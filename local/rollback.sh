@@ -8,6 +8,7 @@ KVER=${KVER:-$(uname -r)}
 
 rm -rf "/lib/modules/$KVER/updates/nvidia-local"
 rm -f /etc/modprobe.d/nvidia-vidmem-reserve.conf
+rm -f /etc/depmod.d/nvidia-local.conf
 depmod -a "$KVER"
 update-initramfs -u -k "$KVER"
 

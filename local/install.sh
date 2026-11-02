@@ -16,6 +16,9 @@ DEST=/lib/modules/$KVER/updates/nvidia-local
 SIGN=/usr/src/linux-headers-$KVER/scripts/sign-file
 RESERVE_MB=${RESERVE_MB:-768}
 MODPROBE_CONF=/etc/modprobe.d/nvidia-vidmem-reserve.conf
+# Ubuntu's nvidia-dkms-* builds its own modules into updates/dkms; depmod
+# must prefer ours over those (and over kernel/nvidia-*).
+DEPMOD_CONF=/etc/depmod.d/nvidia-local.conf
 MODULES=(nvidia nvidia-modeset nvidia-drm nvidia-uvm nvidia-peermem)
 
 die() { echo "install.sh: $*" >&2; exit 1; }
@@ -71,6 +74,10 @@ install_modules() {
     [[ $(modinfo -F vermagic "$BUILD/nvidia.ko" | cut -d' ' -f1) == "$KVER" ]] || die "modules were built for another kernel"
 
     install -d "$DEST"
+    {
+        echo "# Written by local/install.sh: the patched modules win over dkms/kernel copies."
+        for m in "${MODULES[@]}"; do echo "override $m * updates/nvidia-local"; done
+    } >"$DEPMOD_CONF"
     for m in "${MODULES[@]}"; do
         install -m 0644 "$BUILD/$m.ko" "$DEST/$m.ko"
         strip --strip-debug "$DEST/$m.ko"
