@@ -452,6 +452,8 @@ nv_procfs_write_vidmem_evict(
         mode = 7;
     else if (strcmp(cmd, "quiesce") == 0)
         mode = 8;
+    else if (strcmp(cmd, "hot") == 0)
+        mode = 10;
     else
         return -EINVAL;
 
@@ -461,7 +463,7 @@ nv_procfs_write_vidmem_evict(
         if (arg == NULL)
             return -EINVAL;
         ret = kstrtouint(strim(arg), 10, &pid);
-        if ((ret < 0) || ((mode != 4) && (mode != 6) && (mode != 7) && (mode != 8) && (pid == 0)))
+        if ((ret < 0) || ((mode != 4) && (mode != 6) && (mode != 7) && (mode != 8) && (mode != 10) && (pid == 0)))
         {
             return -EINVAL;
         }

@@ -7,6 +7,7 @@
 #   ./nvt-session.sh title            titles of Chrome's pages (DevTools port)
 #   ./nvt-session.sh gpu-pid          pid of the test Chrome's GPU process
 #   ./nvt-session.sh win ACTION PID   minimize|unminimize|activate|fullscreen|normal|screen1|screen2
+#   ./nvt-session.sh win geom PID X Y W H
 #                                     (NVT_OUTPUTS=2 at start: two virtual monitors)
 #                                     every window of PID (a KWin script over DBus)
 #   ./nvt-session.sh stop             Chrome and the compositor
@@ -97,7 +98,9 @@ gpu_pid() {
 # Run a one-off KWin script acting on every window of a process.
 win() {
     local action=$1 pid=$2 js name
+    shift 2
     case $action in
+        geom) js="w.frameGeometry = { x: $1, y: $2, width: $3, height: $4 };" ;;
         minimize) js='w.minimized = true;' ;;
         unminimize) js='w.minimized = false;' ;;
         activate) js='w.minimized = false; workspace.activeWindow = w;' ;;
@@ -149,7 +152,7 @@ case ${1:-} in
     title) title ;;
     gpu-pid) gpu_pid ;;
     main-pid) main_pid ;;
-    win) win "${2:?action}" "${3:?pid}" ;;
+    win) shift; win "$@" ;;
     stop-chrome) stop_chrome ;;
     stop) stop ;;
     *) sed -n '2,12p' "$0"; exit 2 ;;

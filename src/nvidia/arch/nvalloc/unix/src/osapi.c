@@ -5706,7 +5706,7 @@ NV_STATUS NV_API_CALL rm_vidmem_evict(
     NvU32              len = 0;
     NV_STATUS          status;
 
-    if ((buf == NULL) || (bufSize < 256) || (mode > 9))
+    if ((buf == NULL) || (bufSize < 256) || (mode > 10))
         return NV_ERR_INVALID_ARGUMENT;
     buf[0] = '\0';
 

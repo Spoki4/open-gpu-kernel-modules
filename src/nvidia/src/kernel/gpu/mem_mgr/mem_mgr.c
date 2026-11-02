@@ -932,6 +932,8 @@ memmgrStateLoad_IMPL
     return NV_OK;
 }
 
+void vidmemEvictHotTeardown(OBJGPU *pGpu);   // local patch, mem_mgr/vidmem_evict.c
+
 NV_STATUS
 memmgrStatePreUnload_IMPL
 (
@@ -941,6 +943,9 @@ memmgrStatePreUnload_IMPL
 )
 {
     KernelMemorySystem *pKernelMemorySystem = GPU_GET_KERNEL_MEMORY_SYSTEM(pGpu);
+
+    // Local patch: the vidmem eviction's access counter buffer (re-created on demand).
+    vidmemEvictHotTeardown(pGpu);
     NV_ASSERT((flags & GPU_STATE_FLAGS_PRESERVING) || !_memmgrIsZbcSurfaceReferenced(pGpu, pMemoryManager));
 
     if ((flags & GPU_STATE_FLAGS_PRESERVING))

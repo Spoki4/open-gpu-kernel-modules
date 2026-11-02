@@ -18,12 +18,18 @@ ENV_D=$CONF/environment.d/90-$ID.conf
 HINTS=/proc/driver/nvidia/vidmem_hints
 
 install_it() {
-    local d
+    local d main
+    # KWin keeps compiled QML per file URL for its whole lifetime, so a new
+    # version under the same name would not load until the next login: the
+    # main file is named after its content.
+    main=main-$(sha1sum "$HERE/contents/ui/main.qml" | cut -c1-12).qml
     for d in kwin-wayland kwin; do
         mkdir -p "$DATA/$d/scripts"
         rm -rf "${DATA:?}/$d/scripts/$ID"
         cp -r "$HERE" "$DATA/$d/scripts/$ID"
         rm -f "$DATA/$d/scripts/$ID/install.sh"
+        mv "$DATA/$d/scripts/$ID/contents/ui/main.qml" "$DATA/$d/scripts/$ID/contents/ui/$main"
+        sed -i "s|\"ui/main.qml\"|\"ui/$main\"|" "$DATA/$d/scripts/$ID/metadata.json"
     done
     mkdir -p "$(dirname "$ENV_SH")" "$(dirname "$ENV_D")"
     cat >"$ENV_SH" <<'EOF'
@@ -33,7 +39,9 @@ export QML_XHR_ALLOW_FILE_WRITE=1
 EOF
     printf '# See %s\nQML_XHR_ALLOW_FILE_WRITE=1\n' "$ENV_SH" >"$ENV_D"
     kwriteconfig6 --file kwinrc --group Plugins --key "${ID}Enabled" true
-    # Load it into the running KWin now (it can write only after a re-login).
+    # Load the new version into the running KWin now (writing the procfs
+    # file needs QML_XHR_ALLOW_FILE_WRITE, i.e. a login after the first install).
+    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$ID" >/dev/null 2>&1 || true
     qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
     echo "installed; log out and back in, then: $0 status"
 }

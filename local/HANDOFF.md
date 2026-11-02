@@ -798,6 +798,61 @@ Known limits / watch in the real test:
   `journalctl -k | grep "vidmem evict: hints"`. Off switch:
   `sudo local/evict.sh auto off`; script: `install.sh remove`.
 
+## Foreground priority, WebGPU, 615 port (2026-11-02 12:40-13:10)
+
+- CoD on the real desktop with hints (12:39): the game was recognised as
+  foreground (window pid = sp26-cod.exe = the memory holder), hidden apps
+  moved out inside its allocations (Spotify, Claude, Steam: 212 MB, 3-18 ms
+  each), no Xid; but 30 fps with Chrome/ghostty/Steam visible on monitor 2,
+  60 fps once closed: visible windows were never touched.
+- Fix (6deefd7b, installed): victim levels. For the foreground process,
+  visible apps idle on the GPU >= 10 s give up memory too (budget,
+  allocations, and pressure while a >= 1 GB foreground game fills vidmem;
+  GL apps never ask beyond the budget, so pressure must act); visible ones
+  still drawing last, only for the foreground's allocations/restore. A
+  visible app moved out for the foreground returns when activated, or after
+  60 s if there is room without moving anything.
+- Bench: `nvtest.sh fgprio` (two virtual monitors) and `nvtest.sh webgpu`
+  (nvt-webgpu.html, Dawn/Vulkan, 512 MB checked+rewritten per frame; a new
+  tab must still get an adapter). Full `nvtest.sh all`: 8/8 PASS.
+- Branch local/vidmem-615 (worktree ~/projects/ogkm-615 on the PC): the
+  patch on 615.71.09 (Ubuntu ships nvidia-driver-615-open 615.71.09),
+  builds; 2 conflicts resolved (HEAP_FREE via memmgrGetHeapFreeBytes, static
+  BAR1 refcount under kbusShouldRefcountConstruct); upstream build fix for
+  Linux 7.0 (struct nv_cxl under NV_CXL_INIT_SUPPORTED). Not installed: the
+  615 userspace must come first (`sudo apt install nvidia-driver-615-open`,
+  by the user), then switch the main checkout to local/vidmem-615 (sudoers
+  paths point there), build, install.sh install, reboot, run the bench.
+- User asked about moving to CachyOS: answered (possible later; tooling is
+  Ubuntu-specific, the patch and KWin script are not); no decision yet.
+
+## CoD 1 fps, GP_PUT activity, hot memory start (2026-11-02 13:15-13:50)
+
+- CoD test 13:15 (build 6deefd7b): 1 fps. Chrome on monitor 2 was drawing
+  (busiest) but the game's allocations took 831 MB of it and 186 MB of the
+  Steam window (rule "visible drawing last" at level FG): they drew from
+  sysmem, PCIe 21 GB/s, SM 100%. Also a quiesce of ghostty took 294 ms.
+- Fixes (4fc2f2d0): activity also from GP_PUT changes per process (USERD
+  0x8C read every policy step; the GPUMON samples name one process per
+  sample, so a light Chrome next to a game never shows); drawing processes
+  are never taken for streaming (only to restore the foreground's own
+  memory); hidden ones only if not drawing now (4 s, after they were
+  hidden); a moved-out process drawing again comes back first. KWin script:
+  union occlusion (Steam under several windows).
+- User idea: Chrome tabs / hot vs cold inside a process. Plan: access
+  counters (NVC365). Module in vidmem_evict.c, knob `evict.sh hot on|off`
+  (default off). Findings on 595/GA102: the buffer can be created inside RM
+  (internal client, 4096 entries, MIMC 2 MB, threshold 256) and ~3000
+  notifications arrived within seconds, with aperture 0 = VIDMEM regions
+  (so hot/cold of resident memory is visible, the base for per-tab /
+  per-allocation decisions); BUT kfifoConvertInstToKernelChannel fails for
+  every entry (under GSP on 595 the instance blocks are GSP's; 615 moved
+  RAMFC/instance setup to CPU-RM, retry there), and after the first
+  RESET_COUNTERS no further notifications came, none for sysmem.
+  Next: decode MIMC vs MOMC (which one sees sysmem), buffer full/overflow
+  handling, inst->channel on 615 (or match by VA alone + owner pid), then
+  per-allocation cold eviction for visible processes.
+
 ## Outside research (2026-11-02, from another session, partly unverified)
 
 Nobody published a kwin reserve or cross-process eviction for NVIDIA.

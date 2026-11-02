@@ -13,6 +13,8 @@
 #   sudo ./evict.sh shared  <pid|chrome|name>   # who else holds this process's shared vidmem
 #   sudo ./evict.sh trace   on|off              # log every remap (VA ranges) to the kernel log
 #   sudo ./evict.sh windows on|off              # also evict window buffers (default off)
+#   sudo ./evict.sh hot     on|off              # access counters: evicted allocations in use
+#                                               # come back one by one (experiment)
 #   sudo ./evict.sh quiesce 0..4                # how channels are stopped (experiment, see
 #                                               # _vidmemEvictQuiesce in vidmem_evict.c)
 set -euo pipefail
@@ -26,6 +28,10 @@ case $mode in
     status)
         [[ $# -eq 1 ]] || usage
         cmd="status"
+        ;;
+    hot)
+        [[ $# -eq 2 ]] || usage
+        case $2 in on|1) cmd="hot 1" ;; off|0) cmd="hot 0" ;; *) usage ;; esac
         ;;
     auto|trace|windows)
         [[ $# -eq 2 ]] || usage

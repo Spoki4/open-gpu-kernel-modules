@@ -24,8 +24,9 @@
 #                                    Chrome A; alt-tab CYCLES times, switch latency
 #   ./nvtest.sh webgpu [CYCLES]      WebGPU page in Chrome moved and back; a new tab must
 #                                    still get an adapter
-#   ./nvtest.sh fgprio [CYCLES]      two monitors: a visible idle Chrome gives memory to the
-#                                    fullscreen game; clicking between them
+#   ./nvtest.sh fgprio [CYCLES] [idle|anim]
+#                                    two monitors: a visible idle Chrome gives memory to the
+#                                    fullscreen game, a drawing one must not; clicking between
 #   ./nvtest.sh quiesce [CYCLES]     active scenario once per stop method
 #                                    (evict.sh quiesce 0..4, NVTEST_MODES="0 2" to pick)
 #   ./nvtest.sh all                  integrity, active, chrome anim+idle, switch, game
@@ -318,7 +319,10 @@ switch_test() {
     note "after loading: A gpu vram $(vram_of "$gA") MB ram $(ram_of "$gA") MB; B gpu vram $(vram_of "$gB") MB ram $(ram_of "$gB") MB"
     [[ $t == *" done=1 "* ]] || fail "game B did not finish loading: $t"
     [[ $t == *" oom=0 "* ]] || fail "game B ran out of memory: $t"
-    [[ $(ram_of "$gA") -gt 0 ]] || fail "hidden A was not moved out for B"
+    # A behind fullscreen B is hidden; it may stay if it keeps drawing there
+    # (GP_PUT moves: drawing hidden apps are not moved, they would draw from
+    # sysmem). Moved out or not, B must have loaded and both must be intact.
+    note "hidden A moved out for B: $(ram_of "$gA") MB (0 is right if A kept drawing while covered)"
 
     for i in $(seq 1 "$cycles"); do
         t=$(date +%s.%N)
@@ -350,16 +354,17 @@ switch_test() {
 # drawing): A comes back at once, B gives up only what is missing; then
 # back to B.
 fgprio_test() {
-    local cycles=${1:-3}
+    local cycles=${1:-3} amode=${2:-idle} label
+    label=fgprio-$amode
     if seat0_busy && [[ ${NVTEST_FORCE:-0} != 1 ]]; then
-        echo "NVTEST fgprio SKIP somebody is logged in on seat0" | tee -a "$LOGROOT/summary.txt"
+        echo "NVTEST $label SKIP somebody is logged in on seat0" | tee -a "$LOGROOT/summary.txt"
         return 0
     fi
-    begin fgprio
+    begin "$label"
     local S="$HERE/nvt-session.sh" t mA mB gA gB free gameMB i lat
     $S stop >/dev/null 2>&1 || true
-    NVT_OUTPUTS=2 $S start "file://$HERE/nvt-webgl.html?mode=idle&every=60&tex=200" >>"$DIR/notes.txt" 2>&1 ||
-        { fail "session A"; finish fgprio; return 1; }
+    NVT_OUTPUTS=2 $S start "file://$HERE/nvt-webgl.html?mode=$([[ $amode == idle ]] && echo 'idle&every=60' || echo anim)&tex=200" >>"$DIR/notes.txt" 2>&1 ||
+        { fail "session A"; finish "$label"; return 1; }
     for i in $(seq 1 60); do t=$(title_of a); [[ $t == *"checks="[1-9]* ]] && break; sleep 0.5; done
     mA=$(NVT_INSTANCE=a $S main-pid); gA=$(NVT_INSTANCE=a $S gpu-pid)
     $S win screen2 "$mA"
@@ -370,7 +375,7 @@ fgprio_test() {
     # B starts streaming 12 s after it opens: A redraws when it loses focus
     # and must be idle on the GPU for 10 s before it may give up memory.
     NVT_INSTANCE=b $S start "file://$HERE/nvt-webgl.html?mode=game&mb=$gameMB&delay=12" >>"$DIR/notes.txt" 2>&1 ||
-        { fail "session B"; $S stop; finish fgprio; return 1; }
+        { fail "session B"; $S stop; finish "$label"; return 1; }
     sleep 2
     mB=$(NVT_INSTANCE=b $S main-pid)
     $S win screen1 "$mB"
@@ -383,7 +388,12 @@ fgprio_test() {
     note "hints: $(tr '\n' ' ' < /proc/driver/nvidia/vidmem_hints)"
     note "after loading: A vram $(vram_of "$gA") ram $(ram_of "$gA") MB; B vram $(vram_of "$gB") ram $(ram_of "$gB") MB"
     [[ $t == *" done=1 "* && $t == *" oom=0 "* ]] || fail "game B did not load: $t"
-    [[ $(ram_of "$gA") -gt 0 ]] || fail "visible idle A gave up nothing for the foreground game"
+    if [[ $amode == idle ]]; then
+        [[ $(ram_of "$gA") -gt 0 ]] || fail "visible idle A gave up nothing for the foreground game"
+    else
+        # Drawing: must never be moved out (2026-11-02 13:15, CoD at 1 fps).
+        [[ $(ram_of "$gA") -eq 0 ]] || fail "visible DRAWING A was moved out for the game: $(ram_of "$gA") MB"
+    fi
 
     for i in $(seq 1 "$cycles"); do
         t=$(date +%s.%N)
@@ -404,7 +414,7 @@ fgprio_test() {
     done
     journalctl -k --since "$T0" --no-pager | grep -E "vidmem evict: hints" | cut -c 40- >"$DIR/policy.log" || true
     $S stop
-    finish fgprio
+    finish "$label"
 }
 
 # WebGPU in a real Chrome (Dawn on Vulkan): nvt-webgpu.html checks and
@@ -453,6 +463,34 @@ webgpu_test() {
         fail "chrome GPU process trouble: $(head -1 "$DIR/chrome-gpu-errors.log" | cut -c1-120)"
     $S stop
     finish webgpu
+}
+
+# Window hints of the KWin script: A covered by two windows that each cover
+# half of it must be hidden (the union counts); uncovered again, visible.
+occlusion_test() {
+    local S="$HERE/nvt-session.sh" mA mB mC H=/proc/driver/nvidia/vidmem_hints st
+    begin occlusion
+    $S stop >/dev/null 2>&1 || true
+    $S start "file://$HERE/nvt-webgl.html?mode=idle&tex=8" >>"$DIR/notes.txt" 2>&1 || { fail "session"; finish occlusion; return 1; }
+    NVT_INSTANCE=b $S start "file://$HERE/nvt-webgl.html?mode=idle&tex=8" >>"$DIR/notes.txt" 2>&1
+    NVT_INSTANCE=c $S start "file://$HERE/nvt-webgl.html?mode=idle&tex=8" >>"$DIR/notes.txt" 2>&1
+    sleep 5
+    mA=$(NVT_INSTANCE=a $S main-pid); mB=$(NVT_INSTANCE=b $S main-pid); mC=$(NVT_INSTANCE=c $S main-pid)
+    $S win geom "$mA" 100 100 800 600
+    $S win geom "$mB" 80 80 440 640
+    $S win geom "$mC" 500 80 420 640
+    $S win activate "$mB"; $S win activate "$mC"
+    sleep 1.5
+    st=$(awk -v p="$mA" '$1 == p {print $2}' "$H")
+    note "A under B (left half) and C (right half): $st; hints: $(grep -v '^#' "$H" | tr '\n' ' ')"
+    [[ $st == h ]] || fail "A covered by two windows together is '$st', not hidden"
+    $S win geom "$mC" 1000 80 420 640
+    sleep 1.5
+    st=$(awk -v p="$mA" '$1 == p {print $2}' "$H")
+    note "C moved away: A $st"
+    [[ $st == v ]] || fail "A half uncovered is '$st', not visible"
+    $S stop
+    finish occlusion
 }
 
 # Every stop method (evict.sh quiesce 0..4) against the active scenario.
@@ -518,8 +556,9 @@ case ${1:-} in
     quiesce) quiesce_matrix "${2:-}" ;;
     chrome) chrome "${2:-}" "${3:-}" ;;
     switch) switch_test "${2:-}" ;;
-    fgprio) fgprio_test "${2:-}" ;;
+    fgprio) fgprio_test "${2:-}" "${3:-}" ;;
     webgpu) webgpu_test "${2:-}" ;;
+    occlusion) occlusion_test ;;
     game) game "${2:-}" ;;
     all)
         rc=0
@@ -528,8 +567,10 @@ case ${1:-} in
         chrome 5 anim || rc=1
         chrome 3 idle || rc=1
         webgpu_test 5 || rc=1
+        occlusion_test || rc=1
         switch_test 5 || rc=1
-        fgprio_test 3 || rc=1
+        fgprio_test 3 idle || rc=1
+        fgprio_test 2 anim || rc=1
         game 30 || rc=1
         echo "== summary"
         cat "$LOGROOT/summary.txt"

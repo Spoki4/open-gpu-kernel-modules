@@ -57,7 +57,12 @@
 #include "ctrl/ctrla06c.h"
 #include "kernel/gpu/fifo/kernel_channel_group_api.h"
 #include "kernel/gpu/fifo/kernel_channel_group.h"
+#include "kernel/gpu/fifo/kernel_fifo.h"
 #include "gpu/device/device.h"
+#include "rmapi/rmapi_utils.h"
+#include "class/clc365.h"
+#include "ctrl/ctrlc365.h"
+#include "alloc/alloc_access_counter_buffer.h"
 
 // Ampere PTE kinds (same table on Turing..Hopper, dev_mmu.h)
 #define VIDMEM_EVICT_KIND_PITCH          0x00
@@ -72,6 +77,14 @@ typedef struct
     NvU32                 origKind;
 } VIDMEM_EVICT_MAPPING;
 
+// Where an evicted allocation is mapped (values: the mapping may go away).
+typedef struct
+{
+    void  *pVas;     // OBJVASPACE *, compared only
+    NvU64  vaStart;
+    NvU64  vaEnd;    // inclusive
+} VIDMEM_EVICT_VARANGE;
+
 typedef struct VIDMEM_EVICT_STATE
 {
     MEMORY_DESCRIPTOR    *pSysMemDesc;
@@ -80,7 +93,41 @@ typedef struct VIDMEM_EVICT_STATE
     NvU32                 staticBar1Refs; // static BAR1 references dropped at evict
     NvU32                 numMappings;
     VIDMEM_EVICT_MAPPING  mappings[VIDMEM_EVICT_MAX_MAPPINGS];
+    // Registry of evicted allocations (hot memory, see _vidmemHotPoll()).
+    struct VIDMEM_EVICT_STATE *pNext, *pPrev;
+    MEMORY_DESCRIPTOR    *pMemDesc;       // the (now sysmem-backed) vidmem allocation
+    NvU32                 ownerPid;
+    NvU32                 numRanges;
+    VIDMEM_EVICT_VARANGE  ranges[VIDMEM_EVICT_MAX_MAPPINGS];
+    NvU64                 hotNs;          // last access-counter notification for it
+    NvU32                 hotCount;
 } VIDMEM_EVICT_STATE;
+
+static VIDMEM_EVICT_STATE *_vidmemEvictList;   // committed evictions, GPU lock held
+
+static void
+_vidmemEvictListAdd(VIDMEM_EVICT_STATE *pState)
+{
+    pState->pPrev = NULL;
+    pState->pNext = _vidmemEvictList;
+    if (_vidmemEvictList != NULL)
+        _vidmemEvictList->pPrev = pState;
+    _vidmemEvictList = pState;
+}
+
+static void
+_vidmemEvictListRemove(VIDMEM_EVICT_STATE *pState)
+{
+    if ((pState->pPrev == NULL) && (_vidmemEvictList != pState))
+        return;     // not registered (aborted before commit)
+    if (pState->pPrev != NULL)
+        pState->pPrev->pNext = pState->pNext;
+    else
+        _vidmemEvictList = pState->pNext;
+    if (pState->pNext != NULL)
+        pState->pNext->pPrev = pState->pPrev;
+    pState->pNext = pState->pPrev = NULL;
+}
 
 typedef struct
 {
@@ -176,6 +223,17 @@ static NvU64 _vidmemEvictPhaseNs[VE_PH_COUNT];
 // cost ~0.5 s instead of ~20 ms (nvtest.sh switch, 2026-11-02 12:05).
 //
 static NvU64 _vidmemEvictBudgetBytes;
+
+// Process the current evict/restore call works on (recorded in the state).
+static NvU32 _vidmemEvictCurPid;
+
+// When set, an evict/restore call handles only this allocation (hot memory).
+static MEMORY_DESCRIPTOR *_vidmemEvictOnlyMemDesc;
+
+// Hot memory (access counters), defined further down.
+static NvBool _vidmemHotIsRecent(MEMORY_DESCRIPTOR *pMemDesc);
+static void   _vidmemHotResetCounters(void);
+void          vidmemEvictHotTeardown(OBJGPU *pGpu);
 
 // Thread currently inside the engine (memIsReady() must not recurse).
 static volatile OS_THREAD_HANDLE _vidmemEvictBusyThread;
@@ -1108,8 +1166,13 @@ _vidmemEvictBegin
         maxMapPageSize = NV_MAX(maxMapPageSize, pRefs[i].pDmaMappingInfo->mapPageSize);
         pState->mappings[i].pDmaMappingInfo = pRefs[i].pDmaMappingInfo;
         pState->mappings[i].origKind        = memdescGetPteKind(pRefs[i].pDmaMappingInfo->pMemDesc);
+        pState->ranges[i].pVas    = pRefs[i].pVas;
+        pState->ranges[i].vaStart = pRefs[i].pDmaMappingInfo->DmaOffset;
+        pState->ranges[i].vaEnd   = pRefs[i].pDmaMappingInfo->DmaOffset +
+                                    memdescGetSize(pRefs[i].pDmaMappingInfo->pMemDesc) - 1;
     }
     pState->numMappings = numRefs;
+    pState->numRanges   = numRefs;
 
     //
     // Sysmem chunks must be at least as big as every mapping's GPU page. A
@@ -1222,6 +1285,11 @@ _vidmemEvictCommit(OBJGPU *pGpu, MEMORY_DESCRIPTOR *pMemDesc, VIDMEM_EVICT_STATE
     VE_PHASE_END(VE_PH_PMA);
 
     pMemDesc->pLocalEvictState = pState;
+    pState->pMemDesc = pMemDesc;
+    pState->ownerPid = _vidmemEvictCurPid;
+    pState->hotNs    = 0;
+    pState->hotCount = 0;
+    _vidmemEvictListAdd(pState);
     _vidmemEvictBytes += pState->bytes;
     _vidmemEvictAllocs++;
     return NV_OK;
@@ -1385,6 +1453,7 @@ _vidmemRestoreCommit(OBJGPU *pGpu, MEMORY_DESCRIPTOR *pMemDesc, VIDMEM_EVICT_MAP
 
     _vidmemEvictBytes -= NV_MIN(_vidmemEvictBytes, pState->bytes);
     _vidmemEvictAllocs -= NV_MIN(_vidmemEvictAllocs, 1);
+    _vidmemEvictListRemove(pState);
     pMemDesc->pLocalEvictState = NULL;
     _vidmemEvictFreeState(pGpu, pState);
     VE_PHASE_END(VE_PH_SYSFREE);
@@ -1413,6 +1482,7 @@ vidmemEvictFreeEvicted(OBJGPU *pGpu, MEMORY_DESCRIPTOR *pMemDesc)
 
     _vidmemEvictBytes -= NV_MIN(_vidmemEvictBytes, pState->bytes);
     _vidmemEvictAllocs -= NV_MIN(_vidmemEvictAllocs, 1);
+    _vidmemEvictListRemove(pState);
     pMemDesc->pLocalEvictState = NULL;
     _vidmemEvictFreeState(pGpu, pState);
 
@@ -1588,6 +1658,7 @@ _vidmemEvictPidLocked
     portMemSet(_vidmemEvictPhaseNs, 0, sizeof(_vidmemEvictPhaseNs));
 
     EVICT_PRINTF("%s pid %u\n", (mode == 0) ? "dry" : ((mode == 1) ? "evict" : "restore"), pid);
+    _vidmemEvictCurPid = pid;
 
     for (ppClient = serverutilGetFirstClientUnderLock();
          ppClient != NULL;
@@ -1656,6 +1727,10 @@ _vidmemEvictPidLocked
             pMemDesc = pMemory->pMemDesc;
             bytes = memdescGetSize(pMemDesc);
 
+            // One allocation only (a hot one coming back, _vidmemHotRestore()).
+            if ((_vidmemEvictOnlyMemDesc != NULL) && (pMemDesc != _vidmemEvictOnlyMemDesc))
+                continue;
+
             if (mode == 2)
             {
                 if (pMemDesc->pLocalEvictState == NULL)
@@ -1722,6 +1797,10 @@ _vidmemEvictPidLocked
                                  _vidmemEvictHasCompositor(pRefs, numRefs) ? " compositor" : "");
                     continue;
                 }
+
+                // Partial eviction: allocations that were hot lately go last.
+                if ((_vidmemEvictBudgetBytes != 0) && _vidmemHotIsRecent(pMemDesc))
+                    continue;
 
                 // Partial eviction: enough moved (counting deferred ones).
                 if (_vidmemEvictBudgetBytes != 0)
@@ -1859,6 +1938,8 @@ _vidmemEvictPidLocked
                   (osGetMonotonicTimeNs() - startNs) / 1000000, _vidmemEvictBytes >> 20);
     if (pMovedBytes != NULL)
         *pMovedBytes = movedBytes;
+    if ((mode == 1) && (moved != 0))
+        _vidmemHotResetCounters();
 
 free_mem:
     portMemFree(pChannels);
@@ -1866,6 +1947,279 @@ free_mem:
     portMemFree(pRefs);
     portMemFree(pPending);
     return status;
+}
+
+
+// ---------------------------------------------------------------------------
+// Hot memory (2026-11-02, the user's idea: keep what is used in vidmem, the
+// rest may go). The GPU's access counters (class ACCESS_COUNTER_NOTIFY_BUFFER,
+// the MIMC counters UVM uses for migrations) count GPU accesses to remote
+// memory, sysmem included, per 2 MB of virtual address space and notify once
+// a region reaches the threshold: entry = instance block of the channel (so
+// the process and its VA space) + virtual address + count. Evicted
+// allocations live in sysmem, so a notification means "this evicted
+// allocation is in use": it comes back to vidmem on its own (only it, not the
+// whole process), and it goes last the next time memory is taken from that
+// process (cold first).
+//
+// One notification buffer per GPU; nvidia-uvm takes it when a CUDA/managed
+// memory process registers the GPU. Then this stays off (status says so).
+// Interrupts stay disabled; the buffer is polled every policy step.
+// Knob "hot 0|1" (default 0 until verified on the bench).
+// ---------------------------------------------------------------------------
+
+#define VIDMEM_HOT_THRESHOLD     256
+#define VIDMEM_HOT_RECENT_SEC    60      // "hot" mark lifetime for cold-first ordering
+#define VIDMEM_HOT_RING          256
+
+typedef struct
+{
+    NvBool          bInit, bFailed;
+    NV_STATUS       failStatus;
+    NvHandle        hClient, hDevice, hSubdevice, hBuffer;
+    NvU8           *pBuf;
+    NvU32           bufSize, entries;
+    volatile NvU32 *pGet, *pPut, *pIntrEnClear;
+    NvU32           intrMask;
+    NvU64           notifs, sysNotifs, matched, restored;
+    // Allocations that were hot lately (restored because of it): taken last.
+    MEMORY_DESCRIPTOR *recent[VIDMEM_HOT_RING];
+    NvU64              recentNs[VIDMEM_HOT_RING];
+    NvU32              recentNext;
+} VIDMEM_HOT;
+
+static VIDMEM_HOT _vidmemHot;
+static NvU32      _vidmemHotEnabled;
+
+static void
+_vidmemHotNoteRecent(MEMORY_DESCRIPTOR *pMemDesc)
+{
+    _vidmemHot.recent[_vidmemHot.recentNext] = pMemDesc;
+    _vidmemHot.recentNs[_vidmemHot.recentNext] = osGetMonotonicTimeNs();
+    _vidmemHot.recentNext = (_vidmemHot.recentNext + 1) % VIDMEM_HOT_RING;
+}
+
+// Was this allocation hot in the last VIDMEM_HOT_RECENT_SEC? (cold-first order)
+static NvBool
+_vidmemHotIsRecent(MEMORY_DESCRIPTOR *pMemDesc)
+{
+    NvU64 nowNs = osGetMonotonicTimeNs();
+    NvU32 i;
+
+    if (!_vidmemHotEnabled)
+        return NV_FALSE;
+    for (i = 0; i < VIDMEM_HOT_RING; i++)
+    {
+        if ((_vidmemHot.recent[i] == pMemDesc) &&
+            (nowNs - _vidmemHot.recentNs[i] < VIDMEM_HOT_RECENT_SEC * 1000000000ULL))
+            return NV_TRUE;
+    }
+    return NV_FALSE;
+}
+
+// Free everything (module unload, suspend, "hot 0"). Locks held.
+void
+vidmemEvictHotTeardown(OBJGPU *pGpu)
+{
+    RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+
+    if (!_vidmemHot.bInit)
+    {
+        _vidmemHot.bFailed = NV_FALSE;
+        return;
+    }
+    if (_vidmemHot.pBuf != NULL)
+        (void)pRmApi->UnmapFromCpu(pRmApi, _vidmemHot.hClient, _vidmemHot.hSubdevice, _vidmemHot.hBuffer,
+                                   _vidmemHot.pBuf, 0, osGetCurrentProcess());
+    if (_vidmemHot.hBuffer != 0)
+        (void)pRmApi->Free(pRmApi, _vidmemHot.hClient, _vidmemHot.hBuffer);
+    rmapiutilFreeClientAndDeviceHandles(pRmApi, &_vidmemHot.hClient, &_vidmemHot.hDevice, &_vidmemHot.hSubdevice);
+    portMemSet(&_vidmemHot, 0, sizeof(_vidmemHot));
+}
+
+static NV_STATUS
+_vidmemHotInit(OBJGPU *pGpu)
+{
+    RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+    NV_ACCESS_COUNTER_NOTIFY_BUFFER_ALLOC_PARAMS                allocParams = {0};
+    NVC365_CTRL_ACCESS_CNTR_BUFFER_GET_SIZE_PARAMS              sizeParams = {0};
+    NVC365_CTRL_ACCESS_CNTR_BUFFER_GET_REGISTER_MAPPINGS_PARAMS regs;
+    NVC365_CTRL_ACCESS_CNTR_SET_CONFIG_PARAMS                   cfg = {0};
+    NVC365_CTRL_ACCESS_CNTR_BUFFER_ENABLE_PARAMS                en = {0};
+    NvP64     pAddr = NvP64_NULL;
+    NV_STATUS status;
+
+    portMemSet(&regs, 0, sizeof(regs));
+    _vidmemHot.bInit = NV_TRUE;
+
+    status = rmapiutilAllocClientAndDeviceHandles(pRmApi, pGpu, &_vidmemHot.hClient,
+                                                  &_vidmemHot.hDevice, &_vidmemHot.hSubdevice);
+    if (status != NV_OK)
+        goto fail;
+    allocParams.accessCounterIndex = 0;
+    status = pRmApi->Alloc(pRmApi, _vidmemHot.hClient, _vidmemHot.hSubdevice, &_vidmemHot.hBuffer,
+                           ACCESS_COUNTER_NOTIFY_BUFFER, &allocParams, sizeof(allocParams));
+    if (status != NV_OK)
+        goto fail;     // e.g. NV_ERR_INVALID_STATE: nvidia-uvm owns it
+    status = pRmApi->Control(pRmApi, _vidmemHot.hClient, _vidmemHot.hBuffer,
+                             NVC365_CTRL_CMD_ACCESS_CNTR_BUFFER_GET_SIZE, &sizeParams, sizeof(sizeParams));
+    if (status != NV_OK)
+        goto fail;
+    _vidmemHot.bufSize = sizeParams.accessCntrBufferSize;
+    _vidmemHot.entries = _vidmemHot.bufSize / NVC365_NOTIFY_BUF_SIZE;
+    status = pRmApi->MapToCpu(pRmApi, _vidmemHot.hClient, _vidmemHot.hSubdevice, _vidmemHot.hBuffer,
+                              0, _vidmemHot.bufSize, &pAddr, 0);
+    if (status != NV_OK)
+        goto fail;
+    _vidmemHot.pBuf = KERNEL_POINTER_FROM_NvP64(NvU8 *, pAddr);
+    status = pRmApi->Control(pRmApi, _vidmemHot.hClient, _vidmemHot.hBuffer,
+                             NVC365_CTRL_CMD_ACCESS_CNTR_BUFFER_GET_REGISTER_MAPPINGS, &regs, sizeof(regs));
+    if (status != NV_OK)
+        goto fail;
+    _vidmemHot.pGet         = KERNEL_POINTER_FROM_NvP64(volatile NvU32 *, regs.pAccessCntrBufferGet);
+    _vidmemHot.pPut         = KERNEL_POINTER_FROM_NvP64(volatile NvU32 *, regs.pAccessCntrBufferPut);
+    _vidmemHot.pIntrEnClear = KERNEL_POINTER_FROM_NvP64(volatile NvU32 *, regs.pHubIntrEnClear);
+    _vidmemHot.intrMask     = regs.accessCntrMask;
+
+    cfg.mimcGranularity = NVC365_CTRL_ACCESS_COUNTER_GRANULARITY_2M;
+    cfg.momcGranularity = NVC365_CTRL_ACCESS_COUNTER_GRANULARITY_64K;
+    cfg.mimcLimit       = NVC365_CTRL_ACCESS_COUNTER_USE_LIMIT_FULL;
+    cfg.momcLimit       = NVC365_CTRL_ACCESS_COUNTER_USE_LIMIT_NONE;
+    cfg.threshold       = VIDMEM_HOT_THRESHOLD;
+    cfg.cmd = NVC365_CTRL_ACCESS_COUNTER_SET_MIMC_GRANULARITY | NVC365_CTRL_ACCESS_COUNTER_SET_MOMC_GRANULARITY |
+              NVC365_CTRL_ACCESS_COUNTER_SET_MIMC_LIMIT | NVC365_CTRL_ACCESS_COUNTER_SET_MOMC_LIMIT |
+              NVC365_CTRL_ACCESS_COUNTER_SET_THRESHOLD;
+    status = pRmApi->Control(pRmApi, _vidmemHot.hClient, _vidmemHot.hBuffer,
+                             NVC365_CTRL_CMD_ACCESS_CNTR_SET_CONFIG, &cfg, sizeof(cfg));
+    if (status != NV_OK)
+        goto fail;
+    en.intrOwnership = NVC365_CTRL_ACCESS_COUNTER_INTERRUPT_OWNERSHIP_NOT_RM;
+    en.enable        = NV_TRUE;
+    status = pRmApi->Control(pRmApi, _vidmemHot.hClient, _vidmemHot.hBuffer,
+                             NVC365_CTRL_CMD_ACCESS_CNTR_BUFFER_ENABLE, &en, sizeof(en));
+    if (status != NV_OK)
+        goto fail;
+    // Polled, no interrupt.
+    if (_vidmemHot.pIntrEnClear != NULL)
+        MEM_WR32(_vidmemHot.pIntrEnClear, _vidmemHot.intrMask);
+
+    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hot memory: access counters on (%u entries, 2 MB, threshold %u)\n",
+              _vidmemHot.entries, VIDMEM_HOT_THRESHOLD);
+    return NV_OK;
+
+fail:
+    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hot memory: access counters unavailable (0x%x)%s\n", status,
+              (status == NV_ERR_INVALID_STATE) ? ", in use by nvidia-uvm" : "");
+    vidmemEvictHotTeardown(pGpu);
+    _vidmemHot.bInit      = NV_TRUE;     // do not retry every step
+    _vidmemHot.bFailed    = NV_TRUE;
+    _vidmemHot.failStatus = status;
+    return status;
+}
+
+// Counters start again for whatever was just moved out.
+static void
+_vidmemHotResetCounters(void)
+{
+    RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+    NVC365_CTRL_ACCESS_CNTR_BUFFER_RESET_COUNTERS_PARAMS reset = {0};
+
+    if (!_vidmemHotEnabled || !_vidmemHot.bInit || _vidmemHot.bFailed)
+        return;
+    reset.counterType = NVC365_CTRL_ACCESS_COUNTER_TYPE_MIMC;
+    (void)pRmApi->Control(pRmApi, _vidmemHot.hClient, _vidmemHot.hBuffer,
+                          NVC365_CTRL_CMD_ACCESS_CNTR_BUFFER_RESET_COUNTERS, &reset, sizeof(reset));
+}
+
+// Which evicted allocation of this VA space covers va?
+static VIDMEM_EVICT_STATE *
+_vidmemHotFind(void *pVas, NvU64 va)
+{
+    VIDMEM_EVICT_STATE *pState;
+    NvU32 i;
+
+    for (pState = _vidmemEvictList; pState != NULL; pState = pState->pNext)
+    {
+        for (i = 0; i < pState->numRanges; i++)
+        {
+            // The notification names a 2 MB region; any overlap counts.
+            if ((pState->ranges[i].pVas == pVas) &&
+                (va <= pState->ranges[i].vaEnd) && (va + (2ULL << 20) > pState->ranges[i].vaStart))
+                return pState;
+        }
+    }
+    return NULL;
+}
+
+// Read the notifications that arrived since the last step. GPU lock held.
+static void
+_vidmemHotPoll(OBJGPU *pGpu)
+{
+    KernelFifo *pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
+    NvU32 get, put, n = 0;
+    static NvU32 logged;
+
+    if (!_vidmemHotEnabled)
+        return;
+    if (!_vidmemHot.bInit)
+        (void)_vidmemHotInit(pGpu);
+    if (_vidmemHot.bFailed || (_vidmemHot.pBuf == NULL) || (_vidmemHot.entries == 0))
+        return;
+
+    get = MEM_RD32(_vidmemHot.pGet);
+    put = MEM_RD32(_vidmemHot.pPut);
+    while ((get != put) && (n++ < _vidmemHot.entries))
+    {
+        NvU32 *pEntry = (NvU32 *)(_vidmemHot.pBuf + (NvU64)get * NVC365_NOTIFY_BUF_SIZE);
+        NvU32  addrType, aperture, count;
+        NvU64  addr, instLo, instHi;
+        INST_BLOCK_DESC inst;
+        KernelChannel *pKernelChannel = NULL;
+        VIDMEM_EVICT_STATE *pState = NULL;
+
+        if (!DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _VALID, pEntry))
+            break;      // not written yet
+        addrType = DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _ADDR_TYPE, pEntry);
+        aperture = DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _APERTURE, pEntry);
+        count    = DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _COUNTER_VAL, pEntry);
+        addr     = (NvU64)DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _ADDR_LO, pEntry) |
+                   ((NvU64)DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _ADDR_HI, pEntry) << 32);
+        instLo   = DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _INST_LO, pEntry);
+        instHi   = DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _INST_HI, pEntry);
+        inst.address  = (instLo + (instHi << DRF_SIZE_MW(NVC365_NOTIFY_BUF_ENTRY_INST_LO))) << 12;
+        inst.aperture = DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _INST_APERTURE, pEntry);
+        inst.gfid     = GPU_GFID_PF;
+
+        _vidmemHot.notifs++;
+        if ((aperture == NVC365_NOTIFY_BUF_ENTRY_APERTURE_SYS_MEM_COHERENT) ||
+            (aperture == NVC365_NOTIFY_BUF_ENTRY_APERTURE_SYS_MEM_NONCOHERENT))
+        {
+            _vidmemHot.sysNotifs++;
+            if ((addrType == NVC365_NOTIFY_BUF_ENTRY_ADDR_TYPE_GVA) &&
+                (kfifoConvertInstToKernelChannel_HAL(pGpu, pKernelFifo, &inst, &pKernelChannel) == NV_OK) &&
+                (pKernelChannel != NULL))
+                pState = _vidmemHotFind(pKernelChannel->pVAS, addr);
+            if (pState != NULL)
+            {
+                _vidmemHot.matched++;
+                pState->hotNs = osGetMonotonicTimeNs();
+                pState->hotCount++;
+            }
+        }
+        if (logged < 32)
+        {
+            logged++;
+            NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hot memory: %s 0x%llx aperture %u count %u channel %s -> %s\n",
+                      (addrType == NVC365_NOTIFY_BUF_ENTRY_ADDR_TYPE_GVA) ? "va" : "pa", addr, aperture, count,
+                      (pKernelChannel != NULL) ? "found" : "-",
+                      (pState != NULL) ? "evicted allocation" : "not evicted");
+        }
+
+        // Hand the entry back to the hardware.
+        pEntry[7] &= ~NVBIT(31);
+        get = (get + 1) % _vidmemHot.entries;
+    }
+    MEM_WR32(_vidmemHot.pGet, get);
 }
 
 // ---------------------------------------------------------------------------
@@ -1930,6 +2284,9 @@ typedef struct
     NvU64 firstSeenNs;    // monotonic ns when the policy first saw it
     NvU64 lastVisibleNs;  // monotonic ns when a hint last said visible/foreground
     NvU64 evictedForFgNs; // monotonic ns when it was moved out (while visible) for the foreground
+    NvU64 hiddenSinceNs;  // monotonic ns when its hint last turned hidden (0: not hidden)
+    NvU64 submitSig;      // signature of its channels' GP_PUT at the last check
+    NvU64 lastSubmitNs;   // monotonic ns when that signature last changed (work submitted)
 } VIDMEM_EVICT_ACTIVITY;
 
 //
@@ -2129,19 +2486,114 @@ _vidmemActivitySample(OBJGPU *pGpu)
     portMemFree(pParams);
 }
 
-// Seconds since `pid` was last seen on an engine (NV_U32_MAX: never).
+//
+// Seconds since `pid` last did GPU work (NV_U32_MAX: never seen doing any):
+// the shorter of "last GR/NVDEC/NVENC sample" and "last change of its
+// channels' GP_PUT". The samples name only the busiest process per sample,
+// so a light renderer next to a game never shows up in them (nvtest.sh
+// fgprio-anim: a 60 fps Chrome looked idle and was moved out); a moved
+// GP_PUT means work was submitted, however light.
+//
 static NvU32
 _vidmemActivityIdleSec(NvU32 pid)
 {
     VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(pid, NV_FALSE);
     NvU64 since;
+    NvU32 idle;
 
     if (pAct == NULL)
         return NV_U32_MAX;
     since = NV_MAX(pAct->lastActiveTs, pAct->firstSeenTs);
     if ((since == 0) || (_vidmemActivityNewestTs < since))
-        return (pAct->lastActiveTs == 0) ? NV_U32_MAX : 0;
-    return (NvU32)NV_MIN((_vidmemActivityNewestTs - since) / 1000000000ULL, NV_U32_MAX - 1);
+        idle = (pAct->lastActiveTs == 0) ? NV_U32_MAX : 0;
+    else
+        idle = (NvU32)NV_MIN((_vidmemActivityNewestTs - since) / 1000000000ULL, NV_U32_MAX - 1);
+    if (pAct->lastSubmitNs != 0)
+        idle = NV_MIN(idle, (NvU32)NV_MIN((osGetMonotonicTimeNs() - pAct->lastSubmitNs) / 1000000000ULL,
+                                          NV_U32_MAX - 1));
+    return idle;
+}
+
+//
+// Work submission per process: read GP_PUT (USERD offset 0x8C, the same in
+// every GPFIFO class since Volta) of each channel of each user client and
+// note a change of the per-process signature. API lock RW, GPU lock held.
+//
+#define VIDMEM_EVICT_USERD_GP_PUT 0x8C
+
+static void
+_vidmemActivitySampleSubmits(OBJGPU *pGpu)
+{
+    MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    NvU32          subdev = gpumgrGetSubDeviceInstanceFromGpu(pGpu);
+    NvU64          nowNs = osGetMonotonicTimeNs();
+    RmClient     **ppClient;
+    typedef struct { NvU32 pid; NvU64 sig; } VE_SUBMIT_ACC;
+    VE_SUBMIT_ACC *acc;
+    NvU32          nAcc = 0, i;
+
+    acc = portMemAllocNonPaged(sizeof(*acc) * VIDMEM_EVICT_MAX_PROCS);
+    if (acc == NULL)
+        return;
+
+    for (ppClient = serverutilGetFirstClientUnderLock();
+         ppClient != NULL;
+         ppClient = serverutilGetNextClientUnderLock(ppClient))
+    {
+        RmClient   *pRmClient = *ppClient;
+        RsClient   *pRsClient = staticCast(pRmClient, RsClient);
+        RS_ITERATOR iter;
+        NvU64       sig = 0;
+        NvBool      bAny = NV_FALSE;
+
+        if ((pRsClient->type == CLIENT_TYPE_KERNEL) || (pRmClient->ProcID == 0))
+            continue;
+
+        iter = serverutilRefIter(pRsClient->hClient, NV01_NULL_OBJECT, 0, RS_ITERATE_DESCENDANTS, NV_TRUE);
+        while (clientRefIterNext(iter.pClient, &iter))
+        {
+            KernelChannel    *pKC = dynamicCast(iter.pResourceRef->pResource, KernelChannel);
+            TRANSFER_SURFACE  surf = {0};
+            NvU32             put = 0;
+
+            if ((pKC == NULL) || (pKC->pUserdSubDeviceMemDesc[subdev] == NULL))
+                continue;
+            surf.pMemDesc = pKC->pUserdSubDeviceMemDesc[subdev];
+            surf.offset   = VIDMEM_EVICT_USERD_GP_PUT;
+            if (memmgrMemRead(pMemoryManager, &surf, &put, sizeof(put),
+                              TRANSFER_FLAGS_PREFER_PROCESSOR | TRANSFER_FLAGS_MAP_PROTECT_READABLE) != NV_OK)
+                continue;
+            sig = sig * 1000003ULL + put + ((NvU64)RES_GET_HANDLE(pKC) << 32);
+            bAny = NV_TRUE;
+        }
+        if (!bAny)
+            continue;
+
+        for (i = 0; i < nAcc; i++)
+        {
+            if (acc[i].pid == pRmClient->ProcID)
+                break;
+        }
+        if (i == nAcc)
+        {
+            if (nAcc >= VIDMEM_EVICT_MAX_PROCS)
+                continue;
+            acc[nAcc].pid = pRmClient->ProcID;
+            acc[nAcc].sig = 0;
+            nAcc++;
+        }
+        acc[i].sig = acc[i].sig * 31ULL + sig;
+    }
+
+    for (i = 0; i < nAcc; i++)
+    {
+        VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(acc[i].pid, NV_TRUE);
+
+        if ((pAct->submitSig != 0) && (pAct->submitSig != acc[i].sig))
+            pAct->lastSubmitNs = nowNs;
+        pAct->submitSig = acc[i].sig;
+    }
+    portMemFree(acc);
 }
 
 static NvU32
@@ -2358,6 +2810,10 @@ _vidmemEvictGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
             pProcs[k].hint    = _vidmemHint(pProcs[k].pid, NULL);
             if (VE_HINT_STATE(pProcs[k].hint) >= VE_HINT_VISIBLE)
                 pAct->lastVisibleNs = pAct->vidmemAtNs;
+            if (VE_HINT_STATE(pProcs[k].hint) != VE_HINT_HIDDEN)
+                pAct->hiddenSinceNs = 0;
+            else if (pAct->hiddenSinceNs == 0)
+                pAct->hiddenSinceNs = pAct->vidmemAtNs;
         }
     }
 
@@ -2408,21 +2864,35 @@ _vidmemEvictBusiestPid(VIDMEM_EVICT_PROC *pProcs, NvU32 count)
 // VIDMEM_EVICT_FG_HOLD_SEC when there is room without moving anything.
 //
 #define VIDMEM_EVICT_VISIBLE_IDLE_SEC 10
+// "Drawing now": GPU work within the last two policy steps.
+#define VIDMEM_EVICT_DRAWING_SEC      4
 #define VIDMEM_EVICT_FG_HOLD_SEC      60
 
 //
 // Who may give up memory (VE_LEVEL_*):
-//   HIDDEN  hidden and idle windowless processes (pressure, visible apps)
-//   FG_IDLE + visible ones idle on the GPU (the foreground's budget)
-//   FG      + visible ones still drawing, last and only what is missing (the
-//           foreground's allocations and its restore: when the user switches
-//           to Chrome on the second monitor while the game stays visible on
-//           the first, Chrome wins; the game gets its memory back the moment
-//           it is the foreground again, ~0.1 s)
+//   HIDDEN  hidden and windowless processes (pressure, visible apps)
+//   FG_IDLE + visible ones (the foreground's budget, allocations, restore)
+// A process that is drawing where it is not shown is never moved out: it
+// would go on drawing from sysmem, saturate PCIe and hold GR with slow draws
+// (2026-11-02 13:15, CoD: 1 fps after Chrome, busy on the second monitor,
+// and the Steam window were moved out for the game's allocations: PCIe
+// 21 GB/s, SM 100%). Visible and windowless processes: only when idle on the
+// GPU for VIDMEM_EVICT_IDLE_SEC. Hidden ones: unless they drew after they
+// were hidden (alt-tab: the app left behind drew a moment ago, as the
+// foreground; it stops when hidden; an X11 app behind a fullscreen game
+// does not).
 //
-#define VE_LEVEL_HIDDEN  0
-#define VE_LEVEL_FG_IDLE 1
-#define VE_LEVEL_FG      2
+#define VE_LEVEL_HIDDEN     0
+#define VE_LEVEL_FG_IDLE    1
+//
+// RESTORE: + visible ones still drawing, only to bring back the foreground's
+// own memory (bounded; the user just switched to it, e.g. clicked Chrome on
+// the second monitor while the game keeps drawing on the first: the game
+// draws partly from sysmem until it is the foreground again, ~0.1 s). Never
+// for allocations or pressure (13:15: that took a drawing Chrome for the
+// game's streaming, 1 fps).
+//
+#define VE_LEVEL_FG_RESTORE 2
 
 //
 // May `p` be moved out to make room, by the window hints? Hidden (own
@@ -2436,27 +2906,42 @@ _vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs, NvU
 {
     VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(p->pid, NV_TRUE);
     NvU32 st = VE_HINT_STATE(p->hint);
+    NvU32 idle = _vidmemActivityIdleSec(p->pid);
 
     if (p->bNever || (p->pid == exceptPid) || (p->eligibleBytes < (4ULL << 20)))
         return NV_FALSE;
     if (st == VE_HINT_FG)
         return NV_FALSE;
-    if (st == VE_HINT_VISIBLE)
-        return (level == VE_LEVEL_FG) ||
-               ((level == VE_LEVEL_FG_IDLE) && (_vidmemActivityIdleSec(p->pid) >= VIDMEM_EVICT_VISIBLE_IDLE_SEC));
     if ((pAct->lastRestoreNs != 0) &&
         (nowNs - pAct->lastRestoreNs < VIDMEM_EVICT_AFTER_ACCESS_SEC * 1000000000ULL))
         return NV_FALSE;
-    if (st == VE_HINT_HIDDEN)
+
+    switch (st)
     {
-        if ((p->hint & VE_HINT_OTHER_APP) &&
-            (nowNs - pAct->firstSeenNs < VIDMEM_EVICT_INHERIT_GRACE_SEC * 1000000000ULL))
-            return NV_FALSE;
-        return NV_TRUE;
+        case VE_HINT_VISIBLE:
+            // Drawing: only to bring back the foreground's own memory.
+            if (level == VE_LEVEL_FG_RESTORE)
+                return NV_TRUE;
+            return (level == VE_LEVEL_FG_IDLE) && (idle >= VIDMEM_EVICT_VISIBLE_IDLE_SEC);
+
+        case VE_HINT_HIDDEN:
+            //
+            // Drawing now while hidden (work in the last two steps, after it
+            // was hidden): no. Work only before it was hidden (alt-tab) or a
+            // short burst now and then (a check every 20 s): yes.
+            //
+            if ((idle < VIDMEM_EVICT_DRAWING_SEC) && (pAct->hiddenSinceNs != 0) &&
+                ((nowNs - pAct->hiddenSinceNs) / 1000000000ULL > (NvU64)idle + 1))
+                return NV_FALSE;
+            if ((p->hint & VE_HINT_OTHER_APP) &&
+                (nowNs - pAct->firstSeenNs < VIDMEM_EVICT_INHERIT_GRACE_SEC * 1000000000ULL))
+                return NV_FALSE;
+            return NV_TRUE;
+
+        default:
+            // No window anywhere in its ancestry: only when idle.
+            return (idle >= VIDMEM_EVICT_IDLE_SEC) && !_vidmemEvictIsProtected(p->pid, nowNs);
     }
-    // Unknown: a background process without windows; only when idle.
-    return (_vidmemActivityIdleSec(p->pid) >= VIDMEM_EVICT_IDLE_SEC) &&
-           !_vidmemEvictIsProtected(p->pid, nowNs);
 }
 
 //
@@ -2587,12 +3072,41 @@ vidmemEvictReclaimableFor(RmClient *pRmClient)
     }
 }
 
+static void _vidmemHotRestore(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count);
+
 // The policy step when window hints are on. API lock RW, GPU lock held.
 static void
 _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 nowNs)
 {
     NvU64 avail;
     NvU32 pass, i;
+
+    //
+    // 0. A process moved out that is drawing again comes back first: from
+    // sysmem it would load PCIe and GR for everyone (idle hidden processes
+    // make room; if there is none it stays where it is).
+    //
+    for (i = 0; i < count; i++)
+    {
+        NvU64 needMB = pProcs[i].evictedBytes >> 20;
+
+        if ((pProcs[i].evictedBytes == 0) || pProcs[i].bNever ||
+            (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) ||
+            (_vidmemActivityIdleSec(pProcs[i].pid) >= VIDMEM_EVICT_IDLE_SEC))
+            continue;
+        avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB, pProcs[i].pid,
+                                     VE_LEVEL_HIDDEN, "drawing again");
+        if (avail < needMB + 16)
+            continue;
+        NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: restoring %s (pid %u, drawing again, %llu MB)\n",
+                  pProcs[i].name, pProcs[i].pid, needMB);
+        (void)_vidmemEvictPidLocked(pGpu, 2, pProcs[i].pid, NULL, 0, NULL, NULL);
+        pProcs[i].evictedBytes = 0;
+        _vidmemActivityFind(pProcs[i].pid, NV_TRUE)->evictedForFgNs = 0;
+    }
+
+    // 0b. Evicted allocations in use (access counters) come back one by one.
+    _vidmemHotRestore(pGpu, pProcs, count);
 
     //
     // 1. Visible processes get their memory back now: the foreground first,
@@ -2631,7 +3145,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
             else
             {
                 avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB, pProcs[i].pid,
-                                             VE_LEVEL_FG, "foreground again");
+                                             VE_LEVEL_FG_RESTORE, "foreground again");
             }
             if (avail < needMB + 16)
             {
@@ -2697,6 +3211,51 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
     }
 }
 
+//
+// Bring back evicted allocations that are in use (hot), one at a time, for
+// processes that are not hidden: from sysmem they cost PCIe on every access.
+// Idle hidden processes make room. GPU lock held.
+//
+static void
+_vidmemHotRestore(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count)
+{
+    NvU64 nowNs = osGetMonotonicTimeNs();
+    NvU32 done = 0;
+    VIDMEM_EVICT_STATE *pState, *pNext;
+
+    if (!_vidmemHotEnabled)
+        return;
+    for (pState = _vidmemEvictList; (pState != NULL) && (done < 8); pState = pNext)
+    {
+        MEMORY_DESCRIPTOR *pMemDesc = pState->pMemDesc;
+        NvU64 needMB = (pState->bytes >> 20) + 1, avail;
+        NvU32 hint;
+
+        pNext = pState->pNext;
+        if ((pState->hotNs == 0) || (nowNs - pState->hotNs > 4000000000ULL) || (pState->ownerPid == 0))
+            continue;
+        hint = VE_HINT_STATE(_vidmemHint(pState->ownerPid, NULL));
+        if (_vidmemHintsActive() && (hint == VE_HINT_HIDDEN))
+            continue;
+        avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB,
+                                     pState->ownerPid, VE_LEVEL_HIDDEN, "hot allocation");
+        if (avail < needMB + 16)
+            continue;
+        NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hot memory: restoring %llu KB of pid %u (%u notifications)\n",
+                  pState->bytes >> 10, pState->ownerPid, pState->hotCount);
+        _vidmemEvictOnlyMemDesc = pMemDesc;
+        (void)_vidmemEvictPidLocked(pGpu, 2, pState->ownerPid, NULL, 0, NULL, NULL);
+        _vidmemEvictOnlyMemDesc = NULL;
+        if (pMemDesc->pLocalEvictState == NULL)
+        {
+            _vidmemHot.restored++;
+            _vidmemHotNoteRecent(pMemDesc);
+        }
+        done++;
+        pNext = _vidmemEvictList;     // the list changed
+    }
+}
+
 // One policy step. API lock RW, GPU lock held.
 static void
 _vidmemEvictPolicyTick(OBJGPU *pGpu)
@@ -2707,6 +3266,8 @@ _vidmemEvictPolicyTick(OBJGPU *pGpu)
     NvU32 count, busiest, done = 0, i;
 
     _vidmemActivitySample(pGpu);
+    _vidmemActivitySampleSubmits(pGpu);
+    _vidmemHotPoll(pGpu);
     {
         NvU32 busiest = _vidmemActivityBusiest();
 
@@ -3008,7 +3569,7 @@ vidmemEvictMakeRoom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
     wantMB = (size >> 20) + 1 + VIDMEM_EVICT_HINT_LOW_MB;
     avail  = _vidmemEvictHintFree(pGpu, pProcs, count, wantMB, pRmClient->ProcID,
                                   (VE_HINT_STATE(_vidmemHint(pRmClient->ProcID, NULL)) == VE_HINT_FG) ?
-                                      VE_LEVEL_FG : VE_LEVEL_HIDDEN, "allocation");
+                                      VE_LEVEL_FG_IDLE : VE_LEVEL_HIDDEN, "allocation");
     bOk    = (avail > (size >> 20));
     _vidmemEvictUpdateReclaimable(pProcs, count, nowNs);
     lastFruitlessNs = bOk ? 0 : nowNs;
@@ -3326,6 +3887,7 @@ _vidmemEvictStatus(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
         return;
 
     _vidmemActivitySample(pGpu);
+    _vidmemActivitySampleSubmits(pGpu);
     count   = _vidmemEvictGatherProcs(pGpu, pProcs, VIDMEM_EVICT_MAX_PROCS);
     busiest = _vidmemEvictBusiestPid(pProcs, count);
     (void)busiest;
@@ -3337,6 +3899,10 @@ _vidmemEvictStatus(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
                  _vidmemBornAllocs, _vidmemBornBytes >> 20, _vidmemBornFailed, _vidmemBusiestPid,
                  _vidmemEvictWindows ? "evicted too" : "kept in vidmem", _vidmemEvictQuiesce);
     _vidmemEvictPrintBlock(pGpu, buf, bufSize, pLen);
+    EVICT_PRINTF("hot memory: %s; notifications %llu (sysmem %llu, on evicted allocations %llu), hot allocations restored %llu\n",
+                 !_vidmemHotEnabled ? "off" :
+                 (!_vidmemHot.bInit ? "on, not started yet" : (_vidmemHot.bFailed ? "on, access counters unavailable" : "on")),
+                 _vidmemHot.notifs, _vidmemHot.sysNotifs, _vidmemHot.matched, _vidmemHot.restored);
     EVICT_PRINTF("window hints: %s; could give up %llu MB to visible apps, %llu MB to the foreground (added to their budgets)\n",
                  _vidmemHintsActive() ? "on (policy follows window visibility)" : "off (GPU samples)",
                  _vidmemReclaimableBytes >> 20, _vidmemReclaimableFgBytes >> 20);
@@ -3420,6 +3986,13 @@ vidmemEvictProcess
     {
         _vidmemEvictWindows = (arg != 0);
         EVICT_PRINTF("window buffers %s\n", _vidmemEvictWindows ? "evicted too" : "kept in vidmem");
+    }
+    else if (mode == 10)
+    {
+        _vidmemHotEnabled = (arg != 0);
+        if (!_vidmemHotEnabled)
+            vidmemEvictHotTeardown(pGpu);
+        EVICT_PRINTF("hot memory tracking %s\n", _vidmemHotEnabled ? "on (next policy step)" : "off");
     }
     else if (mode == 9)
     {
