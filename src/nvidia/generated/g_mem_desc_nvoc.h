@@ -795,6 +795,10 @@ typedef struct MEMORY_DESCRIPTOR
     // Reference count for duplication of memory object via RmDupObject.
     NvU32 DupCount;
 
+    // Local patch: non-NULL while the allocation is moved to sysmem
+    // (mem_mgr/vidmem_evict.c); the page array is stale then.
+    struct VIDMEM_EVICT_STATE *pLocalEvictState;
+
     //
     // The HwResId is used by the device dependent HAL to keep track of
     // resources attached to the memory (e.g.: compression tags, zcull).

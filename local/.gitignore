@@ -1,0 +1,12 @@
+vram-hog
+gbm-hog
+compr-test
+.vulkan-headers/
+stress-logs/
+nvt-game
+nvt-game.spv.h
+nvt-game.vert.spv.h
+nvt-game.frag.spv.h
+.glslang/
+nvt-bg-*
+nvt-idle-*

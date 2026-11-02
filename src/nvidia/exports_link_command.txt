@@ -184,6 +184,9 @@
 --undefined=rm_init_event_locks
 --undefined=rm_destroy_event_locks
 --undefined=rm_get_gpu_numa_info
+--undefined=rm_vidmem_census
+--undefined=rm_vidmem_pma_info
+--undefined=rm_vidmem_evict
 --undefined=rm_gpu_numa_online
 --undefined=rm_gpu_numa_offline
 --undefined=rm_is_device_sequestered

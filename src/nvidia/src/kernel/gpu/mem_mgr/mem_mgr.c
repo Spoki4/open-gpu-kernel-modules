@@ -2247,6 +2247,8 @@ memmgrMemUtilsSetupChannelBufferSizes_IMPL
     pChannel->finishPayloadOffset      = pChannel->semaOffset + 4;
 }
 
+void vidmemEvictFreeEvicted(OBJGPU *pGpu, MEMORY_DESCRIPTOR *pMemDesc); // local patch, mem_mgr/vidmem_evict.c
+
 NV_STATUS memmgrFree_IMPL
 (
     OBJGPU             *pGpu,
@@ -2291,6 +2293,14 @@ NV_STATUS memmgrFree_IMPL
         status = vaspaceFree(pVAS, offsetAlign);
         memdescDestroy(pMemDesc);
         return status;
+    }
+
+    // Local patch: an allocation moved to sysmem has no PMA pages left.
+    if (pMemDesc->pLocalEvictState != NULL)
+    {
+        vidmemEvictFreeEvicted(pGpu, pMemDesc);
+        memdescDestroy(pMemDesc);
+        return NV_OK;
     }
 
     // Free up the memory allocated by PMA.

@@ -902,6 +902,7 @@ SRCS += src/kernel/mem_mgr/system_mem.c
 SRCS += src/kernel/mem_mgr/vaddr_list.c
 SRCS += src/kernel/mem_mgr/vaspace.c
 SRCS += src/kernel/mem_mgr/video_mem.c
+SRCS += src/kernel/mem_mgr/vidmem_evict.c
 SRCS += src/kernel/mem_mgr/virt_mem_mgr.c
 SRCS += src/kernel/mem_mgr/virt_mem_range.c
 SRCS += src/kernel/mem_mgr/virtual_mem.c

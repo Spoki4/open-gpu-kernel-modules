@@ -1,0 +1,59 @@
+// Shader of nvt-game: fills a buffer with a position-dependent pattern
+// (mode 0), reads it back and counts words that differ (mode 1), or checks
+// and rewrites every word with the next generation of the pattern (mode 2).
+// Reading is the load (like a game sampling its textures every frame) and
+// the check at the same time: a page that came back from system memory at
+// the wrong place, or with stale or garbage content, shows up as errors.
+// Mode 2 also catches writes lost when memory moves under running work: the
+// next check expects the newer generation.
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer Data { uvec4 d[]; };
+layout(std430, set = 0, binding = 1) buffer Result { uint errors; uint first_bad; uint got_x; uint want_x; };
+
+layout(push_constant) uniform PC {
+    uint seed;   // per buffer, so a page moved to another buffer is caught too
+    uint base;   // first element of this dispatch
+    uint count;  // elements in this dispatch
+    uint mode;   // 0 fill (gen_new), 1 verify (gen_old), 2 verify gen_old + write gen_new
+    uint gen_old;
+    uint gen_new;
+} pc;
+
+uint hash(uint x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+void main()
+{
+    uint off = gl_GlobalInvocationID.x;
+    if (off >= pc.count)
+        return;
+    uint i = pc.base + off;
+    uint g = pc.mode == 0u ? pc.gen_new : pc.gen_old;
+    uint h = hash(i ^ pc.seed ^ (g * 0x9e3779b9u));
+    uvec4 want = uvec4(h, h ^ 0x55555555u, i, g);
+    if (pc.mode == 0u) {
+        d[i] = want;
+        return;
+    }
+    uvec4 got = d[i];
+    if (got != want) {
+        if (atomicAdd(errors, 1u) == 0u) {
+            first_bad = i;
+            got_x = got.w;    // generation found
+            want_x = want.w;  // generation expected
+        }
+    }
+    if (pc.mode == 2u) {
+        uint hn = hash(i ^ pc.seed ^ (pc.gen_new * 0x9e3779b9u));
+        d[i] = uvec4(hn, hn ^ 0x55555555u, i, pc.gen_new);
+    }
+}

@@ -1,0 +1,418 @@
+#!/bin/bash
+# Unattended test bench for vidmem eviction (user half; the root half is
+# nvtest-root.sh). Every scenario runs synthetic processes only (nvt-game
+# under different names, compr-test), checks their memory content, the kernel
+# log and timing, and ends with one line
+#   NVTEST <scenario> PASS|FAIL <reasons>
+# Logs: local/stress-logs/nvtest-<date_time>/<scenario>/.
+#
+#   ./nvtest.sh integrity [CYCLES]   idle apps (plain buffers + a compressed image):
+#                                    evict/restore CYCLES times (default 5), content
+#                                    checked while evicted and after each restore;
+#                                    reports evict/restore throughput
+#   ./nvtest.sh active [CYCLES]      evict/restore an app that keeps rendering
+#                                    (30 fps): the quiesce must not corrupt it or
+#                                    stall other apps
+#   ./nvtest.sh game [SECONDS]       a "game" that fills VRAM, background apps (idle
+#                                    and rendering), automatic policy on: idle apps
+#                                    must move out, the game and the rendering app
+#                                    must not, game fps is compared with auto off
+#   ./nvtest.sh chrome [CYCLES] [anim|idle]
+#                                    a real Chrome drawing a self-checking WebGL page
+#                                    (nvt-webgl.html) moved to sysmem and back
+#   ./nvtest.sh switch [CYCLES]      window hints: fullscreen "game" Chrome B and a hidden
+#                                    Chrome A; alt-tab CYCLES times, switch latency
+#   ./nvtest.sh quiesce [CYCLES]     active scenario once per stop method
+#                                    (evict.sh quiesce 0..4, NVTEST_MODES="0 2" to pick)
+#   ./nvtest.sh all                  integrity, active, chrome anim+idle, switch, game
+#
+# Scenarios that put the whole GPU under pressure (game) run only while nobody
+# is logged in on seat0, so they never touch the user's session; override with
+# NVTEST_FORCE=1. integrity and active only touch their own processes.
+set -euo pipefail
+
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+EVICT="sudo -n $HERE/evict.sh"
+LOGROOT=${LOGROOT:-$HERE/stress-logs/nvtest-$(date +%F_%H%M%S)}
+# Kernel log lines that fail any scenario.
+BAD_K_RE='Xid|NVRM: .*(fault|FAULT)|GPU has fallen off|RmInitAdapter failed|BUG:|WARNING:'
+
+die() { echo "nvtest.sh: $*" >&2; exit 2; }
+[[ -x $HERE/nvt-game && -x $HERE/compr-test ]] || die "tools missing, run ./build.sh tools"
+ls /proc/driver/nvidia/gpus/*/vidmem_evict >/dev/null 2>&1 || die "patched module with vidmem_evict not loaded"
+
+seat0_busy() {
+    local s
+    for s in $(loginctl list-sessions --no-legend | awk '{print $1}'); do
+        [[ $(loginctl show-session "$s" -p Seat --value 2>/dev/null) == seat0 &&
+           $(loginctl show-session "$s" -p Class --value 2>/dev/null) == user ]] && return 0
+    done
+    return 1
+}
+
+# --- per-scenario state -------------------------------------------------------
+DIR= ; T0= ; FAILS=() ; PIDS=()
+
+begin() {
+    DIR=$LOGROOT/$1
+    mkdir -p "$DIR"
+    T0=$(date '+%F %T')
+    FAILS=()
+    PIDS=()
+    echo "== $1 ($(date +%T)), logs in $DIR"
+    $EVICT status >"$DIR/status-before.txt" 2>&1 || true
+    nvidia-smi dmon -s ut -d 1 >"$DIR/dmon.log" 2>&1 &
+    PIDS+=($!)
+}
+
+fail() { FAILS+=("$*"); echo "  FAIL: $*"; }
+note() { echo "  $*" | tee -a "$DIR/notes.txt"; }
+
+# start NAME ARGS...: runs nvt-game as NAME (a symlink, so comm == NAME) and
+# sets LAST to its pid. Not called through $(...): the process must stay a
+# child of this shell, and fail() must reach FAILS.
+LAST=
+start() {
+    local name=$1; shift
+    ln -sf nvt-game "$HERE/$name"
+    "$HERE/$name" "$@" >"$DIR/$name.log" 2>&1 &
+    LAST=$!
+    PIDS+=("$LAST")
+    local i
+    for i in $(seq 1 100); do
+        grep -q '^START\|^FATAL' "$DIR/$name.log" 2>/dev/null && break
+        sleep 0.1
+    done
+    grep -q '^START' "$DIR/$name.log" || { fail "$name did not start: $(tail -1 "$DIR/$name.log")"; return 1; }
+}
+
+start_compr() {
+    "$HERE/compr-test" --size 4096 --mode hold --interval-ms 500 --keep-going >"$DIR/compr-test.log" 2>&1 &
+    LAST=$!
+    PIDS+=("$LAST")
+    sleep 2
+}
+
+# evict_op MODE PID LABEL: runs evict.sh, logs it, prints "<MB> <ms>".
+evict_op() {
+    local out
+    out=$($EVICT "$1" "$2" 2>&1) || true
+    printf '%s\n' "--- $(date +%T) $1 $2 ($3)" "$out" >>"$DIR/evict.log"
+    sed -n 's/^summary: [a-z]* [0-9]* allocs \([0-9]*\) MB.*failed \([0-9]*\) .*, \([0-9]*\) ms$/\1 \3 \2/p' <<<"$out"
+}
+
+# finish: stop everything, final checks, verdict.
+finish() {
+    local name=$1 p
+    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null || true; done
+    $EVICT status >"$DIR/status-after.txt" 2>&1 || true
+    journalctl -k --since "$T0" --no-pager >"$DIR/kernel.log" 2>&1 || true
+    if grep -E "$BAD_K_RE" "$DIR/kernel.log" >"$DIR/kernel-bad.log"; then
+        fail "kernel log: $(head -1 "$DIR/kernel-bad.log" | cut -c1-160)"
+    fi
+    local f
+    for f in "$DIR"/nvt-*.log; do
+        [[ -e $f ]] || continue
+        local r
+        r=$(grep '^RESULT' "$f" | tail -1)
+        [[ -n $r ]] || { fail "$(basename "$f" .log): no RESULT ($(tail -1 "$f" | cut -c1-100))"; continue; }
+        [[ $r == *" errors=0" ]] || fail "$(basename "$f" .log): memory content wrong: ${r##* }"
+    done
+    if [[ -e $DIR/compr-test.log ]] && grep -q MISMATCH "$DIR/compr-test.log"; then
+        fail "compr-test: $(grep -m1 MISMATCH "$DIR/compr-test.log")"
+    fi
+    if grep -q "^total evicted now: [1-9]" "$DIR/status-after.txt" 2>/dev/null; then
+        note "left evicted after the test: $(grep '^total evicted now' "$DIR/status-after.txt")"
+    fi
+    local verdict=PASS
+    [[ ${#FAILS[@]} -eq 0 ]] || verdict=FAIL
+    local line="NVTEST $name $verdict ${FAILS[*]:-}"
+    echo "$line" | tee "$DIR/verdict.txt"
+    echo "$line" >>"$LOGROOT/summary.txt"
+    [[ $verdict == PASS ]]
+}
+
+# --- scenarios ----------------------------------------------------------------
+
+integrity() {
+    local cycles=${1:-5}
+    begin integrity
+    local a b c
+    start nvt-idle-a --mb 1024 --idle || { finish integrity; return 1; }; a=$LAST
+    start nvt-idle-b --mb 300 --chunk-mb 100 --idle || { finish integrity; return 1; }; b=$LAST
+    start_compr; c=$LAST
+    local i tot_mb=0 tot_ev=0 tot_rs=0 pid r
+    for i in $(seq 1 "$cycles"); do
+        for pid in "$a" "$b" "$c"; do
+            r=$(evict_op evict "$pid" "cycle $i")
+            read -r mb ms failed <<<"${r:-0 0 0}"
+            [[ ${failed:-0} -eq 0 ]] || fail "cycle $i evict $pid: $failed failed"
+            tot_mb=$((tot_mb + mb)); tot_ev=$((tot_ev + ms))
+        done
+        # Content check while the memory sits in sysmem.
+        kill -USR1 "$a" "$b"; sleep 1.5
+        for pid in "$a" "$b" "$c"; do
+            r=$(evict_op restore "$pid" "cycle $i")
+            read -r mb ms failed <<<"${r:-0 0 0}"
+            [[ ${failed:-0} -eq 0 ]] || fail "cycle $i restore $pid: $failed failed"
+            tot_rs=$((tot_rs + ms))
+        done
+        kill -USR1 "$a" "$b"; sleep 1.5
+    done
+    if [[ $tot_ev -gt 0 && $tot_rs -gt 0 ]]; then
+        note "moved $tot_mb MB each way in $cycles cycles: evict $((tot_mb * 1000 / tot_ev)) MB/s, restore $((tot_mb * 1000 / tot_rs)) MB/s"
+    fi
+    finish integrity
+}
+
+active() {
+    local cycles=${1:-3} label=${2:-active}
+    begin "$label"
+    local bg heavy w
+    # Short frames (well under the drain wait) and long frames (~50 ms of GPU
+    # work each, more from sysmem): a quiesce that only waits a fixed time
+    # moves memory under the long ones while they run.
+    start nvt-bg-a --mb 512 --fps 30 --read-mb 128 --gfx --write || { finish active; return 1; }; bg=$LAST
+    start nvt-bg-heavy --mb 512 --chunk-mb 512 --fps 5 --read-mb 16384 --gfx --write || { finish active; return 1; }; heavy=$LAST
+    # A renderer that is never moved: its frame times show stalls the quiesce
+    # of another process causes.
+    start nvt-bg-witness --mb 1024 --fps 60 --read-mb 1024 --gfx --write || { finish active; return 1; }; w=$LAST
+    sleep 3
+    local i r pid
+    for i in $(seq 1 "$cycles"); do
+        for pid in "$bg" "$heavy"; do
+            r=$(evict_op evict "$pid" "cycle $i")
+            note "cycle $i evict $pid: ${r:-none}"
+            sleep 2
+            r=$(evict_op restore "$pid" "cycle $i")
+            note "cycle $i restore $pid: ${r:-none}"
+            sleep 2
+        done
+    done
+    kill -USR1 "$bg" "$heavy"; sleep 2
+    # A frame that never completes is the failure mode of an unsafe quiesce.
+    local name
+    for name in nvt-bg-a nvt-bg-heavy; do
+        grep -q '^FATAL' "$DIR/$name.log" && fail "$name: $(grep -m1 '^FATAL' "$DIR/$name.log")"
+        local last
+        last=$(awk '/^T /{t=$2} END{sub("t=","",t); print t+0}' "$DIR/$name.log")
+        local alive=$(( $(date +%s) - $(stat -c %Y "$DIR/$name.log") ))
+        [[ $alive -lt 10 ]] || fail "$name stopped making frames (last report t=$last s, silent ${alive} s)"
+    done
+    local worst
+    worst=$(awk '/^T /{for(i=1;i<=NF;i++) if($i ~ /^max_ms=/){split($i,a,"="); if(a[2]>m) m=a[2]}} END{print m+0}' "$DIR/nvt-bg-witness.log")
+    note "witness worst frame ${worst} ms (heavy app drawing from sysmem while moved out holds GR up to ~250 ms)"
+    # The stop itself takes 1-3 ms; a witness stuck for over a second means
+    # the quiesce or a fault hit the other process.
+    awk -v w="$worst" 'BEGIN{exit !(w > 1000)}' && fail "witness stalled ${worst} ms while another process was moved"
+    # Ask them to stop (they print RESULT); one stuck in the driver does not
+    # react to SIGTERM within its 30 s fence timeout and gets killed.
+    for pid in "$bg" "$heavy"; do kill "$pid" 2>/dev/null || true; done
+    local k
+    for k in $(seq 1 50); do
+        kill -0 "$bg" 2>/dev/null || kill -0 "$heavy" 2>/dev/null || break
+        sleep 0.2
+    done
+    for pid in "$bg" "$heavy"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            fail "pid $pid did not exit within 10 s of SIGTERM (stuck in the GPU?)"
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+    grep -h '^quiesce:' "$DIR/evict.log" | sort | uniq -c | sort -rn | head -3 | sed 's/^/  /' | tee -a "$DIR/notes.txt"
+    grep -h '^phases ms:' "$DIR/evict.log" | tail -2 | sed 's/^/  /' | tee -a "$DIR/notes.txt"
+    finish "$label"
+}
+
+# A real Chrome (nvt-session.sh: virtual KWin + test profile) drawing
+# nvt-webgl.html, whose page hashes its own output every 30 frames: the GPU
+# process is moved to sysmem and back CYCLES times while it draws (MODE anim)
+# or while it sits in the background (MODE idle). Any changed hash, lost
+# WebGL context or Xid fails.
+chrome() {
+    local cycles=${1:-5} mode=${2:-anim} label=${3:-chrome-${2:-anim}}
+    begin "$label"
+    "$HERE/nvt-session.sh" stop >/dev/null 2>&1 || true
+    "$HERE/nvt-session.sh" start "file://$HERE/nvt-webgl.html?mode=$mode" >>"$DIR/notes.txt" 2>&1 ||
+        { fail "test session did not start"; finish "$label"; return 1; }
+    local g i r t
+    for i in $(seq 1 60); do
+        t=$("$HERE/nvt-session.sh" title 2>/dev/null | grep '^NVT' || true)
+        [[ $t == *"checks="[1-9]* ]] && break
+        sleep 0.5
+    done
+    g=$("$HERE/nvt-session.sh" gpu-pid)
+    [[ -n $g && $t == NVT* ]] || { fail "chrome page not running (title '$t', gpu pid '$g')"; "$HERE/nvt-session.sh" stop; finish "$label"; return 1; }
+    note "gpu process $g, page: $t"
+    for i in $(seq 1 "$cycles"); do
+        r=$(evict_op evict "$g" "cycle $i")
+        note "cycle $i evict: ${r:-none} | $("$HERE/nvt-session.sh" title | grep '^NVT')"
+        sleep 4
+        r=$(evict_op restore "$g" "cycle $i")
+        note "cycle $i restore: ${r:-none} | $("$HERE/nvt-session.sh" title | grep '^NVT')"
+        sleep 4
+    done
+    t=$("$HERE/nvt-session.sh" title | grep '^NVT' || true)
+    note "final: $t"
+    [[ $t == *" bad=0 "* ]] || fail "page output changed: $t"
+    [[ $t == *" lost=0 "* ]] || fail "WebGL context lost: $t"
+    "$HERE/nvt-session.sh" stop
+    finish "$label"
+}
+
+# Real-time switching with window hints (KWin script in the test compositor):
+# Chrome B is a fullscreen "game" streaming textures until it needs more
+# than is free; Chrome A sits behind it (covered = hidden) and must move out
+# when B's allocations need the room. Then alt-tab CYCLES times: minimize B
+# (A visible: back to vidmem, B out), activate B (B back, A out). Measures
+# how long each switch takes until the shown app is fully in vidmem, checks
+# both pages' output and B's fps.
+ram_of() { $EVICT status 2>/dev/null | awk -v p="$1" '$1 == p { print $4; exit }'; }
+vram_of() { $EVICT status 2>/dev/null | awk -v p="$1" '$1 == p { print $3; exit }'; }
+title_of() { NVT_INSTANCE=$1 "$HERE/nvt-session.sh" title 2>/dev/null | grep '^NVT' | head -1; }
+
+# wait_ram PID [T0]: seconds from T0 (default now) until PID has nothing in
+# sysmem (timeout 10 s), or "timeout".
+wait_ram() {
+    local pid=$1 t0=${2:-$(date +%s.%N)} r
+    while :; do
+        r=$(ram_of "$pid")
+        [[ ${r:-0} == 0 ]] && { echo "$(echo "$(date +%s.%N) - $t0" | bc)"; return 0; }
+        (( $(echo "$(date +%s.%N) - $t0 > 10" | bc) )) && { echo timeout; return 1; }
+        sleep 0.05
+    done
+}
+
+switch_test() {
+    local cycles=${1:-3}
+    if seat0_busy && [[ ${NVTEST_FORCE:-0} != 1 ]]; then
+        echo "NVTEST switch SKIP somebody is logged in on seat0" | tee -a "$LOGROOT/summary.txt"
+        return 0
+    fi
+    begin switch
+    local S="$HERE/nvt-session.sh" t mA mB gA gB free gameMB i lat r
+    $S stop >/dev/null 2>&1 || true
+    $S start "file://$HERE/nvt-webgl.html?mode=anim" >>"$DIR/notes.txt" 2>&1 || { fail "session A"; finish switch; return 1; }
+    for i in $(seq 1 60); do t=$(title_of a); [[ $t == *"checks="[1-9]* ]] && break; sleep 0.5; done
+    mA=$(NVT_INSTANCE=a $S main-pid); gA=$(NVT_INSTANCE=a $S gpu-pid)
+    free=$($EVICT status | sed -n 's/.*free outside reserve \([0-9]*\) MB.*/\1/p')
+    # B wants what is free plus A's whole size: it can only load if A moves out
+    # (its page counts 5.34 MB per texture, the driver sees ~5.1).
+    gameMB=$(( free + $(vram_of "$gA") ))
+    note "A: browser $mA gpu $gA, $t; free outside reserve $free MB, game B wants $gameMB MB"
+
+    NVT_INSTANCE=b $S start "file://$HERE/nvt-webgl.html?mode=game&mb=$gameMB" >>"$DIR/notes.txt" 2>&1 ||
+        { fail "session B"; $S stop; finish switch; return 1; }
+    sleep 2
+    mB=$(NVT_INSTANCE=b $S main-pid)
+    $S win fullscreen "$mB"
+    for i in $(seq 1 240); do t=$(title_of b); [[ $t == *" done=1 "* ]] && break; sleep 0.5; done
+    gB=$(NVT_INSTANCE=b $S gpu-pid)
+    note "B: browser $mB gpu $gB, $t"
+    note "hints: $(tr '\n' ' ' < /proc/driver/nvidia/vidmem_hints)"
+    note "after loading: A gpu vram $(vram_of "$gA") MB ram $(ram_of "$gA") MB; B gpu vram $(vram_of "$gB") MB ram $(ram_of "$gB") MB"
+    [[ $t == *" done=1 "* ]] || fail "game B did not finish loading: $t"
+    [[ $t == *" oom=0 "* ]] || fail "game B ran out of memory: $t"
+    [[ $(ram_of "$gA") -gt 0 ]] || fail "hidden A was not moved out for B"
+
+    for i in $(seq 1 "$cycles"); do
+        t=$(date +%s.%N)
+        $S win minimize "$mB"
+        lat=$(wait_ram "$gA" "$t") || fail "cycle $i: A not back in vidmem within 10 s"
+        sleep 2
+        note "cycle $i alt-tab to A: A back in ${lat} s; A $(title_of a | cut -d' ' -f2-5); B ram $(ram_of "$gB") MB"
+        t=$(date +%s.%N)
+        $S win activate "$mB"
+        lat=$(wait_ram "$gB" "$t") || fail "cycle $i: B not back in vidmem within 10 s"
+        sleep 2
+        note "cycle $i back to B: B back in ${lat} s; B $(title_of b | grep -o 'fps=[0-9]*'); A ram $(ram_of "$gA") MB"
+    done
+
+    for i in a b; do
+        t=$(title_of $i)
+        note "final $i: $t"
+        [[ $t == *" bad=0 "* && $t == *" lost=0 "* ]] || fail "page $i output changed or context lost: $t"
+    done
+    journalctl -k --since "$T0" --no-pager | grep -E "vidmem evict: hints" | cut -c 40- >"$DIR/policy.log" || true
+    $S stop
+    finish switch
+}
+
+# Every stop method (evict.sh quiesce 0..4) against the active scenario.
+quiesce_matrix() {
+    local cycles=${1:-2} m
+    for m in ${NVTEST_MODES:-0 1 2 3 4}; do
+        $EVICT quiesce "$m" >/dev/null
+        active "$cycles" "active-q$m" || true
+    done
+    $EVICT quiesce 0 >/dev/null
+    grep '^NVTEST active-q' "$LOGROOT/summary.txt"
+}
+
+game() {
+    local secs=${1:-60}
+    if seat0_busy && [[ ${NVTEST_FORCE:-0} != 1 ]]; then
+        echo "NVTEST game SKIP somebody is logged in on seat0 (NVTEST_FORCE=1 overrides)" | tee -a "$LOGROOT/summary.txt"
+        return 0
+    fi
+    begin game
+    "$HERE/nvt-session.sh" stop >/dev/null 2>&1 || true
+    local idle1 idle2 bg g free want H=/proc/driver/nvidia/vidmem_hints
+    start nvt-idle-a --mb 1024 --idle --verify-s 20 || { finish game; return 1; }; idle1=$LAST
+    start nvt-idle-b --mb 768 --idle --verify-s 20 || { finish game; return 1; }; idle2=$LAST
+    start nvt-bg-a --mb 256 --fps 30 --read-mb 64 --gfx --write || { finish game; return 1; }; bg=$LAST
+    # Window hints as KWin would write them: this shell (so the game, its
+    # child) in the foreground, the idle apps hidden, the drawing one visible.
+    printf '%s f\n%s h\n%s h\n%s v\n' $$ "$idle1" "$idle2" "$bg" >"$H"
+    free=$($EVICT status | sed -n 's/.*free outside reserve \([0-9]*\) MB.*/\1/p')
+    # The game wants more than is free: only the hidden apps' memory makes it fit.
+    want=$((free + 1500))
+    note "free outside reserve before the game: $free MB, game wants $want MB"
+
+    $EVICT auto off >/dev/null
+    start nvt-game --mb "$want" --read-mb 2048 --duration "$secs" --floor-mb 64 || { finish game; return 1; }; g=$LAST
+    wait "$g" 2>/dev/null || true
+    cp "$DIR/nvt-game.log" "$DIR/nvt-game-auto-off.log"
+    grep '^START\|^RESULT' "$DIR/nvt-game-auto-off.log" | sed 's/^/  auto off: /' | tee -a "$DIR/notes.txt"
+
+    $EVICT auto hints >/dev/null
+    start nvt-game --mb "$want" --read-mb 2048 --duration "$secs" --floor-mb 64 || { finish game; return 1; }; g=$LAST
+    wait "$g" 2>/dev/null || true
+    grep '^START\|^RESULT' "$DIR/nvt-game.log" | sed 's/^/  auto on:  /' | tee -a "$DIR/notes.txt"
+    $EVICT status >"$DIR/status-auto.txt" 2>&1 || true
+
+    journalctl -k --since "$T0" --no-pager | grep -E "vidmem evict: (hints|auto)" >"$DIR/policy.log" || true
+    grep -q "of nvt-bg-a " "$DIR/policy.log" && fail "visible app nvt-bg-a was evicted"
+    grep -q "of nvt-game " "$DIR/policy.log" && fail "the foreground game was evicted"
+    grep -qE "of nvt-idle-" "$DIR/policy.log" || fail "no hidden app was evicted for the game"
+    local got_off got_on
+    got_off=$(sed -n 's/^START .*allocated_mb=\([0-9]*\).*/\1/p' "$DIR/nvt-game-auto-off.log")
+    got_on=$(sed -n 's/^START .*allocated_mb=\([0-9]*\).*/\1/p' "$DIR/nvt-game.log")
+    note "game got $got_off MB without eviction, $got_on MB with it"
+    [[ ${got_on:-0} -gt $(( ${got_off:-0} + 1024 )) ]] || fail "the game did not get the hidden apps' memory"
+    : >"$H"
+    finish game
+}
+
+mkdir -p "$LOGROOT"
+case ${1:-} in
+    integrity) integrity "${2:-}" ;;
+    active) active "${2:-}" ;;
+    quiesce) quiesce_matrix "${2:-}" ;;
+    chrome) chrome "${2:-}" "${3:-}" ;;
+    switch) switch_test "${2:-}" ;;
+    game) game "${2:-}" ;;
+    all)
+        rc=0
+        integrity || rc=1
+        active || rc=1
+        chrome 5 anim || rc=1
+        chrome 3 idle || rc=1
+        switch_test 5 || rc=1
+        game 30 || rc=1
+        echo "== summary"
+        cat "$LOGROOT/summary.txt"
+        exit $rc ;;
+    *) sed -n '2,25p' "$0"; exit 2 ;;
+esac

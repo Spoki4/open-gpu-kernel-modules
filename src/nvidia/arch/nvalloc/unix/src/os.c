@@ -660,9 +660,23 @@ NvU32 osGetCurrentProcess(void)
     return os_get_current_process();
 }
 
+// Local patch: window state hint of a process (vidmem_evict.c), see os_get_vidmem_hint().
+NvU32 osGetVidmemHint(NvU32 pid, NvU32 *pGeneration)
+{
+    return os_get_vidmem_hint(pid, pGeneration);
+}
+
 void osGetCurrentProcessName(char *ProcName, NvU32 Length)
 {
     return os_get_current_process_name(ProcName, Length);
+}
+
+// Local patch: the process (thread group leader) name, for the vidmem user
+// reserve in mem_mgr/video_mem.c.
+void osGetCurrentProcessLeaderName(char *ProcName, NvU32 Length);
+void osGetCurrentProcessLeaderName(char *ProcName, NvU32 Length)
+{
+    os_get_current_process_leader_name(ProcName, Length);
 }
 
 NV_STATUS osGetCurrentThread(OS_THREAD_HANDLE *pThreadId)

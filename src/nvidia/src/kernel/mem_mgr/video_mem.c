@@ -25,6 +25,8 @@
 #include "gpu/mem_mgr/mem_desc.h"
 #include "gpu/mem_mgr/heap.h"
 #include "gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.h"
+#include "gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator_private.h" // local patch: region list
+#include "gpu/mem_mgr/phys_mem_allocator/regmap.h"                    // local patch: block scan
 #include "gpu/mem_mgr/mem_mgr.h"
 #include "gpu/mem_mgr/mem_utils.h"
 #include "gpu/mem_sys/kern_mem_sys.h"
@@ -102,6 +104,427 @@ _vidmemQueryAlignment
     return rmStatus;
 }
 
+//
+// Local patch: keep a slice of vidmem free for the desktop compositor.
+//
+// When a game fills vidmem, the Wayland compositor can no longer allocate its
+// scanout buffers (nvidia-drm only falls back to sysmem for NO_SCANOUT GEM
+// objects) and the whole desktop freezes. With RmVidmemUserReserveMB set
+// (NVreg_RegistryDwords="RmVidmemUserReserveMB=768"), the bottom that many MB
+// of vidmem belong to the compositor: allocations made by ordinary processes
+// get a PMA address range above it (PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE) and
+// fail with NV_ERR_NO_MEMORY once the free memory outside the block is used
+// up. A block rather than a byte count, because scanout buffers must be
+// physically contiguous: with only a byte reserve, a game freeing and
+// re-allocating at the limit left 776 MB free but 66 MB (often less)
+// contiguous (see local/HANDOFF.md). The compositor and kernel threads keep
+// PMA's bottom-up placement for contiguous allocations, and their
+// non-contiguous ones (textures, pixmaps) go top-down, so they use the block
+// only once everything above is taken. Reserve-bound processes are told the
+// free memory outside the block as HEAP_FREE, which their Vulkan/DXGI memory
+// budget is built from.
+//
+// Exempt: the compositor processes listed below, matched by the RM client's
+// name (process name recorded when the client was created) or by the current
+// thread's name, and kernel clients when they allocate from a kernel thread.
+// nvkms also allocates with kernel privilege inside the ioctl of whichever
+// process asked for a GEM or dumb buffer (GBM, DRM_IOCTL_MODE_CREATE_DUMB);
+// those allocations count against that process, and nvidia-drm then falls
+// back to sysmem for NO_SCANOUT buffers.
+// 0 or unset disables all of this.
+//
+#define NV_REG_STR_RM_VIDMEM_USER_RESERVE_MB "RmVidmemUserReserveMB"
+
+static const char * const _vidmemReserveExemptProcs[] =
+{
+    "kwin_wayland",
+    "Xwayland",
+};
+
+static NvBool
+_vidmemIsReserveExempt(const char *name)
+{
+    NvU32 i;
+
+    for (i = 0; i < NV_ARRAY_ELEMENTS(_vidmemReserveExemptProcs); i++)
+    {
+        if (portStringCompare(name, _vidmemReserveExemptProcs[i], NV_PROC_NAME_MAX_LENGTH) == 0)
+            return NV_TRUE;
+    }
+    return NV_FALSE;
+}
+
+static NvU32 _vidmemUserReserveMB = NV_U32_MAX; // NV_U32_MAX: registry not read yet
+
+// Local patch: for mem_mgr/vidmem_evict.c
+NvBool vidmemIsReserveExemptName(const char *name);
+NvBool vidmemUserReserveBoundRangeAny(PMA *pPma, NvU64 pageSize, NvU64 *pBegin, NvU64 *pEnd);
+void vidmemEvictAutoInit(OBJGPU *pGpu, NvU32 reserveMB);
+void vidmemEvictNoteBlock(PMA *pPma);
+NV_STATUS vidmemEvictNoteDupBar1(MEMORY_DESCRIPTOR *pMemDesc);
+NvBool vidmemEvictWantBorn(OBJGPU *pGpu, RmClient *pRmClient, NV_MEMORY_ALLOCATION_PARAMS *pAllocData);
+NvBool vidmemEvictMakeRoom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size);
+NvU64 vidmemEvictReclaimableFor(RmClient *pRmClient);
+NV_STATUS vidmemEvictBornAllocation(OBJGPU *pGpu, Memory *pMemory);
+
+NvBool
+vidmemIsReserveExemptName(const char *name)
+{
+    return _vidmemIsReserveExempt(name);
+}
+
+void osGetCurrentProcessLeaderName(char *ProcName, NvU32 Length); // arch/nvalloc/unix/src/os.c
+
+// Used by osapi.c (vidmem_pma), kern_mem_sys_ctrl.c (HEAP_FREE) and
+// phys_mem_allocator.c (pmaAllocatePages).
+NvBool vidmemGetUserReserveBlockInfo(PMA *pPma, NvU64 *pBlockBytes, NvU64 *pFreeBytes,
+                                     NvU64 *pLargestFreeBytes);
+NvU64 vidmemUserReserveReportedFree(PMA *pPma, RmClient *pRmClient, NvU64 freeBytes);
+NvBool vidmemUserReservePmaRange(PMA *pPma, NvU64 pageSize, NvU64 *pBegin, NvU64 *pEnd);
+
+//
+// The physical range reserve-bound allocations may use: everything above the
+// bottom _vidmemUserReserveMB of the lowest PMA region, aligned to pageSize.
+//
+static NvBool
+_vidmemReserveBoundRange
+(
+    PMA   *pPma,
+    NvU64  pageSize,
+    NvU64 *pBegin,
+    NvU64 *pEnd
+)
+{
+    static NvBool bLogged;
+    NvU64         base = NV_U64_MAX;
+    NvU64         limit = 0;
+    NvU32         i;
+
+    if ((_vidmemUserReserveMB == 0) || (_vidmemUserReserveMB == NV_U32_MAX))
+        return NV_FALSE;
+
+    for (i = 0; i < pPma->regSize; i++)
+    {
+        PMA_REGION_DESCRIPTOR *pDesc = pPma->pRegDescriptors[i];
+
+        if ((pDesc == NULL) || pDesc->bProtected)
+            continue;
+        if (!bLogged)
+            NV_PRINTF(LEVEL_ERROR, "vidmem user reserve: PMA region %u 0x%llx-0x%llx%s\n",
+                      i, pDesc->base, pDesc->limit, pDesc->bSupportISO ? " ISO" : "");
+        base  = NV_MIN(base, pDesc->base);
+        limit = NV_MAX(limit, pDesc->limit);
+    }
+    bLogged = NV_TRUE;
+
+    if (base == NV_U64_MAX)
+        return NV_FALSE;
+
+    *pBegin = NV_ALIGN_UP(base + ((NvU64)_vidmemUserReserveMB << 20), pageSize);
+    *pEnd   = NV_ALIGN_DOWN(limit + 1, pageSize);
+    if (*pEnd <= *pBegin)
+        return NV_FALSE;
+    *pEnd -= 1;
+    return NV_TRUE;
+}
+
+// The reserve-bound range regardless of the calling thread (the eviction
+// worker is a kernel thread but restores memory of ordinary processes).
+NvBool
+vidmemUserReserveBoundRangeAny(PMA *pPma, NvU64 pageSize, NvU64 *pBegin, NvU64 *pEnd)
+{
+    return (pPma != NULL) && _vidmemReserveBoundRange(pPma, pageSize, pBegin, pEnd);
+}
+
+// The frame map of the lowest unprotected PMA region, which holds the block.
+static PMA_REGMAP *
+_vidmemReserveBlockRegmap(PMA *pPma)
+{
+    PMA_REGMAP *pRegmap = NULL;
+    NvU64       lowest = NV_U64_MAX;
+    NvU32       i;
+
+    for (i = 0; i < pPma->regSize; i++)
+    {
+        PMA_REGION_DESCRIPTOR *pDesc = pPma->pRegDescriptors[i];
+
+        if ((pDesc != NULL) && !pDesc->bProtected && (pDesc->base < lowest))
+        {
+            lowest  = pDesc->base;
+            pRegmap = (PMA_REGMAP *)pPma->pRegions[i];
+        }
+    }
+    return pRegmap;
+}
+
+// Free bytes inside the bottom block (popcount over its ~200 map words).
+static NvU64
+_vidmemReserveBlockFreeBytes(PMA *pPma)
+{
+    PMA_REGMAP *pRegmap = _vidmemReserveBlockRegmap(pPma);
+    NvU64       frames, word, used = 0, idx;
+
+    if (pRegmap == NULL)
+        return 0;
+
+    frames = NV_MIN(((NvU64)_vidmemUserReserveMB << 20) >> PMA_PAGE_SHIFT, pRegmap->totalFrames);
+
+    portSyncSpinlockAcquire(pPma->pPmaLock);
+    for (idx = 0; idx < (frames >> 6); idx++)
+    {
+        word = pRegmap->map[MAP_IDX_ALLOC_UNPIN][idx] | pRegmap->map[MAP_IDX_ALLOC_PIN][idx];
+        used += nvPopCount64(word);
+    }
+    if ((frames & 63) != 0)
+    {
+        word = pRegmap->map[MAP_IDX_ALLOC_UNPIN][idx] | pRegmap->map[MAP_IDX_ALLOC_PIN][idx];
+        used += nvPopCount64(word & (NVBIT64(frames & 63) - 1));
+    }
+    portSyncSpinlockRelease(pPma->pPmaLock);
+
+    return (frames - used) << PMA_PAGE_SHIFT;
+}
+
+//
+// Local patch, for /proc/driver/nvidia/gpus/<bdf>/vidmem_pma: size of the
+// bottom reserve block and how much of it is free / largest contiguous free,
+// read from the PMA frame bitmap. Returns NV_FALSE if the reserve is off.
+//
+NvBool
+vidmemGetUserReserveBlockInfo
+(
+    PMA   *pPma,
+    NvU64 *pBlockBytes,
+    NvU64 *pFreeBytes,
+    NvU64 *pLargestFreeBytes
+)
+{
+    PMA_REGMAP *pRegmap;
+    NvU64       frames, frame, run = 0, freeFrames = 0, largest = 0;
+
+    *pBlockBytes = *pFreeBytes = *pLargestFreeBytes = 0;
+
+    if ((pPma == NULL) || (_vidmemUserReserveMB == 0) || (_vidmemUserReserveMB == NV_U32_MAX))
+        return NV_FALSE;
+
+    pRegmap = _vidmemReserveBlockRegmap(pPma);
+
+    portSyncSpinlockAcquire(pPma->pPmaLock);
+
+    if (pRegmap != NULL)
+    {
+        frames = NV_MIN(((NvU64)_vidmemUserReserveMB << 20) >> PMA_PAGE_SHIFT, pRegmap->totalFrames);
+        for (frame = 0; frame < frames; frame++)
+        {
+            NvU64 word = pRegmap->map[MAP_IDX_ALLOC_UNPIN][frame >> 6] |
+                         pRegmap->map[MAP_IDX_ALLOC_PIN][frame >> 6];
+
+            if ((word >> (frame & 63)) & 1)
+            {
+                run = 0;
+            }
+            else
+            {
+                freeFrames++;
+                run++;
+                largest = NV_MAX(largest, run);
+            }
+        }
+        *pBlockBytes       = frames << PMA_PAGE_SHIFT;
+        *pFreeBytes        = freeFrames << PMA_PAGE_SHIFT;
+        *pLargestFreeBytes = largest << PMA_PAGE_SHIFT;
+    }
+
+    portSyncSpinlockRelease(pPma->pPmaLock);
+
+    return (pRegmap != NULL);
+}
+
+static NvBool
+_vidmemIsReserveExemptContext
+(
+    CALL_CONTEXT *pCallContext,
+    RmClient     *pRmClient,
+    char         *procName,
+    NvU32         procNameSize
+)
+{
+    portMemSet(procName, 0, procNameSize);
+
+    if ((pCallContext->secInfo.privLevel >= RS_PRIV_LEVEL_KERNEL) &&
+        ((osGetCurrentProcessFlags() & OS_CURRENT_PROCESS_FLAG_KERNEL_THREAD) != 0))
+        return NV_TRUE;
+
+    if (pRmClient != NULL && _vidmemIsReserveExempt(pRmClient->name))
+        return NV_TRUE;
+
+    osGetCurrentProcessName(procName, procNameSize);
+    if (_vidmemIsReserveExempt(procName))
+        return NV_TRUE;
+
+    // A renamed thread of an exempt process (procName keeps the thread name for the log).
+    {
+        char leader[NV_PROC_NAME_MAX_LENGTH];
+
+        portMemSet(leader, 0, sizeof(leader));
+        osGetCurrentProcessLeaderName(leader, sizeof(leader));
+        return _vidmemIsReserveExempt(leader);
+    }
+}
+
+//
+// Local patch, called by pmaAllocatePages() for every PMA allocation that does
+// not already carry an address range. Allocations RM makes internally on behalf
+// of a process (GR context buffers, page tables, channel memory...) do not go
+// through vidmemConstruct, and PMA places them bottom-up, i.e. into the
+// reserve block: every new GPU process (a game, a restarted browser) ate into
+// it and left holes behind (block 359 -> 97 MB free, 34 MB contiguous). Unless
+// the calling thread belongs to an exempt process (by thread or process name)
+// or is a kernel thread, those allocations get the range above the block too.
+//
+NvBool
+vidmemUserReservePmaRange
+(
+    PMA   *pPma,
+    NvU64  pageSize,
+    NvU64 *pBegin,
+    NvU64 *pEnd
+)
+{
+    char name[NV_PROC_NAME_MAX_LENGTH];
+
+    if ((_vidmemUserReserveMB == 0) || (_vidmemUserReserveMB == NV_U32_MAX) || (pPma == NULL))
+        return NV_FALSE;
+
+    if ((osGetCurrentProcessFlags() & OS_CURRENT_PROCESS_FLAG_KERNEL_THREAD) != 0)
+        return NV_FALSE;
+
+    portMemSet(name, 0, sizeof(name));
+    osGetCurrentProcessName(name, sizeof(name));
+    if (_vidmemIsReserveExempt(name))
+        return NV_FALSE;
+
+    portMemSet(name, 0, sizeof(name));
+    osGetCurrentProcessLeaderName(name, sizeof(name));
+    if (_vidmemIsReserveExempt(name))
+        return NV_FALSE;
+
+    return _vidmemReserveBoundRange(pPma, pageSize, pBegin, pEnd);
+}
+
+//
+// Local patch: free vidmem as reported to a client through
+// NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE. The userspace driver builds the Vulkan
+// memory budget (VK_EXT_memory_budget, DXGI's budget under vkd3d-proton) as
+// "own usage + free", so without this a game at the limit still counts the
+// free part of the block as its budget, plans its texture streaming for it
+// and runs into denials. Reserve-bound callers get the free memory outside
+// the block; exempt callers and kernel threads the real value.
+//
+NvU64
+vidmemUserReserveReportedFree
+(
+    PMA      *pPma,
+    RmClient *pRmClient,
+    NvU64     freeBytes
+)
+{
+    CALL_CONTEXT *pCallContext = resservGetTlsCallContext();
+    char          procName[NV_PROC_NAME_MAX_LENGTH];
+    NvU64         blockFree;
+
+    if ((_vidmemUserReserveMB == 0) || (_vidmemUserReserveMB == NV_U32_MAX) ||
+        (pCallContext == NULL) || (pPma == NULL))
+        return freeBytes;
+
+    if (_vidmemIsReserveExemptContext(pCallContext, pRmClient, procName, sizeof(procName)))
+        return freeBytes;
+
+    blockFree = _vidmemReserveBlockFreeBytes(pPma);
+    //
+    // A visible process (window hints) is also told about the vidmem hidden
+    // processes could give up: allocating it moves them out
+    // (vidmemEvictMakeRoom()).
+    //
+    return ((freeBytes > blockFree) ? (freeBytes - blockFree) : 0) + vidmemEvictReclaimableFor(pRmClient);
+}
+
+//
+// Returns NV_ERR_NO_MEMORY if the free memory outside the block cannot hold
+// the allocation (PMA would fail it anyway because of the address range; this
+// logs it and skips the scan).
+// *pbReserveBound is set when the allocation counts against the reserve and
+// so must stay out of the bottom block (see _vidmemReserveBoundRange);
+// *pbExempt when the reserve is on and the caller is exempt from it.
+//
+static NV_STATUS
+_vidmemCheckUserReserve
+(
+    OBJGPU       *pGpu,
+    Heap         *pHeap,
+    CALL_CONTEXT *pCallContext,
+    RmClient     *pRmClient,
+    NvU64         size,
+    NvBool       *pbReserveBound,
+    NvBool       *pbExempt
+)
+{
+    static NvU32 denyCount;
+    NvU32        reserveMB;
+    char         procName[NV_PROC_NAME_MAX_LENGTH];
+    NvU64        freeBytes = 0;
+    NvU64        blockFree;
+    NvU64        outsideFree;
+
+    *pbReserveBound = NV_FALSE;
+    *pbExempt = NV_FALSE;
+
+    if (_vidmemUserReserveMB == NV_U32_MAX)
+    {
+        NvU32 data32 = 0;
+
+        if (osReadRegistryDword(pGpu, NV_REG_STR_RM_VIDMEM_USER_RESERVE_MB, &data32) != NV_OK)
+            data32 = 0;
+        _vidmemUserReserveMB = data32;
+        if (data32 != 0)
+            NV_PRINTF(LEVEL_ERROR, "vidmem user reserve: %u MB, kept at the bottom of vidmem\n",
+                      data32);
+        vidmemEvictAutoInit(pGpu, data32);
+    }
+    reserveMB = _vidmemUserReserveMB;
+
+    if ((reserveMB == 0) || (pHeap == NULL) || (pHeap->pPmaObject == NULL))
+        return NV_OK;
+
+    if (_vidmemIsReserveExemptContext(pCallContext, pRmClient, procName, sizeof(procName)))
+    {
+        *pbExempt = NV_TRUE;
+        return NV_OK;
+    }
+
+    *pbReserveBound = NV_TRUE;
+
+    pmaGetFreeMemory(pHeap->pPmaObject, &freeBytes);
+    blockFree   = _vidmemReserveBlockFreeBytes(pHeap->pPmaObject);
+    outsideFree = (freeBytes > blockFree) ? (freeBytes - blockFree) : 0;
+    if (outsideFree >= size)
+        return NV_OK;
+
+    denyCount++;
+    if (denyCount <= 8 || (denyCount % 1024) == 0)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "vidmem user reserve: denied %llu KB to %s/%s (pid %u%s), free %llu MB, "
+                  "%llu MB of it in the reserve block, denials %u\n",
+                  size >> 10, (pRmClient != NULL) ? pRmClient->name : "?", procName,
+                  osGetCurrentProcess(),
+                  (pCallContext->secInfo.privLevel >= RS_PRIV_LEVEL_KERNEL) ? ", kernel client" : "",
+                  freeBytes >> 20, blockFree >> 20, denyCount);
+    }
+
+    return NV_ERR_NO_MEMORY;
+}
+
 /*!
  * _vidmemPmaAllocate
  *
@@ -110,6 +533,10 @@ _vidmemQueryAlignment
  *
  * @param[in] pHeap         Pointer to Heap object
  * @param[in] pAllocRequest Pointer to the MEMORY_ALLOCATION_REQUEST.
+ * @param[in] bReserveBound Local patch: keep out of the bottom reserve block
+ *                          (see _vidmemCheckUserReserve).
+ * @param[in] bExempt       Local patch: caller is exempt from the reserve;
+ *                          non-contiguous allocations go top-down.
  *
  * @returns
  *      NV_OK    Operation is successful
@@ -119,7 +546,10 @@ static NV_STATUS
 _vidmemPmaAllocate
 (
     Heap                      *pHeap,
-    MEMORY_ALLOCATION_REQUEST *pAllocRequest
+    MEMORY_ALLOCATION_REQUEST *pAllocRequest,
+    NvBool                     bReserveBound,
+    NvBool                     bExempt,
+    NvBool                     bAnywhere
 )
 {
     NV_MEMORY_ALLOCATION_PARAMS *pAllocData     = pAllocRequest->pUserParams;
@@ -232,6 +662,13 @@ _vidmemPmaAllocate
         allocOptions.flags |= PMA_ALLOCATE_REVERSE_ALLOC;
     }
 
+    // Local patch: keep the compositor's non-contiguous allocations out of the
+    // bottom reserve block while there is room above (PMA: no reverse on NUMA).
+    if (bExempt && !bContig && !(pmaConfig & PMA_QUERY_NUMA_ENABLED))
+    {
+        allocOptions.flags |= PMA_ALLOCATE_REVERSE_ALLOC;
+    }
+
     // Fixed address allocations.
     if (pAllocData->flags & NVOS32_ALLOC_FLAGS_FIXED_ADDRESS_ALLOCATE)
     {
@@ -253,6 +690,34 @@ _vidmemPmaAllocate
                                           allocOptions.physEnd - 1 : 0;
         NV_ASSERT_OR_RETURN(allocOptions.physBegin <= allocOptions.physEnd,
                          NV_ERR_INVALID_ARGUMENT);
+    }
+
+    // Local patch: reserve-bound allocations stay above the bottom reserve block.
+    if (bReserveBound && !(allocOptions.flags & PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE))
+    {
+        NvU64 physBegin, physEnd;
+
+        if (_vidmemReserveBoundRange(pPma, pageSize, &physBegin, &physEnd))
+        {
+            allocOptions.flags |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
+            allocOptions.physBegin = physBegin;
+            allocOptions.physEnd   = physEnd;
+        }
+    }
+
+    //
+    // Local patch: an allocation that goes to sysmem right after this
+    // (vidmemEvictBornAllocation) may sit anywhere for that moment, the
+    // reserve block included. An explicit whole range, so pmaAllocatePages()
+    // does not add the above-the-block one.
+    //
+    if (bAnywhere && !(allocOptions.flags & PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE))
+    {
+        NvU64 align = NV_MAX(sizeAlign, pageSize);
+
+        allocOptions.flags    |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
+        allocOptions.physBegin = 0;
+        allocOptions.physEnd   = NV_ALIGN_DOWN64(NV_U64_MAX, align) - 1;
     }
 
     // Skip scrubber, used only by scrubber construction path
@@ -476,9 +941,14 @@ vidmemCopyConstruct
 
     if (kbusShouldRefcountConstruct_HAL(pGpu, pKernelBus, pMemDesc))
     {
-        // No flags specified on the initial static BAR1 mapping 
-        status = kbusIncreaseStaticBar1Refcount_HAL(pGpu, pKernelBus,
-                       pMemDesc, BUS_MAP_FB_FLAGS_NONE);
+        // No flags specified on the initial static BAR1 mapping
+        // (local patch: not for an allocation moved to sysmem: its vidmem pages
+        // belong to someone else now; the reference is taken on restore)
+        if (pMemDesc->pLocalEvictState != NULL)
+            status = vidmemEvictNoteDupBar1(pMemDesc);
+        else
+            status = kbusIncreaseStaticBar1Refcount_HAL(pGpu, pKernelBus,
+                           pMemDesc, BUS_MAP_FB_FLAGS_NONE);
 
         if (status == NV_OK)
         {
@@ -586,6 +1056,7 @@ vidmemConstruct_IMPL
     NvU64                        offsetOut;
     NvU64                        offsetOutTemp;
     NvBool                       bLockAcquired         = NV_FALSE;
+    NvBool                       bBornEvicted          = NV_FALSE; // local patch
     NvU32                        attr                  = 0;
     NvU32                        attr2                 = 0;
     FB_ALLOC_INFO               *pFbAllocInfo          = NULL;
@@ -707,12 +1178,51 @@ vidmemConstruct_IMPL
     // Get the allocation from PMA if enabled.
     if (bIsPmaAlloc)
     {
+        NvBool bReserveBound = NV_FALSE;
+        NvBool bExempt = NV_FALSE;
+
+        rmStatus = _vidmemCheckUserReserve(pGpu, vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE),
+                                           pCallContext, pRmClient, pAllocData->size,
+                                           &bReserveBound, &bExempt);
+
+        //
+        // Local patch: a visible process the reserve would turn away gets
+        // room made by moving hidden processes to sysmem (window hints).
+        //
+        if ((rmStatus == NV_ERR_NO_MEMORY) && bReserveBound &&
+            vidmemEvictMakeRoom(pGpu, pRmClient, pAllocData->size))
+        {
+            rmStatus = _vidmemCheckUserReserve(pGpu, vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE),
+                                               pCallContext, pRmClient, pAllocData->size,
+                                               &bReserveBound, &bExempt);
+        }
+
+        //
+        // Local patch: a background process the reserve would turn away gets
+        // the allocation in sysmem instead (allocated, then evicted at once;
+        // it comes back to vidmem with the process when there is room).
+        //
+        if ((rmStatus == NV_ERR_NO_MEMORY) && bReserveBound &&
+            vidmemEvictWantBorn(pGpu, pRmClient, pAllocData))
+        {
+            rmStatus      = NV_OK;
+            bReserveBound = NV_FALSE;
+            bBornEvicted  = NV_TRUE;
+        }
+        if (NV_OK != rmStatus)
+            goto done;
+
         SLI_LOOP_START(SLI_LOOP_FLAGS_BC_ONLY | SLI_LOOP_FLAGS_IGNORE_REENTRANCY)
         pAllocRequest->pGpu = pGpu;
-        rmStatus = _vidmemPmaAllocate(vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE), pAllocRequest);
+        rmStatus = _vidmemPmaAllocate(vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE), pAllocRequest,
+                                      bReserveBound, bExempt, bBornEvicted);
         if (NV_OK != rmStatus)
             SLI_LOOP_GOTO(done);
         SLI_LOOP_END;
+
+        // Local patch: track how low the reserve block gets (vidmem_evict.c status).
+        if (bExempt)
+            vidmemEvictNoteBlock(vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE)->pPmaObject);
     }
 
     if (RMCFG_FEATURE_RM_BASIC_LOCK_MODEL)
@@ -1109,6 +1619,10 @@ vidmemConstruct_IMPL
     pAllocData->offset = offsetOut;
 
     stdmemDumpOutputAllocParams(pAllocData);
+
+    // Local patch: move it to sysmem now (if that fails it just stays in vidmem).
+    if (bBornEvicted)
+        (void)vidmemEvictBornAllocation(pGpu, pMemory);
 
 done:
     if (pMemory->pCharge != NULL && rmStatus != NV_OK)

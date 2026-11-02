@@ -774,6 +774,40 @@ ceutilsMemset_IMPL
     return status;
 }
 
+//
+// Largest copy that can start at `offset` of a non-contiguous memdesc: the
+// rest of the current page, plus following pages for as long as their PTE
+// addresses (what CE is programmed with) continue the run. Sysmem is
+// allocated in large compound pages but described with 4K page arrays, and
+// PMA hands out vidmem in runs too; copying page by page costs one GPFIFO
+// entry and doorbell per 4K (2026-11-02: ~1.1 GB/s for vidmem eviction,
+// 450 ms per 512 MB). Capped so one CE launch stays bounded.
+//
+#define CEUTILS_MERGE_MAX_BYTES (256ULL << 20)
+
+static NvU64
+_ceutilsContigRun
+(
+    MEMORY_DESCRIPTOR  *pMemDesc,
+    ADDRESS_TRANSLATION addrTranslation,
+    NvU64               offset,
+    NvU64               maxLength,
+    NvU64               pageGranularity
+)
+{
+    NvU64 phys = memdescGetPhysAddr(pMemDesc, addrTranslation, offset);
+    NvU64 pte  = memdescGetPtePhysAddr(pMemDesc, addrTranslation, offset);
+    NvU64 run  = pageGranularity - (phys % pageGranularity);
+
+    while ((run < maxLength) && (run < CEUTILS_MERGE_MAX_BYTES))
+    {
+        if (memdescGetPtePhysAddr(pMemDesc, addrTranslation, offset + run) != pte + run)
+            break;
+        run += pageGranularity;
+    }
+    return NV_MIN(run, maxLength);
+}
+
 NV_STATUS
 ceutilsMemcopy_IMPL
 (
@@ -868,8 +902,10 @@ ceutilsMemcopy_IMPL
         //
         NvU64 srcAddr = memdescGetPhysAddr(pSrcMemDesc, srcAddrTranslation, srcOffset);
         NvU64 dstAddr = memdescGetPhysAddr(pDstMemDesc, dstAddrTranslation, dstOffset);
-        NvU64 maxContigSizeSrc = bSrcContig ? copyLength : (srcPageGranularity - srcAddr % srcPageGranularity);
-        NvU64 maxContigSizeDst = bDstContig ? copyLength : (dstPageGranularity - dstAddr % dstPageGranularity);
+        NvU64 maxContigSizeSrc = bSrcContig ? copyLength :
+            _ceutilsContigRun(pSrcMemDesc, srcAddrTranslation, srcOffset, copyLength, srcPageGranularity);
+        NvU64 maxContigSizeDst = bDstContig ? copyLength :
+            _ceutilsContigRun(pDstMemDesc, dstAddrTranslation, dstOffset, copyLength, dstPageGranularity);
         NvU32 copySizeContig = (NvU32)NV_MIN(NV_MIN(copyLength, NV_MIN(maxContigSizeSrc, maxContigSizeDst)), CE_MAX_BYTES_PER_LINE);
 
         NV_PRINTF(LEVEL_INFO, "CeUtils Memcopy dstAddr: %llx, srcAddr: %llx, size: %x\n",
