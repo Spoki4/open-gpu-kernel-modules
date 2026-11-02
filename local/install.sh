@@ -66,7 +66,7 @@ install_modules() {
     local version
     version=$(modinfo -F version "$BUILD/nvidia.ko")
     local want
-    want=$(dpkg-query -W -f='${Version}' libnvidia-gl-595:amd64 2>/dev/null | cut -d- -f1)
+    want=$(dpkg-query -W -f='${db:Status-Abbrev} ${Version}\n' 'libnvidia-gl-*:amd64' 2>/dev/null | awk '$1 == "ii" {print $2}' | cut -d- -f1 | sort -V | tail -1)
     [[ $version == "$want" ]] || die "built $version but userspace is $want; versions must match"
     [[ $(modinfo -F vermagic "$BUILD/nvidia.ko" | cut -d' ' -f1) == "$KVER" ]] || die "modules were built for another kernel"
 
