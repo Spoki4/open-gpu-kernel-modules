@@ -56,7 +56,13 @@ status() {
     local k
     k=$(pgrep -u "$(id -u)" -x kwin_wayland | head -1 || true)
     if [[ -n $k ]]; then
-        if tr '\0' '\n' <"/proc/$k/environ" 2>/dev/null | grep -q '^QML_XHR_ALLOW_FILE_WRITE=1$'; then
+        if [[ ! -r /proc/$k/environ ]] || ! tr '\0' '\n' <"/proc/$k/environ" >/dev/null 2>&1; then
+            # KWin is not dumpable (no ptrace), so its environment is unreadable;
+            # entries below prove the script can write.
+            grep -qE '^[0-9]+ [fvh]' "$HINTS" 2>/dev/null &&
+                echo "running kwin_wayland ($k) writes hints" ||
+                echo "running kwin_wayland ($k): no hints yet (log out and back in?)"
+        elif tr '\0' '\n' <"/proc/$k/environ" | grep -q '^QML_XHR_ALLOW_FILE_WRITE=1$'; then
             echo "running kwin_wayland ($k) may write files"
         else
             echo "running kwin_wayland ($k) started without QML_XHR_ALLOW_FILE_WRITE: log out and back in"

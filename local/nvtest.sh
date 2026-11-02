@@ -22,6 +22,10 @@
 #                                    (nvt-webgl.html) moved to sysmem and back
 #   ./nvtest.sh switch [CYCLES]      window hints: fullscreen "game" Chrome B and a hidden
 #                                    Chrome A; alt-tab CYCLES times, switch latency
+#   ./nvtest.sh webgpu [CYCLES]      WebGPU page in Chrome moved and back; a new tab must
+#                                    still get an adapter
+#   ./nvtest.sh fgprio [CYCLES]      two monitors: a visible idle Chrome gives memory to the
+#                                    fullscreen game; clicking between them
 #   ./nvtest.sh quiesce [CYCLES]     active scenario once per stop method
 #                                    (evict.sh quiesce 0..4, NVTEST_MODES="0 2" to pick)
 #   ./nvtest.sh all                  integrity, active, chrome anim+idle, switch, game
@@ -339,6 +343,118 @@ switch_test() {
     finish switch
 }
 
+# Foreground priority on two monitors: Chrome A (a page that redraws every
+# 60 s) stays VISIBLE on monitor 2, the fullscreen "game" Chrome B on monitor
+# 1 needs A's memory. A must give it up (visible but idle) without being
+# shown wrong; then the user clicks A (A foreground, B still visible and
+# drawing): A comes back at once, B gives up only what is missing; then
+# back to B.
+fgprio_test() {
+    local cycles=${1:-3}
+    if seat0_busy && [[ ${NVTEST_FORCE:-0} != 1 ]]; then
+        echo "NVTEST fgprio SKIP somebody is logged in on seat0" | tee -a "$LOGROOT/summary.txt"
+        return 0
+    fi
+    begin fgprio
+    local S="$HERE/nvt-session.sh" t mA mB gA gB free gameMB i lat
+    $S stop >/dev/null 2>&1 || true
+    NVT_OUTPUTS=2 $S start "file://$HERE/nvt-webgl.html?mode=idle&every=60&tex=200" >>"$DIR/notes.txt" 2>&1 ||
+        { fail "session A"; finish fgprio; return 1; }
+    for i in $(seq 1 60); do t=$(title_of a); [[ $t == *"checks="[1-9]* ]] && break; sleep 0.5; done
+    mA=$(NVT_INSTANCE=a $S main-pid); gA=$(NVT_INSTANCE=a $S gpu-pid)
+    $S win screen2 "$mA"
+    note "A on monitor 2: browser $mA gpu $gA, $t"
+    sleep 14    # A idle on the GPU for over 10 s
+    free=$($EVICT status | sed -n 's/.*free outside reserve \([0-9]*\) MB.*/\1/p')
+    gameMB=$(( free + $(vram_of "$gA") ))
+    # B starts streaming 12 s after it opens: A redraws when it loses focus
+    # and must be idle on the GPU for 10 s before it may give up memory.
+    NVT_INSTANCE=b $S start "file://$HERE/nvt-webgl.html?mode=game&mb=$gameMB&delay=12" >>"$DIR/notes.txt" 2>&1 ||
+        { fail "session B"; $S stop; finish fgprio; return 1; }
+    sleep 2
+    mB=$(NVT_INSTANCE=b $S main-pid)
+    $S win screen1 "$mB"
+    sleep 0.5
+    $S win fullscreen "$mB"
+    for i in $(seq 1 240); do t=$(title_of b); [[ $t == *" done=1 "* ]] && break; sleep 0.5; done
+    gB=$(NVT_INSTANCE=b $S gpu-pid)
+    note "B: browser $mB gpu $gB, wants $gameMB MB, $t"
+    grep -q "^$mA v" /proc/driver/nvidia/vidmem_hints || fail "A is not visible on monitor 2 (test setup)"
+    note "hints: $(tr '\n' ' ' < /proc/driver/nvidia/vidmem_hints)"
+    note "after loading: A vram $(vram_of "$gA") ram $(ram_of "$gA") MB; B vram $(vram_of "$gB") ram $(ram_of "$gB") MB"
+    [[ $t == *" done=1 "* && $t == *" oom=0 "* ]] || fail "game B did not load: $t"
+    [[ $(ram_of "$gA") -gt 0 ]] || fail "visible idle A gave up nothing for the foreground game"
+
+    for i in $(seq 1 "$cycles"); do
+        t=$(date +%s.%N)
+        $S win activate "$mA"
+        lat=$(wait_ram "$gA" "$t") || fail "cycle $i: A not back within 10 s"
+        sleep 2
+        note "cycle $i click A: A back in ${lat} s; B (visible, drawing) ram $(ram_of "$gB") MB, $(title_of b | grep -o 'fps=[0-9]*')"
+        t=$(date +%s.%N)
+        $S win activate "$mB"
+        lat=$(wait_ram "$gB" "$t") || fail "cycle $i: B not back within 10 s"
+        sleep 2
+        note "cycle $i click B: B back in ${lat} s; $(title_of b | grep -o 'fps=[0-9]*'); A ram $(ram_of "$gA") MB"
+    done
+    for i in a b; do
+        t=$(title_of $i)
+        note "final $i: $t"
+        [[ $t == *" bad=0 "* && $t == *" lost=0 "* ]] || fail "page $i output changed or context lost: $t"
+    done
+    journalctl -k --since "$T0" --no-pager | grep -E "vidmem evict: hints" | cut -c 40- >"$DIR/policy.log" || true
+    $S stop
+    finish fgprio
+}
+
+# WebGPU in a real Chrome (Dawn on Vulkan): nvt-webgpu.html checks and
+# rewrites 512 MB of storage buffers every frame while the GPU process is
+# moved to sysmem and back CYCLES times. Afterwards a new tab must still get
+# a WebGPU adapter and device (2026-11-02 morning: after an eviction
+# experiment Chrome reported "WebGPU unsupported / no adapter").
+webgpu_test() {
+    local cycles=${1:-5} S="$HERE/nvt-session.sh" g i r t t2
+    begin webgpu
+    $S stop >/dev/null 2>&1 || true
+    $S start "file://$HERE/nvt-webgpu.html?mb=512" >>"$DIR/notes.txt" 2>&1 || { fail "session"; finish webgpu; return 1; }
+    for i in $(seq 1 60); do t=$($S title 2>/dev/null | grep '^WGPU' | head -1 || true); [[ $t == *"checks="[1-9]* ]] && break; sleep 0.5; done
+    g=$($S gpu-pid)
+    note "gpu process $g, page: $t"
+    [[ $t == *"checks="[1-9]* ]] || { fail "WebGPU page not running: '$t'"; $S stop; finish webgpu; return 1; }
+    local m
+    m=$($S main-pid)
+    for i in $(seq 1 "$cycles"); do
+        # Minimized while moved out (else the policy brings the foreground
+        # page back at once); WebGPU keeps running from sysmem meanwhile.
+        $S win minimize "$m"
+        sleep 0.5
+        r=$(evict_op evict "$g" "cycle $i")
+        sleep 3
+        $S win activate "$m"
+        sleep 0.5
+        note "cycle $i evict: ${r:-none} | $($S title | grep '^WGPU' | head -1 || true)"
+        r=$(evict_op restore "$g" "cycle $i")
+        sleep 3
+        note "cycle $i restore: ${r:-none} | $($S title | grep '^WGPU' | head -1 || true)"
+    done
+    t=$($S title | grep '^WGPU' | head -1 || true)
+    sleep 2
+    t2=$($S title | grep '^WGPU' | head -1 || true)
+    note "final: $t2"
+    [[ $t2 == *" errors=0 "* ]] || fail "WebGPU buffer content wrong: $t2"
+    [[ $t2 == *" lost=0 "* ]] || fail "WebGPU device lost: $t2"
+    [[ $t != "$t2" ]] || fail "WebGPU page stopped drawing: $t2"
+    # A fresh page must still get an adapter and a device.
+    curl -s -X PUT "http://127.0.0.1:9333/json/new?file://$HERE/nvt-webgpu.html?probe=1" >/dev/null
+    for i in $(seq 1 20); do r=$($S title | grep '^WGPU probe' | head -1 || true); [[ -n $r ]] && break; sleep 0.5; done
+    note "new tab: ${r:-no answer}"
+    [[ $r == *"adapter=ok device=ok"* ]] || fail "WebGPU unavailable after the moves: ${r:-no answer}"
+    grep -iE "GPU process exited|GPU process crashed|Lost UI shared context|context lost" /tmp/nvt-chrome/chrome-a.log >"$DIR/chrome-gpu-errors.log" &&
+        fail "chrome GPU process trouble: $(head -1 "$DIR/chrome-gpu-errors.log" | cut -c1-120)"
+    $S stop
+    finish webgpu
+}
+
 # Every stop method (evict.sh quiesce 0..4) against the active scenario.
 quiesce_matrix() {
     local cycles=${1:-2} m
@@ -402,6 +518,8 @@ case ${1:-} in
     quiesce) quiesce_matrix "${2:-}" ;;
     chrome) chrome "${2:-}" "${3:-}" ;;
     switch) switch_test "${2:-}" ;;
+    fgprio) fgprio_test "${2:-}" ;;
+    webgpu) webgpu_test "${2:-}" ;;
     game) game "${2:-}" ;;
     all)
         rc=0
@@ -409,7 +527,9 @@ case ${1:-} in
         active || rc=1
         chrome 5 anim || rc=1
         chrome 3 idle || rc=1
+        webgpu_test 5 || rc=1
         switch_test 5 || rc=1
+        fgprio_test 3 || rc=1
         game 30 || rc=1
         echo "== summary"
         cat "$LOGROOT/summary.txt"

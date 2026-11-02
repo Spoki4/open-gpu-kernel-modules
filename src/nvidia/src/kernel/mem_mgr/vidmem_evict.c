@@ -1929,6 +1929,7 @@ typedef struct
     NvU32 recentSamples;  // samples in the last ~10 s (decayed per tick)
     NvU64 firstSeenNs;    // monotonic ns when the policy first saw it
     NvU64 lastVisibleNs;  // monotonic ns when a hint last said visible/foreground
+    NvU64 evictedForFgNs; // monotonic ns when it was moved out (while visible) for the foreground
 } VIDMEM_EVICT_ACTIVITY;
 
 //
@@ -2397,21 +2398,52 @@ _vidmemEvictBusiestPid(VIDMEM_EVICT_PROC *pProcs, NvU32 count)
 }
 
 //
+// Foreground priority (2026-11-02 12:45, CoD with Chrome, ghostty and the
+// Steam window open on the second monitor: 30 fps, 60 once they were
+// closed; the policy could take only 212 MB of hidden apps). For the
+// foreground process a visible window whose process has been idle on the
+// GPU for VIDMEM_EVICT_VISIBLE_IDLE_SEC may give up its memory too: kwin
+// keeps showing it (window buffers stay in vidmem), only the app's own
+// textures move. It comes back when it is activated, or after
+// VIDMEM_EVICT_FG_HOLD_SEC when there is room without moving anything.
+//
+#define VIDMEM_EVICT_VISIBLE_IDLE_SEC 10
+#define VIDMEM_EVICT_FG_HOLD_SEC      60
+
+//
+// Who may give up memory (VE_LEVEL_*):
+//   HIDDEN  hidden and idle windowless processes (pressure, visible apps)
+//   FG_IDLE + visible ones idle on the GPU (the foreground's budget)
+//   FG      + visible ones still drawing, last and only what is missing (the
+//           foreground's allocations and its restore: when the user switches
+//           to Chrome on the second monitor while the game stays visible on
+//           the first, Chrome wins; the game gets its memory back the moment
+//           it is the foreground again, ~0.1 s)
+//
+#define VE_LEVEL_HIDDEN  0
+#define VE_LEVEL_FG_IDLE 1
+#define VE_LEVEL_FG      2
+
+//
 // May `p` be moved out to make room, by the window hints? Hidden (own
 // windows, or inherited after the grace period), or no window anywhere in
-// its ancestry and idle on the GPU. Never the caller (`exceptPid`), the
+// its ancestry and idle on the GPU; for the foreground process also visible
+// ones (see VE_LEVEL_*). Never the foreground, the caller (`exceptPid`), the
 // desktop, or a process that needed a buffer back a moment ago.
 //
 static NvBool
-_vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs)
+_vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs, NvU32 level)
 {
     VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(p->pid, NV_TRUE);
     NvU32 st = VE_HINT_STATE(p->hint);
 
     if (p->bNever || (p->pid == exceptPid) || (p->eligibleBytes < (4ULL << 20)))
         return NV_FALSE;
-    if (st >= VE_HINT_VISIBLE)
+    if (st == VE_HINT_FG)
         return NV_FALSE;
+    if (st == VE_HINT_VISIBLE)
+        return (level == VE_LEVEL_FG) ||
+               ((level == VE_LEVEL_FG_IDLE) && (_vidmemActivityIdleSec(p->pid) >= VIDMEM_EVICT_VISIBLE_IDLE_SEC));
     if ((pAct->lastRestoreNs != 0) &&
         (nowNs - pAct->lastRestoreNs < VIDMEM_EVICT_AFTER_ACCESS_SEC * 1000000000ULL))
         return NV_FALSE;
@@ -2434,7 +2466,7 @@ _vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs)
 // class the one hidden longest (never visible = longest), then the biggest.
 //
 static VIDMEM_EVICT_PROC *
-_vidmemEvictHintPickVictim(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU32 exceptPid, NvU64 nowNs)
+_vidmemEvictHintPickVictim(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU32 exceptPid, NvU64 nowNs, NvU32 level)
 {
     VIDMEM_EVICT_PROC *pPick = NULL;
     NvU64 pickVisible = 0;
@@ -2446,10 +2478,13 @@ _vidmemEvictHintPickVictim(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU32 exceptP
         NvU64 vis;
         NvU32 cls;
 
-        if (!_vidmemEvictHintVictimOk(&pProcs[i], exceptPid, nowNs))
+        if (!_vidmemEvictHintVictimOk(&pProcs[i], exceptPid, nowNs, level))
             continue;
         vis = _vidmemActivityFind(pProcs[i].pid, NV_TRUE)->lastVisibleNs;
-        if (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_UNKNOWN)
+        if (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_VISIBLE)
+            // Visible: only for the foreground, idle ones before drawing ones.
+            cls = (_vidmemActivityIdleSec(pProcs[i].pid) >= VIDMEM_EVICT_VISIBLE_IDLE_SEC) ? 3 : 4;
+        else if (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_UNKNOWN)
             cls = 2;
         else
             cls = (_vidmemActivityIdleSec(pProcs[i].pid) < VIDMEM_EVICT_IDLE_SEC) ? 1 : 0;
@@ -2471,21 +2506,22 @@ _vidmemEvictHintPickVictim(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU32 exceptP
 //
 static NvU64
 _vidmemEvictHintFree(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 wantMB,
-                     NvU32 exceptPid, const char *why)
+                     NvU32 exceptPid, NvU32 level, const char *why)
 {
     NvU64 nowNs = osGetMonotonicTimeNs();
     NvU64 avail = _vidmemEvictAvailMB(pGpu);
 
     while (avail < wantMB)
     {
-        VIDMEM_EVICT_PROC *pPick = _vidmemEvictHintPickVictim(pProcs, count, exceptPid, nowNs);
+        VIDMEM_EVICT_PROC *pPick = _vidmemEvictHintPickVictim(pProcs, count, exceptPid, nowNs, level);
         NvU64 moved = 0;
 
         if (pPick == NULL)
             break;
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: %s: free %llu MB, want %llu MB, evicting up to %llu MB of %s (pid %u, %s%s, %llu MB movable)\n",
                   why, avail, wantMB, (wantMB - avail) + 64, pPick->name, pPick->pid,
-                  (VE_HINT_STATE(pPick->hint) == VE_HINT_HIDDEN) ? "hidden" : "no window",
+                  (VE_HINT_STATE(pPick->hint) == VE_HINT_HIDDEN) ? "hidden" :
+                  ((VE_HINT_STATE(pPick->hint) == VE_HINT_VISIBLE) ? "visible, for the foreground" : "no window"),
                   (pPick->hint & VE_HINT_INHERITED) ? " (parent)" : "", pPick->eligibleBytes >> 20);
         // Only what is missing (+64 MB), not the whole process.
         _vidmemEvictBudgetBytes = ((wantMB - avail) + 64) << 20;
@@ -2493,6 +2529,8 @@ _vidmemEvictHintFree(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
         _vidmemEvictBudgetBytes = 0;
         pPick->eligibleBytes = (moved != 0 && pPick->eligibleBytes > moved) ? pPick->eligibleBytes - moved : 0;
         pPick->evictedBytes += moved;
+        if (VE_HINT_STATE(pPick->hint) == VE_HINT_VISIBLE)
+            _vidmemActivityFind(pPick->pid, NV_TRUE)->evictedForFgNs = osGetMonotonicTimeNs();
         avail = _vidmemEvictAvailMB(pGpu);
     }
     return avail;
@@ -2505,7 +2543,8 @@ _vidmemEvictHintFree(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
 // otherwise a game never asks for more than is free and streams the rest
 // from sysmem itself, and the hidden apps keep the VRAM.
 //
-static NvU64 _vidmemReclaimableBytes;
+static NvU64 _vidmemReclaimableBytes;      // for visible processes: hidden/windowless ones
+static NvU64 _vidmemReclaimableFgBytes;    // for the foreground: + visible idle ones
 
 //
 // Free-memory targets with hints. Smaller than lowMB/hysteresis of the
@@ -2521,15 +2560,18 @@ static NvU64 _vidmemReclaimableBytes;
 static void
 _vidmemEvictUpdateReclaimable(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 nowNs)
 {
-    NvU64 sum = 0;
+    NvU64 sum = 0, sumFg = 0;
     NvU32 i;
 
     for (i = 0; i < count; i++)
     {
-        if (_vidmemEvictHintVictimOk(&pProcs[i], 0, nowNs))
+        if (_vidmemEvictHintVictimOk(&pProcs[i], 0, nowNs, VE_LEVEL_HIDDEN))
             sum += pProcs[i].eligibleBytes;
+        if (_vidmemEvictHintVictimOk(&pProcs[i], 0, nowNs, VE_LEVEL_FG_IDLE))
+            sumFg += pProcs[i].eligibleBytes;
     }
     _vidmemReclaimableBytes = (sum > VIDMEM_EVICT_RECLAIM_MARGIN) ? (sum - VIDMEM_EVICT_RECLAIM_MARGIN) : 0;
+    _vidmemReclaimableFgBytes = (sumFg > VIDMEM_EVICT_RECLAIM_MARGIN) ? (sumFg - VIDMEM_EVICT_RECLAIM_MARGIN) : 0;
 }
 
 NvU64
@@ -2537,9 +2579,12 @@ vidmemEvictReclaimableFor(RmClient *pRmClient)
 {
     if (!_vidmemAutoActive() || !_vidmemHintsActive() || (pRmClient == NULL) || (pRmClient->ProcID == 0))
         return 0;
-    if (VE_HINT_STATE(_vidmemHint(pRmClient->ProcID, NULL)) < VE_HINT_VISIBLE)
-        return 0;
-    return _vidmemReclaimableBytes;
+    switch (VE_HINT_STATE(_vidmemHint(pRmClient->ProcID, NULL)))
+    {
+        case VE_HINT_FG:      return _vidmemReclaimableFgBytes;
+        case VE_HINT_VISIBLE: return _vidmemReclaimableBytes;
+        default:              return 0;
+    }
 }
 
 // The policy step when window hints are on. API lock RW, GPU lock held.
@@ -2563,8 +2608,31 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
 
             if ((pProcs[i].evictedBytes == 0) || (VE_HINT_STATE(pProcs[i].hint) != want))
                 continue;
-            avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB, pProcs[i].pid,
-                                         "visible again");
+            //
+            // A visible app moved out for the foreground stays out for a while
+            // (no ping-pong with the game's next allocation) unless there is
+            // room without moving anything.
+            //
+            if (want == VE_HINT_VISIBLE)
+            {
+                VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(pProcs[i].pid, NV_TRUE);
+
+                if ((pAct->evictedForFgNs != 0) &&
+                    (nowNs - pAct->evictedForFgNs < VIDMEM_EVICT_FG_HOLD_SEC * 1000000000ULL))
+                    continue;
+                if (_vidmemEvictAvailMB(pGpu) < needMB + VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HYST_MB)
+                {
+                    // Only hidden ones make room for a visible (not foreground) app.
+                    (void)_vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB,
+                                               pProcs[i].pid, VE_LEVEL_HIDDEN, "visible again");
+                }
+                avail = _vidmemEvictAvailMB(pGpu);
+            }
+            else
+            {
+                avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB, pProcs[i].pid,
+                                             VE_LEVEL_FG, "foreground again");
+            }
             if (avail < needMB + 16)
             {
                 NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: %s (pid %u) is visible, %llu MB in sysmem, only %llu MB free\n",
@@ -2575,6 +2643,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
                       pProcs[i].name, pProcs[i].pid, (want == VE_HINT_FG) ? "foreground" : "visible", needMB);
             (void)_vidmemEvictPidLocked(pGpu, 2, pProcs[i].pid, NULL, 0, NULL, NULL);
             pProcs[i].evictedBytes = 0;
+            _vidmemActivityFind(pProcs[i].pid, NV_TRUE)->evictedForFgNs = 0;
         }
     }
 
@@ -2584,9 +2653,26 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
     avail = _vidmemEvictAvailMB(pGpu);
     if (avail < VIDMEM_EVICT_HINT_LOW_MB)
     {
+        NvU32 level = VE_LEVEL_HIDDEN, fgPid = 0;
+
+        //
+        // A game in the foreground (>= 1 GB) is what fills vidmem: visible
+        // but idle apps give up memory too. Not every app asks beyond its
+        // budget (GL keeps textures in sysmem itself once vidmem looks
+        // full, nvtest.sh fgprio), so waiting for its allocations is not enough.
+        //
+        for (i = 0; i < count; i++)
+        {
+            if ((VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) && (pProcs[i].vidmemBytes >= VIDMEM_EVICT_GAME_BYTES))
+            {
+                level = VE_LEVEL_FG_IDLE;
+                fgPid = pProcs[i].pid;
+                break;
+            }
+        }
         _vidmemLastPressureNs = nowNs;
-        (void)_vidmemEvictHintFree(pGpu, pProcs, count, VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HYST_MB, 0,
-                                   "pressure");
+        (void)_vidmemEvictHintFree(pGpu, pProcs, count, VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HYST_MB, fgPid,
+                                   level, (level == VE_LEVEL_HIDDEN) ? "pressure" : "pressure from the foreground game");
         return;
     }
 
@@ -2920,7 +3006,9 @@ vidmemEvictMakeRoom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
 
     // Some headroom, so the next allocations do not each come here.
     wantMB = (size >> 20) + 1 + VIDMEM_EVICT_HINT_LOW_MB;
-    avail  = _vidmemEvictHintFree(pGpu, pProcs, count, wantMB, pRmClient->ProcID, "allocation");
+    avail  = _vidmemEvictHintFree(pGpu, pProcs, count, wantMB, pRmClient->ProcID,
+                                  (VE_HINT_STATE(_vidmemHint(pRmClient->ProcID, NULL)) == VE_HINT_FG) ?
+                                      VE_LEVEL_FG : VE_LEVEL_HIDDEN, "allocation");
     bOk    = (avail > (size >> 20));
     _vidmemEvictUpdateReclaimable(pProcs, count, nowNs);
     lastFruitlessNs = bOk ? 0 : nowNs;
@@ -3249,9 +3337,9 @@ _vidmemEvictStatus(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
                  _vidmemBornAllocs, _vidmemBornBytes >> 20, _vidmemBornFailed, _vidmemBusiestPid,
                  _vidmemEvictWindows ? "evicted too" : "kept in vidmem", _vidmemEvictQuiesce);
     _vidmemEvictPrintBlock(pGpu, buf, bufSize, pLen);
-    EVICT_PRINTF("window hints: %s; hidden processes could give up %llu MB (added to the budget of visible ones)\n",
+    EVICT_PRINTF("window hints: %s; could give up %llu MB to visible apps, %llu MB to the foreground (added to their budgets)\n",
                  _vidmemHintsActive() ? "on (policy follows window visibility)" : "off (GPU samples)",
-                 _vidmemReclaimableBytes >> 20);
+                 _vidmemReclaimableBytes >> 20, _vidmemReclaimableFgBytes >> 20);
     EVICT_PRINTF("%-8s %-16s %7s %7s %8s %7s %7s %-7s %s\n",
                  "pid", "name", "vram_mb", "ram_mb", "evict_mb", "idle_s", "samples", "window", "flags");
 

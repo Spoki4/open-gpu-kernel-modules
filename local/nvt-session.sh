@@ -6,7 +6,8 @@
 #   ./nvt-session.sh start [URL...]   compositor (if not running) + Chrome
 #   ./nvt-session.sh title            titles of Chrome's pages (DevTools port)
 #   ./nvt-session.sh gpu-pid          pid of the test Chrome's GPU process
-#   ./nvt-session.sh win ACTION PID   minimize|unminimize|activate|fullscreen|normal
+#   ./nvt-session.sh win ACTION PID   minimize|unminimize|activate|fullscreen|normal|screen1|screen2
+#                                     (NVT_OUTPUTS=2 at start: two virtual monitors)
 #                                     every window of PID (a KWin script over DBus)
 #   ./nvt-session.sh stop             Chrome and the compositor
 # NVT_INSTANCE=b runs a second Chrome (own profile and DevTools port);
@@ -52,7 +53,8 @@ start() {
         cp -r "$HERE/kwin-vram-hints" "$data/kwin/scripts/nvidia-vram-hints"
         # shellcheck disable=SC2046
         XDG_CONFIG_HOME=$cfg XDG_DATA_HOME=$data QML_XHR_ALLOW_FILE_WRITE=1 bwrap --dev-bind / / $(hide_args) \
-            kwin_wayland --virtual --socket "$SOCK" --width 1920 --height 1080 >"$LOG/kwin.log" 2>&1 &
+            kwin_wayland --virtual --socket "$SOCK" --width 1920 --height 1080 \
+            --output-count "${NVT_OUTPUTS:-1}" >"$LOG/kwin.log" 2>&1 &
         local i
         for i in $(seq 1 50); do [[ -S $XDG_RUNTIME_DIR/$SOCK ]] && kwin_running && break; sleep 0.1; done
         sleep 0.5
@@ -100,6 +102,8 @@ win() {
         unminimize) js='w.minimized = false;' ;;
         activate) js='w.minimized = false; workspace.activeWindow = w;' ;;
         fullscreen) js='w.fullScreen = true; workspace.activeWindow = w;' ;;
+        screen2) js='workspace.sendClientToScreen(w, workspace.screens[workspace.screens.length - 1]);' ;;
+        screen1) js='workspace.sendClientToScreen(w, workspace.screens[0]);' ;;
         normal) js='w.fullScreen = false;' ;;
         *) echo "nvt-session: unknown action $action" >&2; exit 2 ;;
     esac

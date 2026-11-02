@@ -101,9 +101,11 @@ function draw() {
     if (now - fpsT >= 1000) { fps = Math.round(fpsFrames * 1000 / (now - fpsT)); fpsFrames = 0; fpsT = now; status(); }
 }
 
-// Game mode: stream two textures per frame until the target or out of memory.
+// Game mode: stream two textures per frame until the target or out of memory
+// (delay=<s>: start streaming only after that many seconds).
+const STREAM_AT = performance.now() + 1000 * +(P.get('delay') || 0);
 function stream() {
-    if (done) return;
+    if (done || performance.now() < STREAM_AT) return;
     for (let k = 0; k < 2 && loadedTex < GAME_TEX; k++) {
         makeTex(loadedTex);
         if (gl.getError() === gl.OUT_OF_MEMORY) { oom = 1; done = true; break; }
@@ -124,8 +126,9 @@ function check() {
 }
 
 if (MODE === 'idle') {
+    // every=<s>: how often a background page redraws and checks (default 5).
     const tick = () => { draw(); check(); };
-    tick(); setInterval(tick, 5000);
+    tick(); setInterval(tick, 1000 * +(P.get('every') || 5));
 } else {
     const loop = () => {
         stream();

@@ -1,0 +1,134 @@
+<!doctype html>
+<!--
+nvt-webgpu: a WebGPU (Dawn/Vulkan in Chrome) workload for nvtest.sh webgpu.
+Holds BUF storage buffers of 4 MB filled with a position+generation
+pattern; every frame a compute pass checks one buffer and rewrites it with
+the next generation (so writes lost while memory moves are caught), a render
+pass draws to the canvas. Mismatches are counted on the GPU and read back.
+State in document.title:
+  WGPU frames=<n> checks=<n> errors=<n> lost=<0|1> mb=<n> adapter=<name>
+?probe=1 only asks for an adapter and a device and reports
+  WGPU probe adapter=<ok|none> device=<ok|fail>
+(Chrome turns WebGPU off for good after GPU process trouble: "no adapter").
+?mb=<MB> buffer memory (default 512), ?every=<frames> readback (default 30).
+-->
+<html><head><meta charset="utf-8"><title>WGPU starting</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style></head>
+<body><canvas id="c" width="512" height="512"></canvas>
+<script>
+const P = new URLSearchParams(location.search);
+const MB = +(P.get('mb') || 512), EVERY = +(P.get('every') || 30);
+const BUF_BYTES = 4 << 20, WORDS = BUF_BYTES / 4, NBUF = Math.max(1, Math.floor(MB / 4));
+let frames = 0, checks = 0, errors = 0, lost = 0, adapterName = '?';
+
+function status() {
+    document.title = `WGPU frames=${frames} checks=${checks} errors=${errors} lost=${lost} mb=${NBUF * 4} adapter=${adapterName}`;
+}
+
+async function probe() {
+    if (!navigator.gpu) { document.title = 'WGPU probe adapter=none device=fail (no navigator.gpu)'; return; }
+    const a = await navigator.gpu.requestAdapter();
+    if (!a) { document.title = 'WGPU probe adapter=none device=fail'; return; }
+    try {
+        const d = await a.requestDevice();
+        document.title = `WGPU probe adapter=ok device=${d ? 'ok' : 'fail'}`;
+    } catch (e) {
+        document.title = 'WGPU probe adapter=ok device=fail ' + e;
+    }
+}
+
+async function main() {
+    if (!navigator.gpu) { document.title = 'WGPU unsupported'; return; }
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) { document.title = 'WGPU noadapter'; return; }
+    try {
+        const info = adapter.info || {};
+        adapterName = ((info.vendor || '') + '/' + (info.architecture || info.device || '')).replace(/\s+/g, '_') || 'ok';
+    } catch (e) {}
+    const device = await adapter.requestDevice({ requiredLimits: { maxStorageBufferBindingSize: BUF_BYTES } });
+    device.lost.then(() => { lost = 1; status(); });
+
+    const code = `
+        struct P { gen_old: u32, gen_new: u32, seed: u32, mode: u32 };
+        @group(0) @binding(0) var<storage, read_write> d: array<u32>;
+        @group(0) @binding(1) var<storage, read_write> res: array<atomic<u32>>;
+        @group(0) @binding(2) var<uniform> p: P;
+        fn h(x0: u32) -> u32 {
+            var x = x0;
+            x = x ^ (x >> 16u); x = x * 0x7feb352du; x = x ^ (x >> 15u); x = x * 0x846ca68bu; x = x ^ (x >> 16u);
+            return x;
+        }
+        @compute @workgroup_size(256)
+        fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            if (i >= ${WORDS}u) { return; }
+            if (p.mode == 0u) { d[i] = h(i ^ p.seed ^ (p.gen_new * 0x9e3779b9u)); return; }
+            if (d[i] != h(i ^ p.seed ^ (p.gen_old * 0x9e3779b9u))) { atomicAdd(&res[0], 1u); }
+            d[i] = h(i ^ p.seed ^ (p.gen_new * 0x9e3779b9u));
+        }`;
+    const module = device.createShaderModule({ code });
+    const pipe = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+
+    const res = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    const read = device.createBuffer({ size: 256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const bufs = [], unis = [], groups = [], gens = [];
+    for (let b = 0; b < NBUF; b++) {
+        bufs.push(device.createBuffer({ size: BUF_BYTES, usage: GPUBufferUsage.STORAGE }));
+        unis.push(device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
+        groups.push(device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: bufs[b] } },
+            { binding: 1, resource: { buffer: res } },
+            { binding: 2, resource: { buffer: unis[b] } }] }));
+        gens.push(0);
+    }
+    function pass(enc, b, mode) {
+        const gen_new = mode === 0 ? 0 : gens[b] + 1;
+        device.queue.writeBuffer(unis[b], 0, new Uint32Array([gens[b], gen_new, 0x9e3779b9 * (b + 1) >>> 0, mode]));
+        const c = enc.beginComputePass();
+        c.setPipeline(pipe); c.setBindGroup(0, groups[b]);
+        c.dispatchWorkgroups(Math.ceil(WORDS / 256));
+        c.end();
+        gens[b] = gen_new;
+    }
+    // Fill: one submit per buffer (uniforms are per buffer).
+    for (let b = 0; b < NBUF; b++) {
+        const enc = device.createCommandEncoder();
+        pass(enc, b, 0);
+        device.queue.submit([enc.finish()]);
+    }
+
+    const ctx = document.getElementById('c').getContext('webgpu');
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
+
+    let cur = 0, busy = false;
+    async function frame() {
+        if (lost) return;
+        const enc = device.createCommandEncoder();
+        pass(enc, cur, 1);
+        cur = (cur + 1) % NBUF;
+        const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(),
+            clearValue: { r: (frames % 256) / 255, g: 0.2, b: 0.4, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+        rp.end();
+        frames++;
+        if (frames % EVERY === 0 && !busy) {
+            enc.copyBufferToBuffer(res, 0, read, 0, 256);
+            device.queue.submit([enc.finish()]);
+            busy = true;
+            await read.mapAsync(GPUMapMode.READ);
+            errors = new Uint32Array(read.getMappedRange())[0];
+            read.unmap();
+            busy = false;
+            checks++;
+            status();
+        } else {
+            device.queue.submit([enc.finish()]);
+        }
+        requestAnimationFrame(frame);
+    }
+    status();
+    requestAnimationFrame(frame);
+}
+
+(P.get('probe') ? probe() : main()).catch(e => { document.title = 'WGPU error ' + e; });
+</script></body></html>
