@@ -1118,3 +1118,34 @@ not fixed yet:
    a game: the game ran at 0.8-8 fps next to 5.8 GB of idle memory).
 3. RM lock waits up to 192 ms during evictions (policy step holds the API and
    GPU locks for the whole batch).
+
+## Frame-time benchmarks and the eviction goal (2026-11-04, local/bench/)
+
+User's goal: with other apps and eviction, the game within 10% of the clean
+FPS. Tooling: `local/bench/bench.py run|analyze|compare` (MangoHud every
+frame + Perfetto v58.2 system trace, local/.perfetto/, user-approved;
+report: compare-*.html). Superposition performance run, 8K Optimized
+(~6.7 GB), 90 s logged stretch; "apps" = Chromium (YouTube, Wikipedia,
+WebGL) + background apps sized so the game is --bg-fill MB short.
+
+| run | fps | 1% low | stutters |
+|---|---|---|---|
+| clean (patched) | 52.3 / 52.0 | 34.7 / 34.3 | 0 |
+| stock-clean | 52.1 | 34.0 | 0 |
+| apps-only (no deficit) | 50.0 | 34.7 | 0 |
+| apps, 1.5 GB short, stock driver | 5.8 | 1.2 | 113 |
+| apps, 1.5 GB short, before 9adf94bb | 7.7-8.8 | 1.3 | 124-167 |
+| apps, 1.5 GB short, 9adf94bb | 49.9 / 49.9 | 34.8 / 33.9 | 0 / 1 |
+
+What it took (9adf94bb): KWin hints recognise fullscreen unmanaged X11
+windows; windowless idle apps are victims for the foreground when not
+drawing; foreground headroom (RmVidmemFgHeadroomMB 2048): GL places
+textures by the vidmem actually free at load time, not by HEAP_FREE.
+nvtest all: 10/10 PASS on this build.
+
+MangoHud: autostart_log does nothing with no_display (invisible HUD
+instead); with Chromium visible the compositor flips every refresh, so the
+frame/trace alignment is coarse (engine start + autostart delay).
+Next: the minimized launcher ping-pong (one 42 ms stutter in the second
+apps-evict run), lock holds of whole eviction batches, Wukong / The Alters
+(DX12 via Proton) in bench.py, final numbers on bare metal.
