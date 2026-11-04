@@ -80,3 +80,33 @@ git rebase --onto <new-version> 595.99.02 local/vidmem-desktop-reserve
 ./local/build.sh && sudo ./local/install.sh install
 ```
 The kernel module version must match the installed `libnvidia-gl` userspace version.
+
+## Test VM (no reboots)
+
+The RTX 3080 Ti goes to a QEMU guest (VFIO), so a build that hangs or panics
+only takes the guest down: `./local/vm/vm.sh reset` and it is back in seconds.
+The host's desktop runs on the AMD iGPU (one monitor on the motherboard); the
+other monitor stays on the 3080 Ti and shows the guest's own KDE Plasma
+(Wayland, KWin on the NVIDIA GPU, as on bare metal), so games run there as
+usual. The repository is shared into the guest at the same path (virtiofs).
+
+```bash
+sudo ./local/vm/setup.sh                 # once: sudoers rule + guest image (CachyOS via pacstrap)
+./local/vm/vm.sh start --no-gpu          # optional: check the VM while the host still has the GPU
+sudo ./local/vm/mode.sh vm               # host stops loading nvidia; move a monitor, reboot
+./local/vm/vm.sh start && ./local/vm/vm.sh wait
+./local/vm/vm.sh input on                # keyboard + mouse to the guest; both Ctrl switch back
+./local/vm/vm.sh build                   # modules for the guest kernel, built in the guest
+./local/vm/vm.sh reload                  # swap the guest's driver (SDDM restarts, autologin)
+./local/vm/vm.sh install                 # the tree build becomes what the guest boots
+./local/vm/vm.sh log                     # serial log: oopses survive a hung guest
+./local/vm/vm.sh reset                   # hung guest
+sudo ./local/vm/mode.sh host             # back to the 3080 Ti on the host after a reboot
+```
+
+The guest pins its kernel and `nvidia-utils`; the tree must be the same
+release as the guest's `nvidia-utils` (`guest.sh` refuses otherwise). Guest
+uses CCD0 (3D V-Cache, CPUs 0-7,16-23) and 24 GB; the host is limited to CCD1
+while it runs (`NVVM_ISOLATE=0` to skip, `NVVM_MEM=16G` for less memory).
+Timings differ a little from bare metal (IOMMU, nested paging): confirm final
+numbers without the VM.
