@@ -1322,3 +1322,31 @@ runner's own output handle (the job is never cleaned up): nvt-idle writes
 at 25 s went to the loading screen and the run measured the menu (299 fps,
 kept as bench-logs/win-wk-clean2-*-INVALID-menu); 40 s now, and a run over
 150 fps is refused.
+
+## Where we stand and what to improve (2026-11-04 night)
+
+Against the stock Linux driver: under pressure (apps, 1.5 GB short) ~50 fps
+instead of 5.8 fps / a hung Wukong; KWin never denied, now without a reserve;
+no ping-pong; nothing lost in a clean run. Against Windows 617.42 under the
+same pressure: -4.4% vs -1.8% (Superposition), -4.0% vs -3.2% (Wukong, within
+noise). Ideas, most useful first:
+
+1. Covered windows should stop drawing (KWin / the hints script, not the
+   driver). Likely the whole Linux loss: apps-only with no deficit already
+   gave 50.0 fps (the same as apps + deficit), so it is Chromium running
+   YouTube and WebGL behind the game, not eviction; KWin flipped ~150/s for
+   the game's 50 in nr-apps-evict (13805 flips / 4501 frames). On Windows,
+   Edge covered by the fullscreen game stops and gives up its VRAM. Check
+   first: count Chromium's frames during the run (Chromium.frames(), the
+   page probe in scenario.py) and run with Chromium minimized; then look at
+   whether KWin keeps sending frame callbacks to a fully covered window.
+   Expected: 2-3 points, close to Windows.
+2. Move out only what is needed, gradually, like WDDM (32-64 MB steps as the
+   game grows) instead of the 2 GB foreground headroom at load (3-4 GB of
+   background moved where Windows moved 0.6-0.9 GB). The game's fps does
+   not suffer now; the gain is less PCIe traffic and faster returns to the
+   background apps.
+3. The Superposition frame tail (1% low 34 vs 43 on Windows, the same with
+   the stock driver: not the patch). Start with whether KWin scans the
+   fullscreen X11 game out directly or composites it.
+4. Final numbers on bare metal, more than one run per case under pressure.
