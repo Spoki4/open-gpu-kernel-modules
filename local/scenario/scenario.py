@@ -459,7 +459,7 @@ SCENARIOS = {"death": scenario_death}
 
 
 # What a run leaves behind if it is killed: matched in /proc/*/cmdline.
-LEFTOVERS = ["scenario/scenario.py run", "user-data-dir=/tmp/gs-chromium", "/nvt-idle-",
+LEFTOVERS = ["scenario/scenario.py run", "bench/bench.py run", "user-data-dir=/tmp/gs-chromium", "/nvt-idle-",
              "trace/nvtrace.py record"]
 
 
@@ -486,7 +486,7 @@ def cmd_stop(a):
         if comm in ("superposition", "launcher") or any(x in cmd for x in LEFTOVERS):
             found.append((int(d), comm, cmd[:80]))
     for pid, comm, cmd in found:
-        sig = signal.SIGINT if "scenario.py" in cmd or "nvtrace.py" in cmd else signal.SIGTERM
+        sig = signal.SIGINT if ("scenario.py" in cmd or "nvtrace.py" in cmd or "bench.py" in cmd) else signal.SIGTERM
         try:
             os.kill(pid, sig)
         except PermissionError:

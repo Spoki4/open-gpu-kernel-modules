@@ -13,3 +13,5 @@ nvt-idle-*
 trace-logs/
 __pycache__/
 scenario-logs/
+.perfetto/
+bench-logs/
