@@ -262,7 +262,9 @@ def cmd_run(a):
             sizes = [total // n + (1 if i < total % n else 0) for i in range(n)] if total else []
 
             import types
-            bg = sc.start_bg(types.SimpleNamespace(dir=d, log=log), sizes)
+            # Content checked once, at the end: idle apps do not read all their
+            # memory every 30 s (from sysmem once moved out: PCIe the game pays).
+            bg = sc.start_bg(types.SimpleNamespace(dir=d, log=log), sizes, verify_s=0)
             log("bg_fill", free_outside_mb=free, game_mb=GAMES[a.game].VRAM_MB, deficit_mb=a.bg_fill,
                 bg_total_mb=total, apps=len(sizes))
             time.sleep(40)     # background apps are old in real life (VIDMEM_EVICT_NEW_PROC_SEC)
@@ -446,6 +448,11 @@ def analyze(d):
     states, main = tp_query(trace, sql_game_states(pid))[:2] if pid else ([], [])
     main_tid = int(main[0]["tid"]) if main else None
     res["main_thread"] = main[0] if main else None
+    # How the KWin hints saw the game (f foreground, v visible, h hidden).
+    hs = [dict(kv.split("=", 1) for kv in (r["fields"] or "").split()) for r in drv if r["name"] == "vidmem_hint"]
+    gh = [h for h in hs if pid is not None and h.get("pid") == str(pid)]
+    if gh:
+        res["game_hint"] = " -> ".join("?hvf"[int(h.get("new_state", 0))] for h in gh)
     # Driver activity during the logged stretch.
     if t0:
         t_end = t0 + el[-1]
@@ -508,6 +515,8 @@ def format_metrics(res):
     s = (f"{res['meta']['label']}: avg {f['avg_fps']} fps, 1% low {f['low1_fps']}, 0.1% low {f['low01_fps']}, "
          f"P99 {f['p99_ms']} ms, max {f['max_ms']} ms, stdev {f['stdev_ms']} ms, stutters {f['stutters']} "
          f"({f['stutter_ms_total']} ms lost), {f['frames']} frames in {f['seconds']} s")
+    if res.get("game_hint"):
+        s += f"\n  game window as the driver saw it: {res['game_hint']}"
     if res.get("alignment"):
         s += f"\n  frames aligned with the trace: {res['alignment']}"
     if res.get("driver"):

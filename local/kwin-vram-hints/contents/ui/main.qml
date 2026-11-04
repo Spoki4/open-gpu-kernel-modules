@@ -8,7 +8,11 @@
 // less than 2% of the window still shows; Steam under several windows,
 // 2026-11-02, counted as visible while one window had to cover it whole).
 // The driver applies a state to the process's children too (browser GPU
-// processes). The whole table is written on every change; a write to the
+// processes). An unmanaged (override-redirect) window covering a screen is
+// a fullscreen X11 game: shown, covering what is below, and the foreground
+// when on top (2026-11-04: Superposition's fullscreen window was skipped as
+// "not managed", the game counted as hidden and its launcher behind it as
+// the foreground, so the driver never made room for the game). The whole table is written on every change; a write to the
 // stock driver (no such file) simply fails.
 //
 // Needs QML_XHR_ALLOW_FILE_WRITE=1 in KWin's environment
@@ -91,14 +95,35 @@ Item {
         return left / total;
     }
 
+    // An unmanaged window over at least 90% of a screen (a fullscreen X11
+    // game). Small unmanaged ones (menus, tooltips) are ignored altogether.
+    function bigUnmanaged(w) {
+        if (!w || w.managed || w.deleted)
+            return false;
+        var g = px(w.frameGeometry);
+        var screens = Workspace.screens;
+        for (var i = 0; i < screens.length; i++) {
+            var s = screens[i].geometry;
+            var x1 = Math.max(g.x, s.x), y1 = Math.max(g.y, s.y);
+            var x2 = Math.min(g.x + g.width, s.x + s.width), y2 = Math.min(g.y + g.height, s.y + s.height);
+            if (x2 > x1 && y2 > y1 && (x2 - x1) * (y2 - y1) >= 0.9 * s.width * s.height)
+                return true;
+        }
+        return false;
+    }
+
     // Shown at all, before looking at what covers it.
     function shown(w) {
+        if (bigUnmanaged(w))
+            return true;
         return w && w.managed && !w.deleted && !w.minimized && !w.hidden &&
                onCurrentDesktop(w) && onCurrentActivity(w);
     }
 
     // Can this window hide the ones below it?
     function covers(w) {
+        if (bigUnmanaged(w))
+            return true;
         return shown(w) && w.opacity >= 1.0 && (w.normalWindow || w.fullScreen) && !w.popupWindow;
     }
 
@@ -109,16 +134,26 @@ Item {
         var i, j;
         var dbg = "";
 
+        // The topmost fullscreen unmanaged window, if any: the game in front.
+        var game = null;
+        for (i = order.length - 1; i >= 0 && game === null; i--) {
+            if (bigUnmanaged(order[i]))
+                game = order[i];
+        }
+
         for (i = 0; i < order.length; i++) {
             var w = order[i];
             if (!w || w.deleted || !w.pid || w.pid <= 0)
                 continue;
+            if (!w.managed && !bigUnmanaged(w))
+                continue;                        // menus, tooltips: say nothing
             var s = 1;
             var share = shown(w) ? visibleShare(order, i, w.frameGeometry) : -1;
             if (shown(w))
                 s = (share < 0.02) ? 1 : 2;
             dbg += " " + w.pid + ":" + w.resourceClass + "=" + (share < 0 ? "off" : share.toFixed(3));
-            if (w === active && shown(w))
+            // Foreground: the game on top; else the active window if it shows.
+            if (game !== null ? w === game : (w === active && s === 2))
                 s = 3;
             if (!(w.pid in state) || state[w.pid] < s)
                 state[w.pid] = s;

@@ -281,6 +281,34 @@ TRACE_EVENT(rm_lock,
               __entry->hold_us, __entry->at, __entry->holder, __entry->holder_at)
 );
 
+// Free vidmem reported to process pid (NV2080 FB_INFO HEAP_FREE: what its
+// Vulkan/DXGI budget and its GL driver's placement are based on).
+// a: real free bytes, of it in the reserve block, reclaimable from others
+//    (window hints) added for it, reported bytes
+TRACE_EVENT(vidmem_budget,
+    TP_PROTO(u32 pid, const char *comm, const u64 *a),
+    TP_ARGS(pid, comm, a),
+    TP_STRUCT__entry(
+        __field(u32, pid)
+        __array(char, comm, TASK_COMM_LEN)
+        __field(u64, free_mb)
+        __field(u64, block_free_mb)
+        __field(u64, reclaim_mb)
+        __field(u64, reported_mb)
+    ),
+    TP_fast_assign(
+        __entry->pid = pid;
+        memcpy(__entry->comm, comm, TASK_COMM_LEN);
+        __entry->free_mb = a[0] >> 20;
+        __entry->block_free_mb = a[1] >> 20;
+        __entry->reclaim_mb = a[2] >> 20;
+        __entry->reported_mb = a[3] >> 20;
+    ),
+    TP_printk("pid=%u comm=%s free_mb=%llu block_free_mb=%llu reclaim_mb=%llu reported_mb=%llu",
+              __entry->pid, __entry->comm, __entry->free_mb, __entry->block_free_mb,
+              __entry->reclaim_mb, __entry->reported_mb)
+);
+
 // Window state of a process changed in the compositor's hints (vidmem_hints).
 TRACE_EVENT(vidmem_hint,
     TP_PROTO(u32 pid, const char *comm, u32 old_state, u32 new_state),

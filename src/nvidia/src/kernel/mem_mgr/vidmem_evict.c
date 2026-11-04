@@ -3023,7 +3023,17 @@ _vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs, NvU
             return NV_TRUE;
 
         default:
-            // No window anywhere in its ancestry: only when idle.
+            //
+            // No window anywhere in its ancestry: only when idle. For the
+            // foreground, when not drawing right now (as hidden ones): a
+            // background app with a little work now and then (a notification,
+            // a check every 30 s) was never 10 s idle at the moment the game
+            // allocated, so the memory promised to the game in its budget was
+            // not there and the game's GL driver put textures in sysmem for
+            // the whole run (2026-11-04, bench.py apps-evict: 8.8 fps vs 52).
+            //
+            if (level >= VE_LEVEL_FG_IDLE)
+                return (idle >= VIDMEM_EVICT_DRAWING_SEC) && !_vidmemEvictIsProtected(p->pid, nowNs);
             return (idle >= VIDMEM_EVICT_IDLE_SEC) && !_vidmemEvictIsProtected(p->pid, nowNs);
     }
 }
@@ -3677,8 +3687,42 @@ vidmemEvictWantBorn(OBJGPU *pGpu, RmClient *pRmClient, NV_MEMORY_ALLOCATION_PARA
 // device GPU lock (PMA allocates first, without it), so the lock is taken
 // here for the moves.
 //
+//
+// Real free vidmem kept ahead of the foreground process's allocations
+// (registry RmVidmemFgHeadroomMB, 0: off). A GL driver places its textures
+// by the vidmem actually free while the game loads: told about reclaimable
+// memory but finding 0.6 GB free, Superposition took the free 4.8 GB in 2 s
+// and put the rest (~1.6 GB) in sysmem for good, 8 fps instead of 52 at 11
+// GB/s of PCIe (2026-11-04, bench.py apps-evict), although its budget said
+// 5 GB free all along and not one allocation was denied. So when an
+// allocation of the foreground leaves less than this free, hidden and idle
+// windowless processes move out first.
+//
+static NvU32 _vidmemFgHeadroomMB = 2048;
+
+static NvBool _vidmemEvictMakeRoomWant(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvU64 headroomMB,
+                                       const char *why);
+
 NvBool
 vidmemEvictMakeRoom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
+{
+    return _vidmemEvictMakeRoomWant(pGpu, pRmClient, size, VIDMEM_EVICT_HINT_LOW_MB, "allocation");
+}
+
+void
+vidmemEvictKeepFgHeadroom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
+{
+    if ((_vidmemFgHeadroomMB == 0) || !_vidmemAutoActive() || !_vidmemHintsActive() ||
+        (pRmClient == NULL) || (pRmClient->ProcID == 0) || _vidmemEvictIsBusyThread() ||
+        (VE_HINT_STATE(_vidmemHint(pRmClient->ProcID, NULL)) != VE_HINT_FG))
+        return;
+    if (_vidmemEvictAvailMB(pGpu) >= (size >> 20) + _vidmemFgHeadroomMB)
+        return;
+    (void)_vidmemEvictMakeRoomWant(pGpu, pRmClient, size, _vidmemFgHeadroomMB, "foreground headroom");
+}
+
+static NvBool
+_vidmemEvictMakeRoomWant(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvU64 headroomMB, const char *why)
 {
     static NvU64       lastFruitlessNs;
     static NvU32       lockLogged;
@@ -3724,11 +3768,11 @@ vidmemEvictMakeRoom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
     count = _vidmemEvictGatherProcs(pGpu, pProcs, VIDMEM_EVICT_MAX_PROCS);
 
     // Some headroom, so the next allocations do not each come here.
-    wantMB = (size >> 20) + 1 + VIDMEM_EVICT_HINT_LOW_MB;
+    wantMB = (size >> 20) + 1 + headroomMB;
     _vidmemEvictWhy = VMT_WHY_ALLOC;
     avail  = _vidmemEvictHintFree(pGpu, pProcs, count, wantMB, pRmClient->ProcID,
                                   (VE_HINT_STATE(_vidmemHint(pRmClient->ProcID, NULL)) == VE_HINT_FG) ?
-                                      VE_LEVEL_FG_IDLE : VE_LEVEL_HIDDEN, "allocation");
+                                      VE_LEVEL_FG_IDLE : VE_LEVEL_HIDDEN, why);
     bOk    = (avail > (size >> 20));
     _vidmemEvictUpdateReclaimable(pProcs, count, nowNs);
     lastFruitlessNs = bOk ? 0 : nowNs;
@@ -3838,6 +3882,8 @@ vidmemEvictAutoInit(OBJGPU *pGpu, NvU32 reserveMB)
         _vidmemLowMB = data32;
     if ((osReadRegistryDword(pGpu, "RmVidmemEvictHighMB", &data32) == NV_OK) && (data32 > _vidmemLowMB))
         _vidmemHighMB = data32;
+    if (osReadRegistryDword(pGpu, "RmVidmemFgHeadroomMB", &data32) == NV_OK)
+        _vidmemFgHeadroomMB = data32;
     if (_vidmemHighMB <= _vidmemLowMB + VIDMEM_EVICT_HYST_MB)
         _vidmemHighMB = _vidmemLowMB + 2 * VIDMEM_EVICT_HYST_MB;
 

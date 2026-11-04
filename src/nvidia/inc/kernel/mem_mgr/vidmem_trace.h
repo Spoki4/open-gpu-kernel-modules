@@ -23,7 +23,8 @@
 #define VMT_TICK      5   // one policy step (API + GPU locks held for all of it)
 #define VMT_PROC      6   // per-process state at a policy step
 #define VMT_LOCK      7   // a long RM lock wait or hold
-#define VMT_NUM_TYPES 8
+#define VMT_BUDGET    8   // free vidmem reported to a process (HEAP_FREE: its Vulkan/GL budget)
+#define VMT_NUM_TYPES 9
 
 // VMT_MOVE why (the caller of the evict engine)
 #define VMT_WHY_MANUAL    0   // procfs vidmem_evict (evict.sh)

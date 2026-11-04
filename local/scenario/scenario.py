@@ -341,7 +341,7 @@ def free_outside_mb():
     return v[0] - v[3]
 
 
-def start_bg(run, sizes):
+def start_bg(run, sizes, verify_s=30):
     """Background "apps" holding VRAM, no window, idle (Discord, Steam,
     Telegram on the real desktop): the memory the driver can take for the
     game. nvt-game checks their content (errors= at the end)."""
@@ -349,7 +349,7 @@ def start_bg(run, sizes):
     for i, mb in enumerate(sizes):
         name = os.path.join(LOCAL, "nvt-idle-a" if i % 2 == 0 else "nvt-idle-b")
         f = open(os.path.join(run.dir, f"bg-{i}.log"), "w")
-        procs.append((subprocess.Popen([name, "--mb", str(mb), "--idle", "--verify-s", "30"], stdout=f,
+        procs.append((subprocess.Popen([name, "--mb", str(mb), "--idle", "--verify-s", str(verify_s)], stdout=f,
                                        stderr=subprocess.STDOUT, env=gs.env(), start_new_session=True), f))
         run.log("bg_app", name=os.path.basename(name), mb=int(mb), pid=procs[-1][0].pid)
     if procs:

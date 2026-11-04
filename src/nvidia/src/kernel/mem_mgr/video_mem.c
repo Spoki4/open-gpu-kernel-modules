@@ -165,6 +165,7 @@ void vidmemEvictNoteBlock(PMA *pPma);
 NV_STATUS vidmemEvictNoteDupBar1(MEMORY_DESCRIPTOR *pMemDesc);
 NvBool vidmemEvictWantBorn(OBJGPU *pGpu, RmClient *pRmClient, NV_MEMORY_ALLOCATION_PARAMS *pAllocData);
 NvBool vidmemEvictMakeRoom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size);
+void vidmemEvictKeepFgHeadroom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size);
 NvU64 vidmemEvictReclaimableFor(RmClient *pRmClient);
 NV_STATUS vidmemEvictBornAllocation(OBJGPU *pGpu, Memory *pMemory);
 
@@ -447,7 +448,17 @@ vidmemUserReserveReportedFree
     // processes could give up: allocating it moves them out
     // (vidmemEvictMakeRoom()).
     //
-    return ((freeBytes > blockFree) ? (freeBytes - blockFree) : 0) + vidmemEvictReclaimableFor(pRmClient);
+    {
+        NvU64 reclaim = vidmemEvictReclaimableFor(pRmClient);
+        NvU64 reported = ((freeBytes > blockFree) ? (freeBytes - blockFree) : 0) + reclaim;
+
+        if (osVidmemTraceOn(VMT_BUDGET))
+        {
+            NvU64 a[VMT_ARGS] = { freeBytes, blockFree, reclaim, reported };
+            osVidmemTrace(VMT_BUDGET, (pRmClient != NULL) ? pRmClient->ProcID : osGetCurrentProcess(), a);
+        }
+        return reported;
+    }
 }
 
 //
@@ -1212,6 +1223,13 @@ vidmemConstruct_IMPL
             bReserveBound = NV_FALSE;
             bBornEvicted  = NV_TRUE;
         }
+        //
+        // Local patch: keep real free vidmem ahead of the foreground game's
+        // allocations (its GL driver puts textures in sysmem when vidmem
+        // looks full, budget or not; vidmemEvictKeepFgHeadroom()).
+        //
+        if ((rmStatus == NV_OK) && bReserveBound && !bBornEvicted)
+            vidmemEvictKeepFgHeadroom(pGpu, pRmClient, pAllocData->size);
         if (bReserveDenied && osVidmemTraceOn(VMT_RESERVE))
         {
             PMA   *pPma = vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE)->pPmaObject;
