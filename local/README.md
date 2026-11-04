@@ -111,7 +111,8 @@ sudo ./local/safety.sh install           # watchdog + panic on lockups (before r
 sudo ./local/rollback.sh                 # back to stock modules, then reboot
 ```
 
-`RESERVE_MB=1024 sudo ./local/install.sh install` changes the reserve.
+No VRAM is reserved by default (the compositor gets room made instead);
+`RESERVE_MB=768 sudo ./local/install.sh install` brings the old fixed reserve back.
 If the system does not boot to a desktop, pick the previous kernel in GRUB
 (it keeps Canonical's modules), then run `rollback.sh`.
 

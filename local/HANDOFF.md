@@ -1163,3 +1163,57 @@ Wukong (bench.py run wukong, 68b6dace; DX12 via Proton, 4K Very High, DLSS
 The stutter at ~67 s of the logged stretch is in the scene (clean too).
 Wukong's first start (shader compilation, language, brightness, a data
 collection prompt: declined) was done once by hand.
+
+## No reserve: priority for what the user works with (2026-11-04 evening)
+
+User's decision: drop the fixed VRAM reserve (768 MB) and protect the desktop
+by priority instead: the compositor gets memory when it needs it, the
+processes the user interacts with come first, everything else is slowed
+down carefully (moved to sysmem), not denied. Default now (guest.sh /
+install.sh `RESERVE_MB=0`); `RESERVE_MB=768` brings the old block back (that
+code path is unchanged).
+
+How it works (video_mem.c header comment, vidmem_evict.c):
+- Placement: without the reserve every non-contiguous PMA allocation goes
+  top-down (`vidmemPmaTopDown()`, hook in `pmaAllocatePages()`), contiguous
+  ones (scanout buffers, cursors) stay bottom-up. Nothing is held back.
+- The compositor (kwin_wayland, Xwayland, kernel threads; nvkms allocations
+  inside kwin's ioctl count as kwin by thread name) is never turned away:
+  when PMA fails its allocation, `vidmemEvictMakeRoomCompositor()` moves
+  others out (`VE_LEVEL_COMPOSITOR`: hidden idle first ... the foreground
+  game last) and the allocation is retried. Accounting is in free 2 MB
+  pages (physically 2 MB aligned: PMA region 0 starts at 0x37c0000), not
+  free bytes: 64 KB holes are useless to a 2 MB-page allocation. A
+  contiguous one (scanout: nvkms-kapi asks CONTIGUOUS + ISO) gets a window
+  cleared: `_vidmemEvictMakeContig()` marks the frames every victim could
+  give up, picks the aligned window with the least to move, and evicts only
+  the allocations in it (`_vidmemEvictRangeLo/Hi` filter in
+  `_vidmemEvictPidLocked()`).
+- Background processes (hidden, or windowless and idle, not the game, not
+  >= 1 GB, not the foreground of the last 30 s) may not take the last
+  `RmVidmemBgCushionMB` (256): below it their new allocations are created in
+  sysmem; their HEAP_FREE (Vulkan/DXGI budget) is that much lower too. If
+  sysmem is impossible for the allocation (contiguous, too big, drawing),
+  it goes to vidmem as before.
+- Visible / foreground processes: room made as with the reserve
+  (vidmemEvictMakeRoom, foreground headroom 2048 MB).
+- "System UI in focus" needs nothing extra: plasmashell / KRunner popups
+  are the active window, so the KWin script reports them as the foreground;
+  kwin's own UI (Alt+Tab, overview) allocates as the compositor.
+
+Ping-pong fix (the minimized launcher, death-20261104_140517):
+- "Drawing again" restores only a process that has drawn at every policy
+  step for `VIDMEM_EVICT_STEADY_SEC` (6 s), not one frame now and then.
+- A hidden one is restored only into memory that is free anyway; a visible
+  one gets room made by idle hidden processes (margin 64 MB, not 256).
+- A process that was the foreground in the last 30 s
+  (`VIDMEM_EVICT_RECENT_FG_SEC`) is not a victim at `VE_LEVEL_HIDDEN` (for
+  pressure, other visible apps, hot restores): the game the user just left
+  or is switching back to keeps its memory (241 MB of the game had moved
+  out for the launcher's 21 MB at the switch back, a 215 ms frame).
+- Order of a policy step: foreground restore, visible restore, then
+  "drawing again", then hot allocations, then pressure.
+
+Status line (`evict.sh status`): "no reserve: largest contiguous free,
+background cushion, room made for the compositor N times (failed), MB
+moved, longest".

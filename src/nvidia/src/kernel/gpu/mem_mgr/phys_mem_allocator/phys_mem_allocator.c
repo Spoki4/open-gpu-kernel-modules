@@ -604,11 +604,13 @@ _pmaAllocatePagesImpl
 
 // Local patch: vidmem user reserve, see mem_mgr/video_mem.c.
 NvBool vidmemUserReservePmaRange(PMA *pPma, NvU64 pageSize, NvU64 *pBegin, NvU64 *pEnd);
+NvBool vidmemPmaTopDown(PMA *pPma);
 
 //
 // Local patch: allocations without an address range get the range above the
 // vidmem user reserve block unless the caller is exempt from the reserve
-// (vidmemUserReservePmaRange()). Works on a copy of the options so callers
+// (vidmemUserReservePmaRange()); without the reserve, non-contiguous ones go
+// top-down (vidmemPmaTopDown()). Works on a copy of the options so callers
 // that reuse theirs are not affected.
 //
 NV_STATUS
@@ -626,16 +628,26 @@ pmaAllocatePages
     NV_STATUS              status;
 
     if ((pPma == NULL) || (allocationOptions == NULL) || pPma->bNuma ||
-        (allocationOptions->flags & PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE) ||
-        !vidmemUserReservePmaRange(pPma, pageSize, &physBegin, &physEnd))
+        (allocationOptions->flags & PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE))
     {
         return _pmaAllocatePagesImpl(pPma, allocationCount, pageSize, allocationOptions, pPages);
     }
 
     options = *allocationOptions;
-    options.flags    |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
-    options.physBegin = physBegin;
-    options.physEnd   = physEnd;
+    if (vidmemUserReservePmaRange(pPma, pageSize, &physBegin, &physEnd))
+    {
+        options.flags    |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
+        options.physBegin = physBegin;
+        options.physEnd   = physEnd;
+    }
+    else if (!(options.flags & PMA_ALLOCATE_CONTIGUOUS) && vidmemPmaTopDown(pPma))
+    {
+        options.flags |= PMA_ALLOCATE_REVERSE_ALLOC;
+    }
+    else
+    {
+        return _pmaAllocatePagesImpl(pPma, allocationCount, pageSize, allocationOptions, pPages);
+    }
 
     status = _pmaAllocatePagesImpl(pPma, allocationCount, pageSize, &options, pPages);
 

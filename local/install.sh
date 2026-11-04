@@ -14,7 +14,7 @@ BUILD=${BUILD:-$HERE/../kernel-open}   # nvtest-root.sh promote passes its candi
 KEYDIR=/var/lib/nvidia-local-mok
 DEST=/lib/modules/$KVER/updates/nvidia-local
 SIGN=/usr/src/linux-headers-$KVER/scripts/sign-file
-RESERVE_MB=${RESERVE_MB:-768}
+RESERVE_MB=${RESERVE_MB:-0}   # 0: no reserve, the compositor gets priority instead (video_mem.c)
 MODPROBE_CONF=/etc/modprobe.d/nvidia-vidmem-reserve.conf
 # Ubuntu's nvidia-dkms-* builds its own modules into updates/dkms; depmod
 # must prefer ours over those (and over kernel/nvidia-*).

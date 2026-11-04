@@ -84,7 +84,7 @@ int main(int argc, char **argv)
     unsigned w = 3840, h = 2160, max = 400, hold = 10;
     unsigned long floor_mb = 150;
     uint32_t flags = GBM_BO_USE_RENDERING;
-    int dumb = 0;
+    int dumb = 0, force = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--node") && i + 1 < argc)
@@ -104,6 +104,8 @@ int main(int argc, char **argv)
             floor_mb = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--hold") && i + 1 < argc)
             hold = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--force"))
+            force = 1;
         else
             goto usage;
     }
@@ -111,8 +113,8 @@ int main(int argc, char **argv)
         node = dumb ? NV_CARD : NV_RENDER;
 
     long reserve = reserve_mb_from_params();
-    if (reserve <= 0) {
-        fprintf(stderr, "RmVidmemUserReserveMB is not set; refusing to run\n");
+    if (reserve <= 0 && !force) {
+        fprintf(stderr, "RmVidmemUserReserveMB is not set; refusing to run (--force overrides)\n");
         return 1;
     }
     if (nvml_open() != 0) {
@@ -148,7 +150,8 @@ int main(int argc, char **argv)
         long f = real_free_mb();
         if (f < min_free)
             min_free = f;
-        if (f < 0 || (unsigned long)f < floor_mb + bo_mb) {
+        // --floor-mb 0: no guard at all (no reserve: the driver has to make room).
+        if (floor_mb != 0 && (f < 0 || (unsigned long)f < floor_mb + bo_mb)) {
             guard = 1;
             why = "floor";
             break;
@@ -175,9 +178,11 @@ int main(int argc, char **argv)
         }
         count++;
         // nvidia-drm falls back to sysmem for NO_SCANOUT buffers once vidmem
-        // is refused; stop then instead of filling system RAM.
+        // is refused; stop then instead of filling system RAM. Not for scanout
+        // buffers (no fallback for them; without the reserve the driver frees
+        // more than each takes by moving others out).
         long after = real_free_mb();
-        if (after >= 0 && f - after < (long)bo_mb / 2) {
+        if (!(flags & GBM_BO_USE_SCANOUT) && after >= 0 && f - after < (long)bo_mb / 2) {
             if (++no_vram >= 5) {
                 why = "sysmem-fallback";
                 break;

@@ -240,6 +240,9 @@ NvU64 vidmemTraceLockNs = 1000000ULL;
 
 // When set, an evict/restore call handles only this allocation (hot memory).
 static MEMORY_DESCRIPTOR *_vidmemEvictOnlyMemDesc;
+// Only allocations with a page in [lo, hi) (a contiguous window for the
+// compositor, _vidmemEvictMakeContig()); hi 0: no filter.
+static NvU64 _vidmemEvictRangeLo, _vidmemEvictRangeHi;
 
 // Hot memory (access counters), defined further down.
 static NvBool _vidmemHotIsRecent(MEMORY_DESCRIPTOR *pMemDesc);
@@ -1667,6 +1670,49 @@ done:
     return (status == NV_OK) ? NV_OK : NV_ERR_NO_MEMORY;
 }
 
+//
+// Does a PMA-backed allocation have a page in [lo, hi)? With pBits (a frame
+// map from `base`, `frames` frames of PMA_PAGE_SHIFT) it marks its frames
+// there instead and returns NV_TRUE if it marked any.
+//
+static NvBool
+_vidmemMemDescFrames(MEMORY_DESCRIPTOR *pMemDesc, NvU64 lo, NvU64 hi, NvU64 *pBits, NvU64 base, NvU64 frames)
+{
+    PMA_ALLOC_INFO *pInfo = pMemDesc->pPmaAllocInfo;
+    NvU64 pageBytes, n, i, f;
+    NvBool bAny = NV_FALSE;
+
+    if ((pInfo == NULL) || (memdescGetAddressSpace(pMemDesc) != ADDR_FBMEM))
+        return NV_FALSE;
+    n         = pInfo->bContig ? 1 : pInfo->pageCount;
+    pageBytes = pInfo->bContig ? pInfo->allocSize : pInfo->pageSize;
+    for (i = 0; i < n; i++)
+    {
+        NvU64 a = pInfo->pageArray[i];
+
+        if (pBits == NULL)
+        {
+            if ((a < hi) && (a + pageBytes > lo))
+                return NV_TRUE;
+            continue;
+        }
+        if (a < base)
+            continue;
+        for (f = (a - base) >> PMA_PAGE_SHIFT; (f < frames) && (f < ((a - base + pageBytes) >> PMA_PAGE_SHIFT)); f++)
+        {
+            pBits[f >> 6] |= NVBIT64(f & 63);
+            bAny = NV_TRUE;
+        }
+    }
+    return bAny;
+}
+
+static NvBool
+_vidmemMemDescInRange(MEMORY_DESCRIPTOR *pMemDesc, NvU64 lo, NvU64 hi)
+{
+    return _vidmemMemDescFrames(pMemDesc, lo, hi, NULL, 0, 0);
+}
+
 // A buffer waiting for phase 2 (the compositor maps it).
 typedef struct
 {
@@ -1804,6 +1850,10 @@ _vidmemEvictPidLocked
 
             // One allocation only (a hot one coming back, _vidmemHotRestore()).
             if ((_vidmemEvictOnlyMemDesc != NULL) && (pMemDesc != _vidmemEvictOnlyMemDesc))
+                continue;
+            // Only what lies in a window being cleared for the compositor.
+            if ((_vidmemEvictRangeHi != 0) &&
+                !_vidmemMemDescInRange(pMemDesc, _vidmemEvictRangeLo, _vidmemEvictRangeHi))
                 continue;
 
             if (mode == 2)
@@ -2371,6 +2421,8 @@ typedef struct
     NvU64 hiddenSinceNs;  // monotonic ns when its hint last turned hidden (0: not hidden)
     NvU64 submitSig;      // signature of its channels' GP_PUT at the last check
     NvU64 lastSubmitNs;   // monotonic ns when that signature last changed (work submitted)
+    NvU64 lastFgNs;       // monotonic ns when a hint last said foreground
+    NvU64 drawingSinceNs; // monotonic ns since when it has drawn at every policy step (0: not drawing)
 } VIDMEM_EVICT_ACTIVITY;
 
 //
@@ -2894,6 +2946,8 @@ _vidmemEvictGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
             pProcs[k].hint    = _vidmemHint(pProcs[k].pid, NULL);
             if (VE_HINT_STATE(pProcs[k].hint) >= VE_HINT_VISIBLE)
                 pAct->lastVisibleNs = pAct->vidmemAtNs;
+            if (VE_HINT_STATE(pProcs[k].hint) == VE_HINT_FG)
+                pAct->lastFgNs = pAct->vidmemAtNs;
             if (VE_HINT_STATE(pProcs[k].hint) != VE_HINT_HIDDEN)
                 pAct->hiddenSinceNs = 0;
             else if (pAct->hiddenSinceNs == 0)
@@ -2977,6 +3031,29 @@ _vidmemEvictBusiestPid(VIDMEM_EVICT_PROC *pProcs, NvU32 count)
 // game's streaming, 1 fps).
 //
 #define VE_LEVEL_FG_RESTORE 2
+//
+// COMPOSITOR: anyone but the desktop itself, the foreground included (last):
+// the compositor's allocation must not fail (no reserve), a game moved out
+// in part only draws slower for a moment (vidmemEvictMakeRoomCompositor()).
+//
+#define VE_LEVEL_COMPOSITOR 3
+
+//
+// A process that was the foreground a moment ago (the game the user alt-tabbed
+// away from, or is alt-tabbing back to: the hints say hidden for a moment) is
+// not moved out for anybody but the foreground and the compositor (2026-11-04
+// death scenario: 241 MB of the game moved out to bring back a minimized
+// launcher's 21 MB at the switch back, a 215 ms frame).
+//
+#define VIDMEM_EVICT_RECENT_FG_SEC 30
+//
+// "Drawing again" brings a moved-out process back only when it has drawn at
+// every policy step for this long: a minimized launcher drawing a frame now
+// and then was brought back and moved out again six times (ping-pong).
+//
+#define VIDMEM_EVICT_STEADY_SEC    6
+// Margin on top of what a restore of a non-foreground process needs.
+#define VIDMEM_EVICT_RESTORE_MARGIN_MB 64
 
 //
 // May `p` be moved out to make room, by the window hints? Hidden (own
@@ -2994,7 +3071,12 @@ _vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs, NvU
 
     if (p->bNever || (p->pid == exceptPid) || (p->eligibleBytes < (4ULL << 20)))
         return NV_FALSE;
+    if (level == VE_LEVEL_COMPOSITOR)
+        return NV_TRUE;
     if (st == VE_HINT_FG)
+        return NV_FALSE;
+    if ((level == VE_LEVEL_HIDDEN) && (pAct->lastFgNs != 0) &&
+        (nowNs - pAct->lastFgNs < VIDMEM_EVICT_RECENT_FG_SEC * 1000000000ULL))
         return NV_FALSE;
     if ((pAct->lastRestoreNs != 0) &&
         (nowNs - pAct->lastRestoreNs < VIDMEM_EVICT_AFTER_ACCESS_SEC * 1000000000ULL))
@@ -3060,7 +3142,11 @@ _vidmemEvictHintPickVictim(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU32 exceptP
         if (!_vidmemEvictHintVictimOk(&pProcs[i], exceptPid, nowNs, level))
             continue;
         vis = _vidmemActivityFind(pProcs[i].pid, NV_TRUE)->lastVisibleNs;
-        if (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_VISIBLE)
+        if (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG)
+            cls = 6;    // the compositor's last resort
+        else if ((level == VE_LEVEL_COMPOSITOR) && _vidmemEvictIsProtected(pProcs[i].pid, nowNs))
+            cls = 5;    // the game in the background, a process just started or just restored
+        else if (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_VISIBLE)
             // Visible: only for the foreground, idle ones before drawing ones.
             cls = (_vidmemActivityIdleSec(pProcs[i].pid) >= VIDMEM_EVICT_VISIBLE_IDLE_SEC) ? 3 : 4;
         else if (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_UNKNOWN)
@@ -3100,7 +3186,8 @@ _vidmemEvictHintFree(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: %s: free %llu MB, want %llu MB, evicting up to %llu MB of %s (pid %u, %s%s, %llu MB movable)\n",
                   why, avail, wantMB, (wantMB - avail) + 64, pPick->name, pPick->pid,
                   (VE_HINT_STATE(pPick->hint) == VE_HINT_HIDDEN) ? "hidden" :
-                  ((VE_HINT_STATE(pPick->hint) == VE_HINT_VISIBLE) ? "visible, for the foreground" : "no window"),
+                  ((VE_HINT_STATE(pPick->hint) == VE_HINT_VISIBLE) ? "visible, for the foreground" :
+                   ((VE_HINT_STATE(pPick->hint) == VE_HINT_FG) ? "foreground, for the compositor" : "no window")),
                   (pPick->hint & VE_HINT_INHERITED) ? " (parent)" : "", pPick->eligibleBytes >> 20);
         // Only what is missing (+64 MB), not the whole process.
         _vidmemEvictBudgetBytes = ((wantMB - avail) + 64) << 20;
@@ -3176,35 +3263,6 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
     NvU32 pass, i;
 
     //
-    // 0. A process moved out that is drawing again comes back first: from
-    // sysmem it would load PCIe and GR for everyone (idle hidden processes
-    // make room; if there is none it stays where it is).
-    //
-    for (i = 0; i < count; i++)
-    {
-        NvU64 needMB = pProcs[i].evictedBytes >> 20;
-
-        if ((pProcs[i].evictedBytes == 0) || pProcs[i].bNever ||
-            (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) ||
-            (_vidmemActivityIdleSec(pProcs[i].pid) >= VIDMEM_EVICT_IDLE_SEC))
-            continue;
-        _vidmemEvictWhy = VMT_WHY_ROOM;
-        avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB, pProcs[i].pid,
-                                     VE_LEVEL_HIDDEN, "drawing again");
-        if (avail < needMB + 16)
-            continue;
-        NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: restoring %s (pid %u, drawing again, %llu MB)\n",
-                  pProcs[i].name, pProcs[i].pid, needMB);
-        _vidmemEvictWhy = VMT_WHY_RESTORE;
-        (void)_vidmemEvictPidLocked(pGpu, 2, pProcs[i].pid, NULL, 0, NULL, NULL);
-        pProcs[i].evictedBytes = 0;
-        _vidmemActivityFind(pProcs[i].pid, NV_TRUE)->evictedForFgNs = 0;
-    }
-
-    // 0b. Evicted allocations in use (access counters) come back one by one.
-    _vidmemHotRestore(pGpu, pProcs, count);
-
-    //
     // 1. Visible processes get their memory back now: the foreground first,
     // then other visible ones; hidden processes make room.
     //
@@ -3234,7 +3292,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
                 {
                     // Only hidden ones make room for a visible (not foreground) app.
                     _vidmemEvictWhy = VMT_WHY_ROOM;
-                    (void)_vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB,
+                    (void)_vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_RESTORE_MARGIN_MB,
                                                pProcs[i].pid, VE_LEVEL_HIDDEN, "visible again");
                 }
                 avail = _vidmemEvictAvailMB(pGpu);
@@ -3259,6 +3317,49 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
             _vidmemActivityFind(pProcs[i].pid, NV_TRUE)->evictedForFgNs = 0;
         }
     }
+
+    //
+    // 1b. A process moved out that draws steadily again comes back: from
+    // sysmem it would load PCIe and GR for everyone. After the foreground,
+    // which the user is working with. A visible one gets room made by idle
+    // hidden processes; a hidden one (minimized, behind the game) only takes
+    // memory that is free anyway: it is slowed down, not the others (a
+    // minimized launcher drawing a frame now and then ping-ponged six times
+    // and took 241 MB of the game at a switch, 2026-11-04).
+    //
+    for (i = 0; i < count; i++)
+    {
+        VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(pProcs[i].pid, NV_TRUE);
+        NvU64 needMB = pProcs[i].evictedBytes >> 20;
+        NvBool bVisible = (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_VISIBLE);
+
+        if ((pProcs[i].evictedBytes == 0) || pProcs[i].bNever ||
+            (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) ||
+            (pAct->drawingSinceNs == 0) ||
+            (nowNs - pAct->drawingSinceNs < VIDMEM_EVICT_STEADY_SEC * 1000000000ULL))
+            continue;
+        if (bVisible)
+        {
+            _vidmemEvictWhy = VMT_WHY_ROOM;
+            avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_RESTORE_MARGIN_MB,
+                                         pProcs[i].pid, VE_LEVEL_HIDDEN, "drawing again");
+            if (avail < needMB + 16)
+                continue;
+        }
+        else if (_vidmemEvictAvailMB(pGpu) < needMB + VIDMEM_EVICT_HINT_LOW_MB)
+        {
+            continue;
+        }
+        NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: restoring %s (pid %u, drawing again, %s, %llu MB)\n",
+                  pProcs[i].name, pProcs[i].pid, bVisible ? "visible" : "not visible", needMB);
+        _vidmemEvictWhy = VMT_WHY_RESTORE;
+        (void)_vidmemEvictPidLocked(pGpu, 2, pProcs[i].pid, NULL, 0, NULL, NULL);
+        pProcs[i].evictedBytes = 0;
+        pAct->evictedForFgNs = 0;
+    }
+
+    // 1c. Evicted allocations in use (access counters) come back one by one.
+    _vidmemHotRestore(pGpu, pProcs, count);
 
     //
     // 2. Pressure: hidden processes out until lowMB + hysteresis is free.
@@ -3339,7 +3440,7 @@ _vidmemHotRestore(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count)
         if (_vidmemHintsActive() && (hint == VE_HINT_HIDDEN))
             continue;
         _vidmemEvictWhy = VMT_WHY_ROOM;
-        avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB,
+        avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_RESTORE_MARGIN_MB,
                                      pState->ownerPid, VE_LEVEL_HIDDEN, "hot allocation");
         if (avail < needMB + 16)
             continue;
@@ -3371,6 +3472,18 @@ _vidmemEvictPolicyStep(OBJGPU *pGpu)
     _vidmemActivitySample(pGpu);
     _vidmemActivitySampleSubmits(pGpu);
     _vidmemHotPoll(pGpu);
+    // Drawing streaks ("drawing again" wants a steady one, not a frame now and then).
+    for (i = 0; i < VIDMEM_EVICT_MAX_PROCS; i++)
+    {
+        VIDMEM_EVICT_ACTIVITY *pAct = &_vidmemActivity[i];
+
+        if (pAct->pid == 0)
+            continue;
+        if (_vidmemActivityIdleSec(pAct->pid) >= VIDMEM_EVICT_TICK_SEC)
+            pAct->drawingSinceNs = 0;
+        else if (pAct->drawingSinceNs == 0)
+            pAct->drawingSinceNs = nowNs;
+    }
     {
         NvU32 busiest = _vidmemActivityBusiest();
 
@@ -3670,11 +3783,53 @@ vidmemEvictWantBorn(OBJGPU *pGpu, RmClient *pRmClient, NV_MEMORY_ALLOCATION_PARA
                               NVOS32_ALLOC_FLAGS_USE_BEGIN_END |
                               NVOS32_ALLOC_FLAGS_VIRTUAL)))
         return NV_FALSE;
-    if ((pHeap == NULL) ||
-        !vidmemGetUserReserveBlockInfo(pHeap->pPmaObject, &blockBytes, &blockFree, &blockLargest) ||
-        (blockFree < pAllocData->size + (128ULL << 20)))
+    if (pHeap == NULL)
         return NV_FALSE;
-    return NV_TRUE;
+    if (!vidmemGetUserReserveBlockInfo(pHeap->pPmaObject, &blockBytes, &blockFree, &blockLargest))
+    {
+        // No reserve: it sits in the free memory for that moment.
+        NvU64 freeBytes = 0;
+
+        pmaGetFreeMemory(pHeap->pPmaObject, &freeBytes);
+        return freeBytes >= pAllocData->size + (64ULL << 20);
+    }
+    return blockFree >= pAllocData->size + (128ULL << 20);
+}
+
+//
+// No reserve: free vidmem a background process may not take (registry
+// RmVidmemBgCushionMB, 0: off). A hidden process, or a windowless one idle on
+// the GPU, gets its new allocations in sysmem once less than this would be
+// left (vidmemEvictWantBorn()), and is told that much less free memory: the
+// last of vidmem goes to what the user works with and to the compositor.
+// Not for what would then be denied instead of moved (the game in the
+// background, a process with >= 1 GB, one drawing), and not for a process
+// that was the foreground a moment ago.
+//
+static NvU32 _vidmemBgCushionMB = 256;
+
+NvU64
+vidmemEvictBackgroundCushion(RmClient *pRmClient)
+{
+    VIDMEM_EVICT_ACTIVITY *pAct;
+    NvU64 nowNs;
+    NvU32 st;
+
+    if ((_vidmemBgCushionMB == 0) || !_vidmemAutoActive() || !_vidmemHintsActive() ||
+        (pRmClient == NULL) || (pRmClient->ProcID == 0) || _vidmemEvictIsNeverName(pRmClient->name))
+        return 0;
+    st = VE_HINT_STATE(_vidmemHint(pRmClient->ProcID, NULL));
+    if (st >= VE_HINT_VISIBLE)
+        return 0;
+    pAct = _vidmemActivityFind(pRmClient->ProcID, NV_FALSE);
+    if (pAct == NULL)
+        return 0;
+    nowNs = osGetMonotonicTimeNs();
+    if (_vidmemEvictIsProtected(pRmClient->ProcID, nowNs) ||
+        (_vidmemActivityIdleSec(pRmClient->ProcID) < VIDMEM_EVICT_DRAWING_SEC) ||
+        ((pAct->lastFgNs != 0) && (nowNs - pAct->lastFgNs < VIDMEM_EVICT_RECENT_FG_SEC * 1000000000ULL)))
+        return 0;
+    return (NvU64)_vidmemBgCushionMB << 20;
 }
 
 //
@@ -3793,6 +3948,355 @@ _vidmemEvictMakeRoomWant(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvU64 he
 }
 
 //
+// No reserve: clear a contiguous window of `size` for the compositor (a
+// scanout buffer is physically contiguous). Marks the frames of everything
+// the victims could give up, picks the 2 MB-aligned window with no frame that
+// cannot be freed and the least to move (the lowest of equals: scanout
+// buffers grow up), and moves just the allocations in it. GPU lock held.
+//
+NvU64 *vidmemPmaUsedMap(PMA *pPma, NvU64 *pBase, NvU64 *pFrames, NvU64 *pLargestFree); // video_mem.c
+
+#define VIDMEM_EVICT_CHUNK_FRAMES ((2ULL << 20) >> PMA_PAGE_SHIFT)
+
+//
+// Free 2 MB pages (physically 2 MB aligned: the region base is not) in a frame
+// map from vidmemPmaUsedMap(): how many, and the longest run of them. What a
+// 2 MB-page allocation can use; free bytes in 64 KB holes are no help to it
+// (2026-11-04 scanout-churn: 96 MB free, the compositor's 32 MB failed).
+//
+static void
+_vidmemEvictFreeChunks(const NvU64 *pUsed, NvU64 base, NvU64 frames, NvU64 *pFree, NvU64 *pLongest)
+{
+    NvU64 off = (NV_ALIGN_UP64(base, 2ULL << 20) - base) >> PMA_PAGE_SHIFT;
+    NvU64 f, g, run = 0;
+
+    *pFree = *pLongest = 0;
+    for (f = off; f + VIDMEM_EVICT_CHUNK_FRAMES <= frames; f += VIDMEM_EVICT_CHUNK_FRAMES)
+    {
+        for (g = f; g < f + VIDMEM_EVICT_CHUNK_FRAMES; g++)
+        {
+            if ((pUsed[g >> 6] >> (g & 63)) & 1)
+                break;
+        }
+        if (g < f + VIDMEM_EVICT_CHUNK_FRAMES)
+        {
+            run = 0;
+            continue;
+        }
+        (*pFree)++;
+        *pLongest = NV_MAX(*pLongest, ++run);
+    }
+}
+
+//
+// The cheapest window of `need` 2 MB chunks starting at a multiple of `align`:
+// frames to move (in use and movable, pMovable), NV_U64_MAX if every window
+// holds a frame that cannot be freed. *pStart (optional) gets its first chunk.
+// pCost is scratch space for `chunks` entries.
+//
+static NvU64
+_vidmemEvictBestWindow(const NvU64 *pUsed, const NvU64 *pMovable, NvU32 *pCost, NvU64 base, NvU64 off,
+                       NvU64 chunks, NvU64 need, NvU64 align, NvU64 *pStart)
+{
+    NvU64 c, f, s, best = NV_U64_MAX;
+
+    for (c = 0; c < chunks; c++)
+    {
+        NvU32 n = 0;
+
+        for (f = off + c * VIDMEM_EVICT_CHUNK_FRAMES; f < off + (c + 1) * VIDMEM_EVICT_CHUNK_FRAMES; f++)
+        {
+            NvBool bUsed = (pUsed[f >> 6] >> (f & 63)) & 1;
+            NvBool bMov  = (pMovable[f >> 6] >> (f & 63)) & 1;
+
+            if (bUsed && !bMov)
+            {
+                n = NV_U32_MAX;
+                break;
+            }
+            n += bUsed;
+        }
+        pCost[c] = n;
+    }
+    for (s = 0; s + need <= chunks; s++)
+    {
+        NvU64 addr = base + ((off + s * VIDMEM_EVICT_CHUNK_FRAMES) << PMA_PAGE_SHIFT);
+        NvU64 cost = 0;
+
+        if ((addr % align) != 0)
+            continue;
+        for (c = s; c < s + need; c++)
+        {
+            if (pCost[c] == NV_U32_MAX)
+                break;
+            cost += pCost[c];
+        }
+        if ((c == s + need) && (cost < best))
+        {
+            best = cost;
+            if (pStart != NULL)
+                *pStart = s;
+            if (best == 0)
+                break;
+        }
+    }
+    return best;
+}
+
+// Free 2 MB pages now and their longest run, or NV_FALSE.
+static NvBool
+_vidmemEvictChunkInfo(PMA *pPma, NvU64 *pFree, NvU64 *pLongest)
+{
+    NvU64  base = 0, frames = 0, largest = 0;
+    NvU64 *pUsed = vidmemPmaUsedMap(pPma, &base, &frames, &largest);
+
+    if (pUsed == NULL)
+        return NV_FALSE;
+    _vidmemEvictFreeChunks(pUsed, base, frames, pFree, pLongest);
+    portMemFree(pUsed);
+    return NV_TRUE;
+}
+
+static NvBool
+_vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
+                       NvU64 *pMovedMB)
+{
+    Heap   *pHeap = GPU_GET_HEAP(pGpu);
+    PMA    *pPma = (pHeap != NULL) ? pHeap->pPmaObject : NULL;
+    NvU64   base = 0, frames = 0, largest = 0, words, chunks, need, off, freeChunks, longest;
+    NvU64  *pUsed, *pMovable = NULL;
+    NvU32  *pCost = NULL;
+    NvU64   bestStart = NV_U64_MAX, bestCost = NV_U64_MAX;
+    VIDMEM_EVICT_MAPREF *pRefs = NULL;
+    NvU64   nowNs = osGetMonotonicTimeNs();
+    NvBool  bOk = NV_FALSE;
+    NvU32   i;
+
+    *pMovedMB = 0;
+    pUsed = vidmemPmaUsedMap(pPma, &base, &frames, &largest);
+    if (pUsed == NULL)
+        return NV_FALSE;
+    //
+    // The window starts at a multiple of the allocation's alignment: an ISO
+    // scanout buffer may want more than 2 MB (2026-11-04 scanout-churn: a
+    // cleared 2 MB-aligned 32 MB window at 0x1ffc00000 did not do).
+    //
+    align  = NV_MAX(align, 2ULL << 20);
+    need   = NV_DIV_AND_CEIL(size, 2ULL << 20);
+    _vidmemEvictFreeChunks(pUsed, base, frames, &freeChunks, &longest);
+    words  = (frames + 63) >> 6;
+    off    = (NV_ALIGN_UP64(base, 2ULL << 20) - base) >> PMA_PAGE_SHIFT;
+    chunks = (frames > off) ? (frames - off) / VIDMEM_EVICT_CHUNK_FRAMES : 0;
+    pMovable = portMemAllocNonPaged(words * sizeof(NvU64));
+    pCost    = portMemAllocNonPaged(chunks * sizeof(NvU32));
+    pRefs    = portMemAllocNonPaged(sizeof(*pRefs) * VIDMEM_EVICT_MAX_MAPPINGS);
+    if ((pMovable == NULL) || (pCost == NULL) || (pRefs == NULL) || (need == 0) || (need > chunks))
+        goto done;
+    portMemSet(pMovable, 0, words * sizeof(NvU64));
+    // Already there: an aligned window with nothing in it.
+    if (_vidmemEvictBestWindow(pUsed, pMovable, pCost, base, off, chunks, need, align, NULL) == 0)
+    {
+        bOk = NV_TRUE;
+        goto done;
+    }
+
+    // Frames the victims could give up.
+    for (i = 0; i < count; i++)
+    {
+        RmClient **ppClient;
+
+        if (!_vidmemEvictHintVictimOk(&pProcs[i], 0, nowNs, VE_LEVEL_COMPOSITOR))
+            continue;
+        for (ppClient = serverutilGetFirstClientUnderLock(); ppClient != NULL;
+             ppClient = serverutilGetNextClientUnderLock(ppClient))
+        {
+            RsClient   *pRsClient = staticCast(*ppClient, RsClient);
+            RS_ITERATOR iter;
+
+            if ((pRsClient->type == CLIENT_TYPE_KERNEL) || ((*ppClient)->ProcID != pProcs[i].pid))
+                continue;
+            iter = serverutilRefIter(pRsClient->hClient, NV01_NULL_OBJECT, 0, RS_ITERATE_DESCENDANTS, NV_TRUE);
+            while (clientRefIterNext(iter.pClient, &iter))
+            {
+                Memory *pMemory = dynamicCast(iter.pResourceRef->pResource, Memory);
+                NvU32   numRefs = 0;
+
+                if ((pMemory == NULL) || (pMemory->pMemDesc == NULL) ||
+                    (iter.pResourceRef->externalClassId != NV01_MEMORY_LOCAL_USER) ||
+                    (pMemory->pMemDesc->pLocalEvictState != NULL) ||
+                    (_vidmemEvictCheck(pGpu, iter.pResourceRef, pProcs[i].pid, pRefs, &numRefs) != NULL))
+                    continue;
+                (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pMovable, base, frames);
+            }
+        }
+    }
+
+    bestCost = _vidmemEvictBestWindow(pUsed, pMovable, pCost, base, off, chunks, need, align, &bestStart);
+    if (bestStart == NV_U64_MAX)
+    {
+        NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: compositor: no %llu MB window aligned to %llu KB can be cleared (longest free %llu MB)\n",
+                  need * 2, align >> 10, longest * 2);
+        goto done;
+    }
+
+    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: compositor: clearing %llu MB at 0x%llx for a contiguous %llu KB aligned to %llu KB (longest free %llu MB, %llu MB to move)\n",
+              need * 2, base + ((off + bestStart * VIDMEM_EVICT_CHUNK_FRAMES) << PMA_PAGE_SHIFT), size >> 10,
+              align >> 10, longest * 2, (bestCost << PMA_PAGE_SHIFT) >> 20);
+    _vidmemEvictRangeLo = base + ((off + bestStart * VIDMEM_EVICT_CHUNK_FRAMES) << PMA_PAGE_SHIFT);
+    _vidmemEvictRangeHi = _vidmemEvictRangeLo + (need << 21);
+    for (i = 0; i < count; i++)
+    {
+        RmClient **ppClient;
+        NvBool     bHas = NV_FALSE;
+        NvU64      moved = 0;
+
+        if (!_vidmemEvictHintVictimOk(&pProcs[i], 0, nowNs, VE_LEVEL_COMPOSITOR))
+            continue;
+        for (ppClient = serverutilGetFirstClientUnderLock(); (ppClient != NULL) && !bHas;
+             ppClient = serverutilGetNextClientUnderLock(ppClient))
+        {
+            RsClient   *pRsClient = staticCast(*ppClient, RsClient);
+            RS_ITERATOR iter;
+
+            if ((pRsClient->type == CLIENT_TYPE_KERNEL) || ((*ppClient)->ProcID != pProcs[i].pid))
+                continue;
+            iter = serverutilRefIter(pRsClient->hClient, NV01_NULL_OBJECT, 0, RS_ITERATE_DESCENDANTS, NV_TRUE);
+            while (!bHas && clientRefIterNext(iter.pClient, &iter))
+            {
+                Memory *pMemory = dynamicCast(iter.pResourceRef->pResource, Memory);
+
+                bHas = (pMemory != NULL) && (pMemory->pMemDesc != NULL) &&
+                       (iter.pResourceRef->externalClassId == NV01_MEMORY_LOCAL_USER) &&
+                       (pMemory->pMemDesc->pLocalEvictState == NULL) &&
+                       _vidmemMemDescInRange(pMemory->pMemDesc, _vidmemEvictRangeLo, _vidmemEvictRangeHi);
+            }
+        }
+        if (!bHas)
+            continue;
+        (void)_vidmemEvictPidLocked(pGpu, 1, pProcs[i].pid, NULL, 0, NULL, &moved);
+        *pMovedMB += moved >> 20;
+    }
+    _vidmemEvictRangeLo = _vidmemEvictRangeHi = 0;
+
+    portMemFree(pUsed);
+    pUsed = vidmemPmaUsedMap(pPma, &base, &frames, &largest);
+    portMemSet(pMovable, 0, words * sizeof(NvU64));
+    bOk = (pUsed != NULL) &&
+          (_vidmemEvictBestWindow(pUsed, pMovable, pCost, base, off, chunks, need, align, NULL) == 0);
+
+done:
+    portMemFree(pUsed);
+    portMemFree(pMovable);
+    portMemFree(pCost);
+    portMemFree(pRefs);
+    return bOk;
+}
+
+static NvU32 _vidmemCompRooms, _vidmemCompRoomFails;
+static NvU64 _vidmemCompRoomMovedMB, _vidmemCompRoomMaxNs;
+
+//
+// No reserve: an allocation of the compositor (kwin_wayland, Xwayland, a
+// kernel thread) just failed. Move others to sysmem until it fits, hidden
+// and idle ones first and the foreground last (VE_LEVEL_COMPOSITOR), and for
+// a contiguous one clear a window (_vidmemEvictMakeContig()). The caller
+// tries again. Needs the API lock for writing (vidmemConstruct() holds it).
+//
+NvBool
+vidmemEvictMakeRoomCompositor(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvBool bContig, NvU64 align)
+{
+    static NvU32       lockLogged;
+    VIDMEM_EVICT_PROC *pProcs;
+    NvU64              t0 = VMT_NOW(), avail, wantMB, movedMB = 0, dt;
+    NvU32              count;
+    NvBool             bOk;
+    NvBool             bLocked = NV_FALSE;
+
+    if (!_vidmemAutoActive() || _vidmemEvictIsBusyThread())
+        return NV_FALSE;
+    if (!rmapiLockIsWriteOwner())
+    {
+        if (lockLogged++ < 4)
+            NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: cannot make room for the compositor (%s) here: no API write lock\n",
+                      (pRmClient != NULL) ? pRmClient->name : "kernel");
+        return NV_FALSE;
+    }
+    if (!rmGpuLockIsOwner() && !rmDeviceGpuLockIsOwner(pGpu->gpuInstance))
+    {
+        if (rmDeviceGpuLocksAcquire(pGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_MEM) != NV_OK)
+            return NV_FALSE;
+        bLocked = NV_TRUE;
+    }
+    pProcs = portMemAllocNonPaged(sizeof(*pProcs) * VIDMEM_EVICT_MAX_PROCS);
+    if (pProcs == NULL)
+    {
+        if (bLocked)
+            rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
+        return NV_FALSE;
+    }
+    count = _vidmemEvictGatherProcs(pGpu, pProcs, VIDMEM_EVICT_MAX_PROCS);
+
+    //
+    // Free 2 MB pages, not free bytes: a 2 MB-page allocation cannot use
+    // 64 KB holes. Each round asks for what is still missing (whole
+    // allocations move, and some of them may sit in holes).
+    //
+    _vidmemEvictWhy = VMT_WHY_ALLOC;
+    wantMB = 2 * NV_DIV_AND_CEIL(size, 2ULL << 20) + VIDMEM_EVICT_RESTORE_MARGIN_MB;
+    avail  = _vidmemEvictAvailMB(pGpu);
+    {
+        Heap  *pHeap = GPU_GET_HEAP(pGpu);
+        NvU64  freeChunks = 0, longest = 0, round;
+
+        for (round = 0; round < 4; round++)
+        {
+            NvU64 before = avail;
+
+            if (!_vidmemEvictChunkInfo(pHeap->pPmaObject, &freeChunks, &longest) || (2 * freeChunks >= wantMB))
+                break;
+            avail = _vidmemEvictHintFree(pGpu, pProcs, count, avail + (wantMB - 2 * freeChunks), 0,
+                                         VE_LEVEL_COMPOSITOR, "compositor");
+            movedMB += (avail > before) ? (avail - before) : 0;
+            if (avail <= before)
+                break;      // nothing left to move
+        }
+        bOk = _vidmemEvictChunkInfo(pHeap->pPmaObject, &freeChunks, &longest) &&
+              (2 * freeChunks > (size >> 20));
+    }
+    if (bOk && bContig)
+    {
+        NvU64 contigMB = 0;
+
+        // What moved changed what the victims hold.
+        count = _vidmemEvictGatherProcs(pGpu, pProcs, VIDMEM_EVICT_MAX_PROCS);
+        bOk = _vidmemEvictMakeContig(pGpu, pProcs, count, size, align, &contigMB);
+        movedMB += contigMB;
+    }
+    _vidmemEvictUpdateReclaimable(pProcs, count, osGetMonotonicTimeNs());
+    _vidmemLastPressureNs = osGetMonotonicTimeNs();
+
+    portMemFree(pProcs);
+    if (bLocked)
+        rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
+
+    dt = VMT_NOW() - t0;
+    _vidmemCompRooms++;
+    _vidmemCompRoomFails += !bOk;
+    _vidmemCompRoomMovedMB += movedMB;
+    _vidmemCompRoomMaxNs = NV_MAX(_vidmemCompRoomMaxNs, dt);
+    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: compositor: %s %llu KB%s for %s: %s, %llu MB moved in %llu us\n",
+              bOk ? "room made for" : "no room for", size >> 10, bContig ? " contiguous" : "",
+              (pRmClient != NULL) ? pRmClient->name : "kernel", bOk ? "retrying" : "it fails",
+              movedMB, dt / 1000);
+    if (osVidmemTraceOn(VMT_MAKEROOM))
+    {
+        NvU64 a[VMT_ARGS] = { size, wantMB, avail, bOk, dt, VE_LEVEL_COMPOSITOR };
+        osVidmemTrace(VMT_MAKEROOM, (pRmClient != NULL) ? pRmClient->ProcID : osGetCurrentProcess(), a);
+    }
+    return bOk;
+}
+
+//
 // Move an allocation that vidmemConstruct() just made to sysmem. It has no
 // mappings yet, so nothing has to be paused; its content is the scrubbed
 // (zeroed) vidmem. GPU lock held.
@@ -3884,6 +4388,8 @@ vidmemEvictAutoInit(OBJGPU *pGpu, NvU32 reserveMB)
         _vidmemHighMB = data32;
     if (osReadRegistryDword(pGpu, "RmVidmemFgHeadroomMB", &data32) == NV_OK)
         _vidmemFgHeadroomMB = data32;
+    if (osReadRegistryDword(pGpu, "RmVidmemBgCushionMB", &data32) == NV_OK)
+        _vidmemBgCushionMB = data32;
     if (_vidmemHighMB <= _vidmemLowMB + VIDMEM_EVICT_HYST_MB)
         _vidmemHighMB = _vidmemLowMB + 2 * VIDMEM_EVICT_HYST_MB;
 
@@ -3946,9 +4452,20 @@ _vidmemEvictPrintBlock(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
     NvU64  blockBytes = 0, blockFree = 0, blockLargest = 0;
     NvU64  nowNs = osGetMonotonicTimeNs();
 
-    if ((pHeap == NULL) ||
-        !vidmemGetUserReserveBlockInfo(pHeap->pPmaObject, &blockBytes, &blockFree, &blockLargest))
+    if (pHeap == NULL)
         return;
+    if (!vidmemGetUserReserveBlockInfo(pHeap->pPmaObject, &blockBytes, &blockFree, &blockLargest))
+    {
+        NvU64  base = 0, frames = 0, largest = 0;
+        NvU64 *pUsed = vidmemPmaUsedMap(pHeap->pPmaObject, &base, &frames, &largest);
+
+        portMemFree(pUsed);
+        EVICT_PRINTF("no reserve: largest contiguous free %llu MB; background cushion %u MB; "
+                     "room made for the compositor %u times (%u failed), %llu MB moved, longest %llu us\n",
+                     largest >> 20, _vidmemBgCushionMB, _vidmemCompRooms, _vidmemCompRoomFails,
+                     _vidmemCompRoomMovedMB, _vidmemCompRoomMaxNs / 1000);
+        return;
+    }
     vidmemEvictNoteBlock(pHeap->pPmaObject);
 
     EVICT_PRINTF("reserve block %llu MB: free %llu MB (largest %llu MB); lowest since load: free %llu MB (%llu s ago, %s), largest %llu MB (%llu s ago, %s)\n",

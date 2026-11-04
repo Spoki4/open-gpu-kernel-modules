@@ -7,6 +7,8 @@
 #   ./stress.sh gbm               # GBM render/scanout buffers, dumb buffers: bound by the reserve?
 #   ./stress.sh scanout           # with vidmem filled to the reserve, can the compositor still
 #                                 # get contiguous scanout buffers? (needs vidmem_pma, 2026-11-01)
+#                                 # Without the reserve: vidmem filled to the last MB, and the
+#                                 # compositor has to get room made (vidmemEvictMakeRoomCompositor)
 #   ./stress.sh game              # wait for GAME (default sp26-cod.exe), log its census
 #                                 # (incl. sysmem) and vidmem_pma every 10 s until it exits
 #   ./stress.sh run NAME CMD...   # any command under the same watchdog
@@ -28,12 +30,18 @@ LOGROOT=${LOGROOT:-$HERE/stress-logs/$(date +%F_%H%M%S)}
 
 params=$(cat /proc/driver/nvidia/params)
 RESERVE_MB=$(sed -n 's/.*RmVidmemUserReserveMB=\([0-9]*\).*/\1/p' <<<"$params")
-[[ ${RESERVE_MB:-0} -gt 0 ]] || { echo "stress.sh: RmVidmemUserReserveMB is not set" >&2; exit 1; }
+[[ -n $RESERVE_MB ]] || { echo "stress.sh: RmVidmemUserReserveMB is not set (not the local driver?)" >&2; exit 1; }
+# No reserve: filling vidmem to the end is the test, the kill switch would stop it.
+(( RESERVE_MB > 0 )) || KILL_MB=${KILL_MB_NORES:-0}
+NORES_HOG=() NORES_PROBE=()
+(( RESERVE_MB > 0 )) || { NORES_HOG=(--force --floor-mb 0); NORES_PROBE=(--force --floor-mb 0); }
 for t in vram-hog gbm-hog; do
     [[ -x $HERE/$t ]] || { echo "stress.sh: $t missing, run ./build.sh tools" >&2; exit 1; }
 done
 
-# The desktop session's environment, so spectacle and journalctl --user work over SSH.
+# The desktop session's environment, so spectacle and journalctl --user work over SSH
+# (in the test VM guest the Wayland socket name changes with every SDDM restart).
+[[ -z ${WAYLAND_DISPLAY:-} ]] && eval "$("$HERE/scenario/session-env.sh" 2>/dev/null)" || true
 uid=$(id -u)
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$uid}
 export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
@@ -191,6 +199,11 @@ summarize() {
     (( pfail == 0 )) || why+=("$pfail screenshot probes failed")
     (( badk == 0 )) || why+=("$badk bad kernel lines")
     (( badu == 0 )) || why+=("$badu kwin error lines")
+    # No reserve: the compositor probe must get every buffer it asked for.
+    if (( RESERVE_MB == 0 )) && grep -q 'RESULT mode=gbm' "$dir/cmd.log" 2>/dev/null; then
+        grep 'RESULT mode=gbm' "$dir/cmd.log" | grep -q 'stop=max' || why+=("compositor probe refused")
+        (( nvkmsf == 0 )) || why+=("$nvkmsf nvkms allocation failures")
+    fi
     [[ $kwin0 == "$kwin1" ]] || why+=("kwin pid changed")
     [[ $plasma0 == "$plasma1" ]] || why+=("plasmashell pid changed")
     (( ${#why[@]} == 0 )) || verdict=FAIL
@@ -266,13 +279,13 @@ scanout_case() {
     local hl hog=
     if (( $# > 0 )); then
         hl=$(mktemp)
-        "$HERE/vram-hog" "$@" >"$hl" 2>&1 &
+        "$HERE/vram-hog" "$@" "${NORES_HOG[@]}" >"$hl" 2>&1 &
         hog=$!
         while kill -0 "$hog" 2>/dev/null && ! grep -q holding "$hl"; do sleep 0.5; done
         grep -E 'RESULT|stopped|filled' "$hl"
     fi
     echo "pma before (free, largest contiguous MB): $(pma)"
-    "$KWIN_PROBE" --scanout --max "$n" --floor-mb 64 --hold 2 | grep -vE '^  [0-9]+ buffers'
+    "$KWIN_PROBE" --scanout --max "$n" --floor-mb 64 --hold 2 "${NORES_PROBE[@]}" | grep -vE '^  [0-9]+ buffers'
     echo "pma after: $(pma)"
     if [[ -n $hog ]]; then
         kill "$hog" 2>/dev/null || true
