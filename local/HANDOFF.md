@@ -1277,5 +1277,48 @@ Superposition: the same median frame (19.3 vs 19.4 ms); Linux has a tail
 yet (MangoHud vs PresentMon measure differently; or GL frame pacing).
 Wukong: Windows ~16% faster, the vkd3d-proton translation cost, not the
 driver patch (the patched clean run equals the stock one, 52.1 vs 52.3).
-Not done: the apps + pressure scenario on Windows (how WDDM's own paging
-copes with the same 1.5 GB deficit).
+
+### Apps + 1.5 GB deficit on Windows (2026-11-04 late evening)
+
+`winbench.py run GAME --apps --bg-fill 1500`, bench.py's scenario: Edge
+(Chromium) with the same three tabs (YouTube, Wikipedia, nvt-webgl), then
+idle windowless processes holding VRAM (nvt-idle.exe: local/vm/win/nvt-idle.cs,
+Vulkan through P/Invoke, built in the guest with .NET Framework's csc; it fills
+its buffers once) so the game is 1.5 GB short of its own peak on Windows
+(WIN_VRAM_MB: Superposition 6218 MB, Wukong 5113 MB from the clean runs'
+nvidia-smi log; Linux: 6700 / 5600). Background total 5.5-5.7 GB / 6.7-6.8 GB,
+as on Linux (5.5 / 6.4). Every run now logs nvidia-smi (nvidia-smi.csv) and
+dedicated/shared VRAM per process (gpumem.csv: vm/win/gpumem.ps1, Windows'
+"GPU Process Memory" counters).
+
+| avg fps (1% low) | Linux clean | Linux apps | | Windows clean | Windows apps | |
+|---|---|---|---|---|---|---|
+| Superposition | 52.35 (33.8) | 50.02 (34.5) | -4.4% | 51.38 (43.3/42.9) | 50.47 / 50.40 (42.3/42.1) | -1.8% |
+| Wukong | 52.7 (41.0) | 50.57 (37.2) | -4.0% | 61.07 (42.9-49.9) | 59.07 / 59.16 (39.6/40.5) | -3.2% |
+
+Windows clean = 3 runs (51.41/51.39/51.33; 61.08/60.83/61.31); Linux 1 run
+each. Wukong on Windows: run 1 had 3 stutters (max 122 ms), run 2 none (max
+34 ms); Linux 2 stutters (max 95 ms).
+
+What Windows did with the memory (gpumem.csv, dedicated MB before -> during):
+- Edge gave up most of its VRAM by itself once the fullscreen game covered
+  it: 1361 -> 198 (Superposition), 1300 -> 497 (Wukong). Chromium on Windows
+  drops its GPU resources when its window is occluded; nothing on our Linux
+  desktop tells Chromium that (Wayland has no occlusion signal it uses).
+- WDDM moved the idle processes out only as far as needed: 5725 -> 5149
+  (Superposition, at load), 6805 -> 5941 (Wukong, in 32-64 MB steps during
+  the run; their "shared" grew by the same amount). The game itself stayed
+  in VRAM: 5.6 GB dedicated / ~50 MB shared (Superposition), 4.7-4.9 GB /
+  150-330 MB (Wukong).
+- So the same policy as ours (the background pays, the foreground keeps its
+  memory), plus a browser that cooperates. Linux loses 2-3 points more in
+  Superposition; in Wukong the two are within a point (and within run noise).
+Not looked into: Steam took ~130 s from -applaunch to the game's process
+with Edge and the fill running (18 s clean); it does not touch the measured
+stretch.
+Pitfalls: Start-Process -RedirectStandardOutput gives the child the job
+runner's own output handle (the job is never cleaned up): nvt-idle writes
+--log itself. Wukong's first start after the guest boots is slower: the key
+at 25 s went to the loading screen and the run measured the menu (299 fps,
+kept as bench-logs/win-wk-clean2-*-INVALID-menu); 40 s now, and a run over
+150 fps is refused.

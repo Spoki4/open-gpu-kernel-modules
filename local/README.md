@@ -163,6 +163,7 @@ The same GPU under Windows, for comparisons (never together with the Linux guest
 local/vm/vm.sh stop && local/vm/vm.sh win start && local/vm/vm.sh win wait
 python3 local/bench/winbench.py run superposition --label win-clean
 python3 local/bench/winbench.py run wukong --label win-wk-clean
+python3 local/bench/winbench.py run wukong --label win-wk-apps --apps --bg-fill 1500   # Edge + background VRAM
 local/vm/vm.sh win stop && local/vm/vm.sh start
 ```
 `local/vm/vm.sh win input on` hands keyboard and mouse to Windows (both Ctrl switch back).
