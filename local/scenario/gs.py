@@ -12,6 +12,7 @@ screenshots (spectacle). Used by scenario.py; also a CLI:
   ./gs.py move X Y
   ./gs.py key alt+tab                 one combination (names: evdev KEY_* without KEY_)
   ./gs.py type "text"
+  ./gs.py wheel CLICKS [X Y]          mouse wheel (positive: down), at X,Y
   ./gs.py cursor                      where KWin has the cursor (logical px)
 
 Runs as the session user (spoki4) in the guest, e.g. over vm.sh ssh.
@@ -287,7 +288,7 @@ def main():
         print(cursor())
     elif cmd == "screen":
         print(screen())
-    elif cmd in ("click", "move", "key", "type"):
+    elif cmd in ("click", "move", "key", "type", "wheel"):
         inp = Input()
         try:
             if cmd == "click":
@@ -296,6 +297,10 @@ def main():
                 inp.move(float(a[1]), float(a[2]))
             elif cmd == "key":
                 inp.key(a[1])
+            elif cmd == "wheel":         # wheel CLICKS [X Y]: positive scrolls down
+                if len(a) > 3:
+                    inp.move(float(a[2]), float(a[3]))
+                inp.wheel(int(a[1]))
             else:
                 inp.type(a[1])
             time.sleep(0.2)

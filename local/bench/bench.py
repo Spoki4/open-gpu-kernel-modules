@@ -219,7 +219,114 @@ class SuperpositionBench:
         subprocess.run(["pkill", "-x", "launcher"])
 
 
-GAMES = {"superposition": SuperpositionBench}
+class WukongBench:
+    """Black Myth: Wukong Benchmark Tool (Steam 3132990; DX12 through Proton
+    and VKD3D: it sizes its streaming by the Vulkan/DXGI budget, like the
+    real games). Steam must run with MANGOHUD=1 and MANGOHUD_CONFIGFILE
+    (ensure_steam); the config is rewritten per run. Its window is a
+    managed fullscreen one, so the MangoHud hotkey reaches it. Graphics
+    settings: the tool's defaults (DLSS, Super Resolution 50, no RT).
+    Coordinates: physical pixels of the 3840x2160 screen."""
+    APPID = 3132990
+    CLASS = "steam_app_3132990"
+    MENU_BENCHMARK = (300, 972)
+    CONFIRM = (1509, 1269)
+    VRAM_MB = 5600       # peak at these settings (vidmem_pma: ~10.8 -> ~5.2 GB free)
+    START_S = 20         # from Confirm into the run (it loads ~10 s)
+    LOG_S = 90
+    RUN_S = 190          # Confirm to the results screen (the run is ~175 s)
+    CONF = os.path.expanduser("~/.config/MangoHud/bench.conf")
+
+    def __init__(self, d, inp, rec):
+        self.d, self.inp, self.rec = d, inp, rec
+
+    def ensure_steam(self, log):
+        """Steam (and so the game) with MANGOHUD in its environment."""
+        import gs
+        pids = subprocess.run(["pgrep", "-x", "steam"], capture_output=True, text=True).stdout.split()
+        for p in pids:
+            try:
+                if b"MANGOHUD_CONFIGFILE=" in open(f"/proc/{p}/environ", "rb").read():
+                    return
+            except OSError:
+                pass
+        if pids:
+            subprocess.run(["steam", "-shutdown"], env=gs.env(), capture_output=True)
+            for _ in range(60):
+                if not subprocess.run(["pgrep", "-x", "steam"], capture_output=True).stdout:
+                    break
+                time.sleep(1)
+        env = dict(gs.env(), MANGOHUD="1", MANGOHUD_CONFIGFILE=self.CONF)
+        subprocess.Popen(["steam", "-silent"], env=env, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(90):
+            if subprocess.run(["pgrep", "-x", "steamwebhelper"], capture_output=True).stdout:
+                break
+            time.sleep(1)
+        time.sleep(15)
+        log("steam_started", mangohud=True)
+
+    def window(self):
+        import gs
+        for w in gs.windows():
+            if w["cls"] == self.CLASS:
+                return w
+        return None
+
+    def run(self, log):
+        import gs
+        mh_dir = os.path.join(self.d, "mangohud")
+        os.makedirs(mh_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(self.CONF), exist_ok=True)
+        with open(self.CONF, "w") as f:
+            f.write("fps_only\nalpha=0.0\nbackground_alpha=0.0\ngpu_stats=0\nlog_interval=0\n"
+                    f"output_folder={mh_dir}\nlog_duration={self.LOG_S}\n"
+                    "toggle_logging=Control_R+Shift_R+Scroll_Lock\n")
+        self.ensure_steam(log)
+        subprocess.Popen(["steam", "-applaunch", str(self.APPID)], env=gs.env(), start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(240):
+            w = self.window()
+            if w:
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("Wukong window did not open")
+        pid = w["pid"]
+        log("engine_start", pid=pid)
+        self.rec.mark("bench: engine start")
+        time.sleep(25)                       # logo, "Press Any Button"
+        gs.activate(pid)
+        self.inp.key("e", hold=0.1)
+        time.sleep(4)
+        self.inp.click(*self.MENU_BENCHMARK)
+        time.sleep(2)
+        self.inp.click(*self.CONFIRM)
+        t0 = mono()
+        log("benchmark_confirmed")
+        gs.shot(os.path.join(self.d, "confirmed.png"))
+        time.sleep(self.START_S)
+        log("engine", pid=pid)
+        gs.activate(pid)
+        self.rec.mark("bench: mangohud start")
+        self.inp.key(HOTKEY, hold=0.1)
+        log("mangohud_start")
+        time.sleep(max(self.LOG_S, self.RUN_S - self.START_S) + 5)
+        gs.shot(os.path.join(self.d, "results.png"))
+        log("engine_exit", s=round(mono() - t0, 1))
+        self.rec.mark("bench: engine exit")
+        # By pid (a pkill -f pattern also hit watchdog.sh, whose --on-kill names it).
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        for _ in range(60):
+            if not self.window():
+                break
+            time.sleep(1)
+
+
+GAMES = {"superposition": SuperpositionBench, "wukong": WukongBench}
 
 
 def cmd_run(a):
@@ -442,7 +549,11 @@ def analyze(d):
         b = (r.get("buf") or "").strip()
         if b.startswith("bench:"):
             marks[b] = int(r["ts"])
-    t0 = align_frames(trace, el, marks.get("bench: engine start"), SuperpositionBench.WARMUP_S, res)
+    if "bench: mangohud start" in marks:      # logging started by the hotkey at this mark
+        t0 = marks["bench: mangohud start"]
+        res["alignment"] = "hotkey mark"
+    else:
+        t0 = align_frames(trace, el, marks.get("bench: engine start"), SuperpositionBench.WARMUP_S, res)
     pid = next((e["pid"] for e in reversed(events) if e["kind"] in ("engine", "engine_start")), None)
     drv = tp_query(trace, SQL_EVENTS)[0]
     states, main = tp_query(trace, sql_game_states(pid))[:2] if pid else ([], [])
