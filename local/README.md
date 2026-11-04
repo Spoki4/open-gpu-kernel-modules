@@ -154,3 +154,15 @@ uses CCD0 (3D V-Cache, CPUs 0-7,16-23) and 24 GB; the host is limited to CCD1
 while it runs (`NVVM_ISOLATE=0` to skip, `NVVM_MEM=16G` for less memory).
 Timings differ a little from bare metal (IOMMU, nested paging): confirm final
 numbers without the VM.
+
+### Windows reference guest
+
+The same GPU under Windows, for comparisons (never together with the Linux guest):
+
+```bash
+local/vm/vm.sh stop && local/vm/vm.sh win start && local/vm/vm.sh win wait
+python3 local/bench/winbench.py run superposition --label win-clean
+python3 local/bench/winbench.py run wukong --label win-wk-clean
+local/vm/vm.sh win stop && local/vm/vm.sh start
+```
+`local/vm/vm.sh win input on` hands keyboard and mouse to Windows (both Ctrl switch back).

@@ -9,16 +9,20 @@ and keys, as a USB tablet/keyboard).
                                        the driver installer into C:\\nvwin\\dl
   ./winbench.py run superposition --label win-clean
   ./winbench.py run wukong --label win-wk-clean
-  ./winbench.py metrics DIR            print metrics of a run (PresentMon CSV)
+  ./winbench.py metrics DIR GAME       print metrics of a run (PresentMon CSV)
 
 Superposition: the engine binary with the exact arguments the Linux launcher
 gives it (bench.py's 8K Optimized performance run, OpenGL, captured from
 /proc/PID/cmdline on 2026-11-04), so no launcher clicks. Wukong: Steam
 -applaunch and the same clicks as bench.py at 3840x2160 (the settings file
 is copied from the Linux Proton prefix, so the graphics settings match).
-Frames: PresentMon's time between presents for the same stretch bench.py
-logs with MangoHud (WARMUP_S/START_S after start, LOG_S long); metrics are
-bench.py's own frame_metrics() and stutters(). Logs: local/bench-logs/<label>-<date>/.
+Frames: PresentMon's time between presents from the start; the stretch kept
+is the one bench.py logs with MangoHud, placed by the end of loading (Windows
+loads slower: a fixed delay caught the end of the loading screen): LOAD_OFFSET
+after the last long frame of the loading, LOG_S long. LOAD_OFFSET is measured
+on Linux (Superposition: GPU busy reaches 100% 8.7 s after the engine starts,
+MangoHud logs from 12 s). Metrics are bench.py's own frame_metrics() and
+stutters(). Logs: local/bench-logs/<label>-<date>/.
 """
 
 import argparse
@@ -44,6 +48,10 @@ SP_ARGS = ("-preset 6 -video_app opengl -video_vsync 0 -video_mode -1 "
            "-project_name Superposition -video_fullscreen 1 -video_width 3840 -video_height 2160 "
            "-virtual_width 7680 -virtual_height 4320 -extern_plugin GPUMonitor -mode 0 -sound 1 -tooltips 1")
 SCREEN = (3840, 2160)
+# Seconds from the end of loading to bench.py's logged stretch, per game (see
+# above). Wukong's loading screen has no long frames: its stretch is placed
+# like bench.py's, START_S after Confirm (where PresentMon starts), so None.
+LOAD_OFFSET = {"superposition": 3.3, "wukong": None}
 
 
 def win(ps, check=True):
@@ -97,8 +105,8 @@ def run_superposition(d, log):
     win(f"Start-Process -WorkingDirectory '{SP_DIR}\\bin' '{SP_DIR}\\bin\\superposition.exe' -ArgumentList '{SP_ARGS}'")
     t0 = time.time()
     log("engine_start")
-    presentmon("superposition.exe", g.WARMUP_S, g.LOG_S, out)
-    time.sleep(g.WARMUP_S + g.LOG_S + 5)
+    presentmon("superposition.exe", 0, g.WARMUP_S + g.LOG_S + 30, out)
+    time.sleep(g.WARMUP_S + g.LOG_S + 35)
     while "running" in win("if (Get-Process PresentMon* -ErrorAction SilentlyContinue) { 'running' }", check=False):
         time.sleep(2)
     log("logged", s=round(time.time() - t0, 1))
@@ -127,7 +135,7 @@ def run_wukong(d, log):
     click(*g.CONFIRM)
     t0 = time.time()
     log("benchmark_confirmed")
-    presentmon("b1-Win64-Shipping.exe", g.START_S, g.LOG_S, out)
+    presentmon("b1-Win64-Shipping.exe", 0, g.START_S + g.LOG_S + 20, out)
     time.sleep(max(g.LOG_S + g.START_S, g.RUN_S) + 5)
     log("engine_exit", s=round(time.time() - t0, 1))
     win("Stop-Process -Name b1-Win64-Shipping -Force -ErrorAction SilentlyContinue", check=False)
@@ -141,10 +149,36 @@ def frame_times(path):
     return [float(r[col]) for r in rows if r.get(col) not in (None, "", "NA")]
 
 
-def metrics(d):
-    ft = frame_times(os.path.join(d, "presentmon.csv"))
+def logged_stretch(ft, offset, seconds, long_ms=250.0, search_s=60.0):
+    """The frames of the stretch bench.py logs: from `offset` s after the end
+    of the last frame longer than long_ms in the first search_s (the loading
+    screen), `seconds` long. Returns (frames, start_s)."""
+    t, load_end = 0.0, 0.0
+    for x in ft:
+        t += x / 1000
+        if t > search_s:
+            break
+        if x > long_ms:
+            load_end = t
+    start = load_end + offset
+    out, t = [], 0.0
+    for x in ft:
+        t += x / 1000
+        if t > start and t <= start + seconds:
+            out.append(x)
+    return out, round(start, 2), round(load_end, 2)
+
+
+def metrics(d, game):
+    allft = frame_times(os.path.join(d, "presentmon.csv"))
+    g = bench.SuperpositionBench if game == "superposition" else bench.WukongBench
+    if LOAD_OFFSET[game] is None:
+        ft, start, load_end = logged_stretch(allft, g.START_S, g.LOG_S, search_s=0)
+    else:
+        ft, start, load_end = logged_stretch(allft, LOAD_OFFSET[game], g.LOG_S)
     m = bench.frame_metrics(ft)
     m["stutters"] = len(bench.stutters(ft))
+    m["load_end_s"], m["window_start_s"] = load_end, start
     with open(os.path.join(d, "metrics.json"), "w") as f:
         json.dump(m, f, indent=1)
     return m
@@ -159,6 +193,7 @@ def main():
     r.add_argument("--label", required=True)
     m = sub.add_parser("metrics")
     m.add_argument("dir")
+    m.add_argument("game", choices=["superposition", "wukong"])
     a = ap.parse_args()
 
     if a.cmd == "setup":
@@ -169,7 +204,7 @@ def main():
                 print("copied", f)
         return
     if a.cmd == "metrics":
-        print(json.dumps(metrics(a.dir), indent=1))
+        print(json.dumps(metrics(a.dir, a.game), indent=1))
         return
 
     d = os.path.join(LOCAL, "bench-logs", f"{a.label}-{datetime.datetime.now():%Y%m%d_%H%M%S}")
@@ -183,7 +218,7 @@ def main():
     log("start", game=a.game, driver=win("(Get-CimInstance Win32_VideoController | "
                                          "Where-Object Name -like '*NVIDIA*').DriverVersion", check=False).strip())
     (run_superposition if a.game == "superposition" else run_wukong)(d, log)
-    m = metrics(d)
+    m = metrics(d, a.game)
     log("metrics", **m)
     print(f"{a.label}: avg {m['avg_fps']} fps, 1% low {m['low1_fps']}, 0.1% low {m['low01_fps']}, "
           f"P99 {m['p99_ms']} ms, stutters {m['stutters']}  ({d})")

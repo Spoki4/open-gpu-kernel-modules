@@ -1240,3 +1240,42 @@ launcher 1 evict / 1 restore (was 6 / 5), the game was never moved out at
 a switch back (was 241 MB). The second switch back still has one 285 ms
 flip gap with no driver activity in that phase; the reserve build had
 291.7 ms there too (death-20261104_135315): the scenario, not the policy.
+
+## Windows reference on the same GPU (2026-11-04 evening, vm.sh win)
+
+`local/vm/win.sh` (through `vm.sh win ...`, same sudoers rule): Windows 11
+Pro 26300 on the same 3080 Ti, 16 vCPUs on CCD0, 24 GB; never at the same
+time as the Linux guest. Disk /var/lib/nvidia-vm/win/disk.img (sparse, 200
+GB), local user `bench` with autologon, password and ssh key in
+~/.local/share/nvwin (installers cached in dl/). Installed: NVIDIA 617.42
+(no 615 on Windows), Superposition 1.1, Steam (the user's account,
+invisible), Wukong Benchmark Tool + DirectX June 2010 and VC++ 2022 redist
+(the tool refused to start without the DirectX runtime). The firewall prompt
+of b1 was cancelled. Pitfalls: Setup reads autounattend.xml only from
+removable media (usb-storage removable=on); `win run` = the job runner in
+the desktop session (ssh is a service session); Windows ignores the ACPI
+power button: stop shuts down from inside; the emulated VGA exists only
+during `create` (screendump), afterwards the monitor is the only screen.
+
+`local/bench/winbench.py run superposition|wukong --label L`: Superposition's
+engine with the exact Linux arguments (OpenGL, 8K Optimized, 4K output);
+Wukong with the Linux settings files copied in, the same clicks. Frames:
+PresentMon (time between presents), the same metric functions as bench.py;
+the stretch is placed like bench.py's (Superposition: 3.3 s after the
+loading ends, measured on Linux by GPU busy; Wukong: 20 s after Confirm).
+Monitor at 120 Hz there (144 on Linux): no effect at ~50-60 fps, vsync off.
+
+| clean run | Linux (patched, no reserve) | Windows 617.42 |
+|---|---|---|
+| Superposition (OpenGL) avg fps | 52.35 | 51.41 / 51.39 |
+| Superposition 1% low / P99 | 33.8 / 27.8 ms | 43.3 / 22.5 ms |
+| Wukong (DX12; Linux: Proton/vkd3d) avg fps | 52.7 | 61.08 / 60.83 |
+| Wukong 1% low / P99 | 41.0 / 22.5 ms | 42.9-48.0 / 19.5 ms |
+
+Superposition: the same median frame (19.3 vs 19.4 ms); Linux has a tail
+(2% of frames > 25 ms vs 0.06%), hence the lower 1% low: not looked into
+yet (MangoHud vs PresentMon measure differently; or GL frame pacing).
+Wukong: Windows ~16% faster, the vkd3d-proton translation cost, not the
+driver patch (the patched clean run equals the stock one, 52.1 vs 52.3).
+Not done: the apps + pressure scenario on Windows (how WDDM's own paging
+copes with the same 1.5 GB deficit).

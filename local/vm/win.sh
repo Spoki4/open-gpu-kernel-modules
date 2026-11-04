@@ -57,7 +57,7 @@ qmp() {
     printf '{"execute":"qmp_capabilities"}\n%s\n' "$1" \
         | socat -t2 - "UNIX-CONNECT:$RUN/win-qmp.sock" | tail -n +3
 }
-SSH=(ssh -p "$SSH_PORT" -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5
+SSH=(ssh -p "$SSH_PORT" -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o LogLevel=ERROR
      -o UserKnownHostsFile="$UDIR/known_hosts" -o StrictHostKeyChecking=accept-new "$WIN_USER@127.0.0.1")
 
 bind_vfio() {
@@ -171,6 +171,8 @@ EOF
 stop() {
     as_root stop
     running || { echo "not running"; return; }
+    # Windows ignores the ACPI button here (seen twice): shut down from inside first.
+    timeout 20 "${SSH[@]}" 'shutdown /s /t 0' </dev/null 2>/dev/null || true
     qmp '{"execute":"system_powerdown"}' >/dev/null
     local i
     for i in $(seq 180); do running || { echo "stopped"; return; }; sleep 1; done
@@ -218,7 +220,7 @@ wait_ready() {
 run() {
     local id="j$$_${RANDOM}" body
     body=$(printf '$ErrorActionPreference = "Stop"\n$ProgressPreference = "SilentlyContinue"\n%s\n' "$*")
-    "${SSH[@]}" "Set-Content -Encoding UTF8 C:\\nvwin\\jobs\\$id.tmp -Value \$input; Rename-Item C:\\nvwin\\jobs\\$id.tmp $id.ps1" <<<"$body"
+    "${SSH[@]}" "\$input | Set-Content -Encoding UTF8 C:\\nvwin\\jobs\\$id.tmp; Rename-Item C:\\nvwin\\jobs\\$id.tmp $id.ps1" <<<"$body"
     local rc
     while :; do
         rc=$("${SSH[@]}" "if (Test-Path C:\\nvwin\\jobs\\$id.rc) { Get-Content C:\\nvwin\\jobs\\$id.rc }" </dev/null 2>/dev/null | tr -d '\r' || true)
@@ -244,8 +246,8 @@ status)
 wait) wait_ready ;;
 ssh) exec "${SSH[@]/BatchMode=yes/BatchMode=no}" "$@" ;;
 run) run "$@" ;;
-put) scp -P "$SSH_PORT" -i "$KEY" -o IdentitiesOnly=yes -o UserKnownHostsFile="$UDIR/known_hosts" "$1" "$WIN_USER@127.0.0.1:$2" ;;
-get) scp -P "$SSH_PORT" -i "$KEY" -o IdentitiesOnly=yes -o UserKnownHostsFile="$UDIR/known_hosts" "$WIN_USER@127.0.0.1:$1" "$2" ;;
+put) scp -q -o LogLevel=ERROR -P "$SSH_PORT" -i "$KEY" -o IdentitiesOnly=yes -o UserKnownHostsFile="$UDIR/known_hosts" "$1" "$WIN_USER@127.0.0.1:$2" ;;
+get) scp -q -o LogLevel=ERROR -P "$SSH_PORT" -i "$KEY" -o IdentitiesOnly=yes -o UserKnownHostsFile="$UDIR/known_hosts" "$WIN_USER@127.0.0.1:$1" "$2" ;;
 input) input "$@" ;;
 qmp) as_root qmp "$@"; qmp "$1" ;;
 # A frame of the emulated VGA (install only): screen FILE.png
