@@ -4,6 +4,85 @@ Context for a new Claude Code session that continues this work from another
 machine (MacBook) over SSH. Written 2026-11-01 at the end of the first session.
 The user writes in Russian; answer in Russian.
 
+## Test VM — the current way to test (CachyOS host, set up 2026-11-04)
+
+Read this first. The PC now boots CachyOS (kernel 7.3.1-1-cachyos, stock
+`linux-cachyos-nvidia-open` + `nvidia-utils` 615.78.08, Limine with Secure
+Boot via sbctl). Ubuntu is still in the Limine menu; the sections further down
+were written there (`install.sh`, `nvtest-root.sh`, `build.sh` tools and the
+MOK signing are Ubuntu-specific: dpkg, `/usr/lib/x86_64-linux-gnu`). On
+CachyOS, driver builds are tested in a QEMU guest that owns the RTX 3080 Ti
+(VFIO), so a hang or panic costs a ~11 s guest reset instead of a host reboot.
+User docs: "Test VM" in `local/README.md`; scripts in `local/vm/`, each with
+a usage header.
+
+Layout:
+- Host in "vm mode" (`local/vm/mode.sh status`): the host never loads nvidia,
+  `vfio-pci` owns 01:00.0/01:00.1, the host desktop runs on the AMD iGPU (one
+  monitor on the motherboard, HDMI-A-2). The other monitor stays on the 3080 Ti
+  (DP) and shows the guest's own Plasma. Switching modes (`mode.sh vm|host`)
+  needs sudo and a reboot: the user does both.
+- Guest: CachyOS image `/var/lib/nvidia-vm/guest.img` (built by `mkimage.sh`
+  via pacstrap), hostname `nvvm`, user `spoki4` (uid 1000, no password,
+  NOPASSWD sudo), Plasma Wayland with SDDM autologin, Steam, Chromium (not
+  google-chrome: `nvt-session.sh` calls `google-chrome`, untested in the guest).
+  Kernel, headers, `linux-cachyos-nvidia-open` and `nvidia-utils` are pinned
+  (`IgnorePkg`) at 7.3.1-1 / 615.78.08; update them together on purpose only.
+- The repo is shared into the guest at the same path (virtiofs), so edit on the
+  host and build in the guest. QEMU runs as root in `nvvm.service` (transient,
+  `nvvm.slice`), virtiofsd in `nvvm-virtiofsd.service`.
+- Guest gets CCD0 (CPUs 0-7,16-23, the V-Cache CCD) and 24 GB (pinned by
+  VFIO); while it runs the host is limited to CCD1 (`AllowedCPUs` on
+  user/system slice, restored on stop). The user's other VM `vsos-winbuild`
+  uses 16 GB and port 2222, hence guest ssh on 127.0.0.1:2230.
+
+How an agent drives it (no password needed: `/etc/sudoers.d/nvidia-local-vm`
+lets spoki4 run `local/vm/vm.sh` as root with SETENV; the script re-runs itself
+with `sudo -n` for root subcommands):
+```bash
+local/vm/vm.sh status                # running?, 3080 Ti driver, guest's driver
+local/vm/vm.sh start && local/vm/vm.sh wait
+local/vm/vm.sh build                 # make modules in the guest, for the guest kernel
+local/vm/vm.sh reload [tree|installed|stock]   # ~4 s; SDDM restarts and autologs in
+local/vm/vm.sh install [stock]       # what the guest boots (updates/nvidia-local + depmod override)
+local/vm/vm.sh ssh 'CMD'             # anything in the guest; `sudo` works without a password
+local/vm/vm.sh log                   # serial log, /var/lib/nvidia-vm/serial.log (oopses survive a hang)
+local/vm/vm.sh reset                 # hung guest: back in ~11 s, the GPU resets fine
+local/vm/vm.sh console               # root shell on the guest's serial port
+local/vm/vm.sh qmp '{"execute":...}' # raw QMP; gdbstub on 127.0.0.1:1234
+local/vm/vm.sh stop
+```
+`guest.sh` refuses a tree build whose version differs from the guest's
+`nvidia-utils` or whose vermagic is not the guest kernel. Everything else that
+needs root (`setup.sh`, `mkimage.sh`, `mode.sh`) the user runs in a terminal
+(Claude: open a Terminal panel tab with the command, the user types the
+password there).
+
+Rules and pitfalls:
+- Never run `vm.sh input on` on your own: it takes the user's real keyboard and
+  mouse away from the host (both Ctrl switch back). The user does it.
+  To test the input path without hands: a uinput keyboard (python-evdev is
+  installed, `/dev/uinput` has an ACL for spoki4) attached via `vm.sh qmp`
+  `object-add input-linux` worked on 2026-11-04.
+- Keyboard: keys come on the NKRO interface (`by-id/...Gaming_Keyboard-event-if01`)
+  as well as the boot one (`-event-kbd`); vm.sh grabs both. Mouse:
+  `wheel-debounce.service` grabs the G703's node and re-emits it as
+  "Logitech G703 LS (debounced)" (no by-id link); vm.sh finds it by name.
+- pacstrap runs the host's `/etc/pacman.d/hooks`, where limine's initcpio hook
+  shadows the guest's mkinitcpio hook; `mkimage.sh` creates the presets itself.
+- QEMU here has no `virtio-vga` module; `start --no-gpu` boots without a display
+  (enough to test ssh, virtiofs, builds while the host still owns the GPU).
+- Timings (fps, eviction throughput) differ a little from bare metal (IOMMU,
+  nested paging): confirm final numbers outside the VM.
+- Verified 2026-11-04: PCIe 4.0 x16 and the full 16 GB BAR1 in the guest,
+  `reload stock` 4 s, `reset` 11 s, Plasma back each time, input switching.
+
+Blocker as of 2026-11-04: branch `local/vidmem-615` is based on 615.71.09.
+It does not build against kernel 7.3 (`kernel-open/nvidia/os-interface.c:3152`,
+dmem cgroup API changed) and would not match 615.78.08 userspace anyway. Its 8
+commits need rebasing onto tag `615.78.08` (present locally); the user has not
+decided yet, so ask before doing it.
+
 ## Where things are (set up 2026-11-01)
 
 - PC: repo at `~/projects/open-gpu-kernel-modules` (branch
