@@ -1149,3 +1149,17 @@ frame/trace alignment is coarse (engine start + autostart delay).
 Next: the minimized launcher ping-pong (one 42 ms stutter in the second
 apps-evict run), lock holds of whole eviction batches, Wukong / The Alters
 (DX12 via Proton) in bench.py, final numbers on bare metal.
+
+Wukong (bench.py run wukong, 68b6dace; DX12 via Proton, 4K Very High, DLSS
+50, ~5.6 GB), same conditions (Chromium + background apps 1.5 GB short):
+
+| run | fps | 1% low | notes |
+|---|---|---|---|
+| wk-clean | 52.4 | 41.2 | |
+| wk-apps-evict | 50.45 | 38.0 | -3.7%; 3.2 GB moved out by the foreground headroom while it loaded |
+| wk-apps-noevict | 28.8 | 14.2 | 273 reserve denials |
+| wk-stock-apps | 1.7 | 0.8 | stock driver: hung at the loading screen, ctxBufPoolReserve NO_MEMORY (the 2026-10-31 freeze signature) |
+
+The stutter at ~67 s of the logged stretch is in the scene (clean too).
+Wukong's first start (shader compilation, language, brightness, a data
+collection prompt: declined) was done once by hand.
