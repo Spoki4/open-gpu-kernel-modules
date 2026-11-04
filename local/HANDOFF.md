@@ -59,6 +59,13 @@ needs root (`setup.sh`, `mkimage.sh`, `mode.sh`) the user runs in a terminal
 password there).
 
 Rules and pitfalls:
+- Long runs only under `local/watchdog.sh` (user's rule, 2026-11-04, after a
+  bench sat hung for 30 min while the agent waited for "done"): in the guest
+  `./watchdog.sh --stall 420 --watch stress-logs --ignore dmon.log --on-kill
+  "./nvt-session.sh stop" -- ./nvtest.sh ...` (or `bench-all.sh`, which does
+  that), and on the host around `vm.sh ssh` too (a hung guest goes silent).
+  Monitors must report "no progress" and every failure, not only the end.
+  dmon.log keeps growing while a test hangs: it does not count as progress.
 - Never run `vm.sh input on` on your own: it takes the user's real keyboard and
   mouse away from the host (both Ctrl switch back). The user does it.
   To test the input path without hands: a uinput keyboard (python-evdev is
@@ -77,11 +84,25 @@ Rules and pitfalls:
 - Verified 2026-11-04: PCIe 4.0 x16 and the full 16 GB BAR1 in the guest,
   `reload stock` 4 s, `reset` 11 s, Plasma back each time, input switching.
 
-Blocker as of 2026-11-04: branch `local/vidmem-615` is based on 615.71.09.
-It does not build against kernel 7.3 (`kernel-open/nvidia/os-interface.c:3152`,
-dmem cgroup API changed) and would not match 615.78.08 userspace anyway. Its 8
-commits need rebasing onto tag `615.78.08` (present locally); the user has not
-decided yet, so ask before doing it.
+Rebased 2026-11-04 (user's go-ahead): `local/vidmem-615` now sits on tag
+`615.78.08`, no conflicts (upstream touched os-interface.c, osapi.c, regmap.c,
+mem.c only cosmetically; its os-interface.c also fixes the dmem cgroup build on
+7.3). The pre-rebase branch is kept as `local/vidmem-615.71.09-backup`; the
+rebase is not pushed (origin still has the 615.71.09 one, needs a force push).
+Building for CachyOS: the kernel is clang + ThinLTO, so kernel-open needs
+`LD=ld.lld` (kernel-open/Makefile passes LD=ld otherwise; `vm.sh build` does
+it). The host runs the same kernel and gcc as the guest, so a tree built on the
+host (`make modules SYSSRC=/lib/modules/$(uname -r)/build LD=ld.lld
+IGNORE_CC_MISMATCH=1`) loads in the guest too. The guest needs `vm.sh install`
+once (writes the reserve modprobe conf; without it the reserve is 0).
+Bench in the guest: `NVTEST_FORCE=1 ./nvtest.sh all` via `vm.sh ssh` (the guest
+is always logged in, hence FORCE; nvt-session.sh gives its test KWin a private
+DBus then, chromium is used when google-chrome is missing).
+
+Tracing (2026-11-04): tracepoints `nvidia_vidmem:*` + `local/trace/nvtrace.py`
+(record / report / live / mark), see "Tracing" in README.md. Use it to explain
+any stutter before changing the policy: the report lines up frame gaps (page
+flips) with moves, pauses, make-room waits, policy steps and RM lock waits.
 
 ## Where things are (set up 2026-11-01)
 

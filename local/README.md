@@ -51,6 +51,37 @@ sudo ./local/census.sh chrome --summary  # Chrome's GPU process, totals only
 sudo ./local/census.sh 1234              # any PID, full list
 ```
 
+## Tracing: why does it stutter?
+
+The driver emits tracepoints (system `nvidia_vidmem`, free while off;
+`kernel-open/nvidia/nv-vidmem-trace.h`):
+
+| event | what | who waited |
+|---|---|---|
+| `vidmem_move` | one evict/restore batch: why, MB, phases (quiesce, sysmem alloc, copy, remap, pma) | the process moved, and whoever waits for the RM locks |
+| `vidmem_pause` | a process's channels were off: its GPU work stood still for `paused_us` | that process |
+| `vidmem_makeroom` | an allocation of a visible process moved others out first | the allocating thread (`us`) |
+| `vidmem_reserve` | the reserve turned an allocation away: denied, room made, or created in sysmem | the allocating process |
+| `vidmem_tick` | one policy step (API + GPU lock held throughout), time queued for the lock | every RM call meanwhile |
+| `vidmem_proc` | per process at each step: vram, sysmem, eligible, window state, idle | - |
+| `vidmem_hint` | a window state change from the KWin script | - |
+| `rm_lock` | an RM API/GPU lock wait or hold over `trace-lock` us (default 1000), where it was taken (symbol), who held it | the waiting thread |
+
+`local/trace/nvtrace.py` records them together with Xids (`nvidia:nvidia_dev_xid`),
+the compositor's page flips (`drm:drm_vblank_event_delivered`: a gap in
+continuous motion = a dropped frame), the kernel log, and samples of VRAM
+(`vidmem_pma`), GPU load, PCIe traffic and per-process SM load (NVML), all on
+CLOCK_MONOTONIC. The report lists the longest frame gaps with the driver
+events that overlapped them, and writes a timeline for ui.perfetto.dev.
+
+```bash
+sudo ./local/trace/nvtrace.py record -d 60             # or: record -- ./local/nvt-game ... (runs as you)
+sudo ./local/trace/nvtrace.py mark "stutter"           # while recording: a marker (bind to a hotkey)
+./local/trace/nvtrace.py report local/trace-logs/<dir> # summary.txt + trace.json (open in ui.perfetto.dev)
+sudo ./local/trace/nvtrace.py live                     # the events one line each, as they happen
+sudo ./local/evict.sh trace-lock 500                   # lock waits/holds traced from 500 us
+```
+
 ## Usage
 
 ```bash
@@ -64,6 +95,8 @@ sudo ./local/install.sh install          # sign + install into updates/nvidia-lo
 ./local/stress.sh scanout                # can the compositor still get contiguous scanout buffers?
 ./local/stress.sh game                   # start before a game: logs its vidmem/sysmem and vidmem_pma
 ./local/compr-test --mode hold           # a compressed image with a known pattern, verified via the GPU
+NVTEST_FORCE=1 ./local/bench-all.sh      # whole bench under watchdog.sh (killed if no progress for 8 min)
+./local/watchdog.sh --stall 300 -- CMD   # any long run: WATCHDOG STALL/TIMEOUT instead of waiting forever
 sudo ./local/safety.sh install           # watchdog + panic on lockups (before risky driver work)
 sudo ./local/rollback.sh                 # back to stock modules, then reboot
 ```
