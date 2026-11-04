@@ -1363,7 +1363,16 @@ _vidmemRestoreBegin(OBJGPU *pGpu, MEMORY_DESCRIPTOR *pMemDesc, VIDMEM_EVICT_MAPR
     if (pPages == NULL)
         return NV_ERR_NO_MEMORY;
 
-    allocOptions.flags     = PMA_ALLOCATE_FORCE_ALIGNMENT;
+    //
+    // Pinned, as every RM allocation (video_mem.c). Without it PMA marks the
+    // restored frames unpinned, i.e. evictable UVM memory: the next allocation
+    // that needs them calls the UVM eviction callback, which is NULL when
+    // nvidia-uvm has no GPU registered (2026-11-04, scenario.py --bg-fill:
+    // NULL pointer call in _pmaEvictContiguous from the game's vidmemConstruct,
+    // then soft lockups on every CPU).
+    //
+    allocOptions.flags     = PMA_ALLOCATE_FORCE_ALIGNMENT | PMA_ALLOCATE_PINNED |
+                             (pPmaInfo->flags & PMA_ALLOCATE_PERSISTENT);
     allocOptions.alignment = pPmaInfo->pageSize;
     if (pPmaInfo->bContig)
     {
@@ -1399,7 +1408,8 @@ _vidmemRestoreBegin(OBJGPU *pGpu, MEMORY_DESCRIPTOR *pMemDesc, VIDMEM_EVICT_MAPR
     }
 
     pPmaInfo->flags = allocOptions.flags & (PMA_ALLOCATE_FORCE_ALIGNMENT | PMA_ALLOCATE_CONTIGUOUS |
-                                            PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE);
+                                            PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE | PMA_ALLOCATE_PINNED |
+                                            PMA_ALLOCATE_PERSISTENT);
     if (pPmaInfo->bContig)
     {
         // Same layout as the vidmem alloc path: memdescDescribe(pageArray[0]).
