@@ -82,6 +82,16 @@ sudo ./local/trace/nvtrace.py live                     # the events one line eac
 sudo ./local/evict.sh trace-lock 500                   # lock waits/holds traced from 500 us
 ```
 
+## Real-life scenarios (test VM guest)
+
+`local/scenario/scenario.py run death`: a game in the foreground, Alt+Tab to
+Chromium, browse, back, N cycles, with background apps sized so the game is
+short of VRAM (`--bg-fill MB`); report per phase: frames on screen, worst
+frame and time to steady after each switch, the game's own frame times
+(MangoHud), what the driver moved. `gs.py` drives the desktop (windows,
+uinput mouse and keyboard, screenshots). Needs the KWin hints script in the
+session. See HANDOFF.md "Real-life scenarios".
+
 ## Usage
 
 ```bash

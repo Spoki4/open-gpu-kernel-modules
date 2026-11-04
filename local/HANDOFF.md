@@ -1071,3 +1071,50 @@ netconsole (to be set up) streaming kernel logs to it, use tmux on the PC.
   ~1 min after plasmashell appears before measuring.
 - Keep Chrome hardware acceleration on (user needs WebGPU). Discord's HW
   acceleration was disabled (backup `~/.config/discord/settings.json.bak-before-hwaccel`).
+
+## Real-life scenarios in the VM guest (2026-11-04, local/scenario/)
+
+User's goal: test like real life (play, die, Alt+Tab to Chrome, browse, back)
+and with real game benchmarks. In the guest: Steam logged in by the user,
+installed Black Myth: Wukong Benchmark Tool (3132990) and The Alters
+Benchmark Tool (3787490) (MH Wilds benchmark 3424520: "No licenses"),
+Unigine Superposition in ~/bench/superposition, mangohud, python-evdev,
+spectacle, ydotool (unused: its absolute moves do not work under KWin).
+
+```bash
+local/vm/vm.sh ssh 'cd ~/projects/open-gpu-kernel-modules/local && ./watchdog.sh --stall 180 \
+  --on-kill "python3 scenario/scenario.py stop" -- python3 scenario/scenario.py run death \
+  --cycles 2 --play 30 --browse 20 --bg-fill 1500'
+```
+
+Pitfalls found the hard way:
+- The KWin hints script must be installed in the guest session
+  (kwin-vram-hints/install.sh + `sudo systemctl restart sddm`); without it the
+  policy is off and a game is just denied memory. scenario.py checks it.
+- Superposition free edition: only the performance run and "game" mode; its
+  fullscreen is an unmanaged X11 window (always on top, grabs the keyboard,
+  Alt+Tab cannot leave it; F2 = wireframe). Run as borderless 4K window.
+- MangoHud writes a log only when logging stops (log_duration or the hotkey,
+  here Ctrl_R+Shift_R+Scroll_Lock); its NVML thread takes the RM API lock
+  (kwin waited 41 ms for it): gpu_stats=0.
+- `pgrep -f`/`pkill -f` patterns match the command line that contains them
+  (killed my own ssh twice, found the watchdog instead of the game): use
+  `scenario.py stop` / `pgrep -x`.
+- A pressure run is valid only with evictions in the report ("INVALID"
+  otherwise); a windowless background process with >= 1 GB counts as a game
+  (VIDMEM_EVICT_GAME_BYTES) and is never moved out, so --bg-fill uses apps of
+  <= 900 MB, idle (memory check every 30 s, idle_s must reach 10).
+
+Bug found and fixed (4b2a1bc2): restored PMA pages were unpinned -> the next
+allocation over them called the NULL UVM eviction callback, guest oops.
+
+Policy findings of the first valid run (scenario-logs/death-20261104_140517),
+not fixed yet:
+1. A minimized launcher "drawing again" ping-pongs (6 evictions, 5
+   restores) and its restore takes room from the game while the game is
+   hidden: 241 MB of the game moved out at the switch back, 215 ms frame,
+   one failed restore of the game.
+2. Windowless >= 1 GB processes are never evicted (an LLM server would starve
+   a game: the game ran at 0.8-8 fps next to 5.8 GB of idle memory).
+3. RM lock waits up to 192 ms during evictions (policy step holds the API and
+   GPU locks for the whole batch).
