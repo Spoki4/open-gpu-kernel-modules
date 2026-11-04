@@ -251,7 +251,14 @@ log) tail -n 100 -F "$STATE/serial.log" ;;
 qmp) as_root qmp "$@"; qmp "$1" ;;
 ssh) ssh_guest -t "$@" ;;
 wait) wait_ssh ;;
-build) ssh_guest "cd '$REPO' && nice make modules -j\$(nproc) SYSSRC=/lib/modules/\$(uname -r)/build" ;;
+# CachyOS kernels are built with clang + ThinLTO: kernel-open's objects are
+# LLVM bitcode and need ld.lld (kernel-open/Makefile passes LD=ld to kbuild
+# unless LD is given). kernel-open picks clang from the kernel config by
+# itself; nv-kernel.o stays gcc-built, as in the distribution packages. The
+# CC check only trips over the "LLD x.y" suffix in CONFIG_CC_VERSION_TEXT.
+build) ssh_guest "cd '$REPO' && K=/lib/modules/\$(uname -r)/build && \
+    if grep -q '^CONFIG_LD_IS_LLD=y' \$K/.config; then L='LD=ld.lld IGNORE_CC_MISMATCH=1'; else L=; fi && \
+    nice make modules -j\$(nproc) SYSSRC=\$K \$L" ;;
 reload) ssh_guest "sudo '$REPO/local/vm/guest.sh' reload ${1:-tree}" ;;
 install) ssh_guest "sudo '$REPO/local/vm/guest.sh' install ${1:-}" ;;
 _cleanup) as_root _cleanup; cleanup ;;

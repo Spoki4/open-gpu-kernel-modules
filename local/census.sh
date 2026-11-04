@@ -15,7 +15,7 @@ target=$1
 case $target in
     ''|*[!0-9]*)
         if [[ $target == chrome ]]; then
-            pid=$(pgrep -o -f -- '/opt/google/chrome/chrome --type=gpu-process' || true)
+            pid=$(pgrep -o -f -- '(/opt/google/chrome/chrome|/usr/lib/chromium/chromium) --type=gpu-process' || true)
         else
             pid=$(pgrep -o -x -- "$target" || true)
         fi

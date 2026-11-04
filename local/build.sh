@@ -10,7 +10,9 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 VK_HEADERS=${VK_HEADERS:-$HERE/.vulkan-headers}
 GLSLANG_DIR=${GLSLANG_DIR:-$HERE/.glslang}
 GLSLANG_VER=16.6.0
-LIBDIR=/usr/lib/x86_64-linux-gnu
+# Debian/Ubuntu multiarch dir, else /usr/lib (Arch, CachyOS: the test VM guest).
+LIBDIR=${LIBDIR:-/usr/lib/x86_64-linux-gnu}
+[[ -e $LIBDIR/libvulkan.so.1 ]] || LIBDIR=/usr/lib
 
 if [[ ${1:-} != tools ]]; then
     nice make -C "$HERE/.." modules -j"$(nproc)" SYSSRC="/lib/modules/$KVER/build"

@@ -283,8 +283,8 @@ wait_ram() {
     local pid=$1 t0=${2:-$(date +%s.%N)} r
     while :; do
         r=$(ram_of "$pid")
-        [[ ${r:-0} == 0 ]] && { echo "$(echo "$(date +%s.%N) - $t0" | bc)"; return 0; }
-        (( $(echo "$(date +%s.%N) - $t0 > 10" | bc) )) && { echo timeout; return 1; }
+        [[ ${r:-0} == 0 ]] && { awk -v a="$(date +%s.%N)" -v b="$t0" 'BEGIN { printf "%.3f\n", a - b }'; return 0; }
+        awk -v a="$(date +%s.%N)" -v b="$t0" 'BEGIN { exit !(a - b > 10) }' && { echo timeout; return 1; }
         sleep 0.05
     done
 }

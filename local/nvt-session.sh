@@ -28,6 +28,21 @@ export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}
 unset DISPLAY
 
+# With a desktop session logged in (the test VM guest logs in by itself) its
+# KWin owns org.kde.KWin on the session bus, and the "win" scripts would go to
+# it. The test compositor then gets a bus of its own.
+BUS_FILE=$LOG/bus
+if [[ -s $BUS_FILE ]] && kill -0 "$(sed -n 2p "$BUS_FILE")" 2>/dev/null; then
+    DBUS_SESSION_BUS_ADDRESS=$(sed -n 1p "$BUS_FILE")
+fi
+own_bus() {
+    qdbus6 org.kde.KWin >/dev/null 2>&1 || return 0
+    [[ $DBUS_SESSION_BUS_ADDRESS == "$(sed -n 1p "$BUS_FILE" 2>/dev/null)" ]] && return 0
+    mkdir -p "$LOG"
+    dbus-daemon --session --fork --print-address=1 --print-pid=1 >"$BUS_FILE"
+    DBUS_SESSION_BUS_ADDRESS=$(sed -n 1p "$BUS_FILE")
+}
+
 # AMD nodes (everything that is not the NVIDIA GPU at 01:00.0).
 hide_args() {
     local n
@@ -39,10 +54,13 @@ hide_args() {
 
 kwin_running() { pgrep -f -- "kwin_wayland --virtual --socket $SOCK" >/dev/null; }
 chrome_pids() { pgrep -f -- "--user-data-dir=$PROFILE" || true; }
+# google-chrome on the PC, chromium in the test VM guest.
+CHROME_BIN=${CHROME_BIN:-$(command -v google-chrome || command -v chromium || echo google-chrome)}
 
 start() {
     mkdir -p "$LOG"
     if ! kwin_running; then
+        own_bus
         # Own config dir (the user's kwinrc stays untouched) with the window
         # hints script enabled; QML may write the procfs file.
         local cfg=$LOG/kwin-config data=$LOG/kwin-data
@@ -63,7 +81,7 @@ start() {
             { echo "nvt-session: compositor did not start: $(tail -2 "$LOG/kwin.log")" >&2; exit 1; }
     fi
     [[ -z $(chrome_pids) ]] || { echo "nvt-session: test Chrome already running" >&2; exit 1; }
-    WAYLAND_DISPLAY=$SOCK google-chrome --ozone-platform=wayland --user-data-dir="$PROFILE" \
+    WAYLAND_DISPLAY=$SOCK "$CHROME_BIN" --ozone-platform=wayland --user-data-dir="$PROFILE" \
         --password-store=basic --no-first-run --no-default-browser-check --disable-background-networking \
         --remote-debugging-port=$PORT --new-window "$@" >"$LOG/chrome-$INST.log" 2>&1 &
     local i
@@ -145,6 +163,10 @@ stop() {
     for i in $(seq 1 50); do kwin_running || break; sleep 0.1; done
     kwin_running && pkill -9 -f -- "kwin_wayland --virtual --socket $SOCK" 2>/dev/null || true
     rm -f "$XDG_RUNTIME_DIR/$SOCK" "$XDG_RUNTIME_DIR/$SOCK.lock"
+    if [[ -s $BUS_FILE ]]; then
+        kill "$(sed -n 2p "$BUS_FILE")" 2>/dev/null || true
+        rm -f "$BUS_FILE"
+    fi
 }
 
 case ${1:-} in
