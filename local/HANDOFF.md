@@ -16,7 +16,13 @@ CachyOS, driver builds are tested in a QEMU guest that owns the RTX 3080 Ti
 User docs: "Test VM" in `local/README.md`; scripts in `local/vm/`, each with
 a usage header.
 
-Layout:
+Since 2026-11-04 night the host is back in host mode and runs the patched
+driver itself (build 805435d3 in updates/nvidia-local, no reserve, the KWin
+hints script installed for spoki4): the test VM needs `sudo local/vm/mode.sh vm`
+and a reboot again before it can have the card. `sudo local/vm/guest.sh
+install stock` on the host goes back to the stock modules.
+
+Layout (vm mode):
 - Host in "vm mode" (`local/vm/mode.sh status`): the host never loads nvidia,
   `vfio-pci` owns 01:00.0/01:00.1, the host desktop runs on the AMD iGPU (one
   monitor on the motherboard, HDMI-A-2). The other monitor stays on the 3080 Ti
