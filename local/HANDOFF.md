@@ -1217,3 +1217,26 @@ Ping-pong fix (the minimized launcher, death-20261104_140517):
 Status line (`evict.sh status`): "no reserve: largest contiguous free,
 background cushion, room made for the compositor N times (failed), MB
 moved, longest".
+
+Results without the reserve (build a32843c5+, same conditions as above:
+Chromium + background apps sized so the game is 1.5 GB short):
+
+| run | fps | 1% low | stutters | with the 768 MB reserve |
+|---|---|---|---|---|
+| nr-clean (Superposition) | 52.35 | 33.8 | 0 | 52.3 / 52.0 |
+| nr-apps-evict | 50.02 (-4.4%) | 34.5 | 0 | 49.9 |
+| wk-nr-clean (Wukong) | 52.7 | 41.0 | 1 (the scene, 67 s) | 52.4 |
+| wk-nr-apps-evict | 50.57 (-4.0%) | 37.2 | 2 (scene + 46 ms at 5.7 s, no driver activity) | 50.45 |
+
+stress.sh scanout without the reserve: 5/5 PASS, 6/6 4K scanout buffers
+for a "kwin_wayland" probe with vidmem filled to 2-50 MB free, also while a
+hog re-allocates at the limit with 4/8 threads. The bugs it found on the
+way: free bytes in 64 KB holes are no help to 2 MB pages; PMA region 0 is
+not 2 MB aligned (0x37c0000); gbm-hog's "sysmem fallback" heuristic
+mistook room being made for a fallback (off for --scanout now).
+
+Death scenario (death-20261104_185602, 2 cycles, alt-tab to Chromium):
+launcher 1 evict / 1 restore (was 6 / 5), the game was never moved out at
+a switch back (was 241 MB). The second switch back still has one 285 ms
+flip gap with no driver activity in that phase; the reserve build had
+291.7 ms there too (death-20261104_135315): the scenario, not the policy.

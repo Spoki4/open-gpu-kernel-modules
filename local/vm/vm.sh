@@ -22,6 +22,7 @@
 #   ./vm.sh reload [tree|installed|stock]
 #                                swap the guest's driver without a reboot (guest.sh)
 #   ./vm.sh install [stock]      make the tree build the one the guest boots
+#   ./vm.sh win ...              the Windows guest on the same GPU (win.sh)
 #
 # The repository is shared into the guest via virtiofs at the same path, so
 # edits on the host are visible there at once. QEMU runs as root (VFIO pins
@@ -262,5 +263,7 @@ build) ssh_guest "cd '$REPO' && K=/lib/modules/\$(uname -r)/build && \
 reload) ssh_guest "sudo '$REPO/local/vm/guest.sh' reload ${1:-tree}" ;;
 install) ssh_guest "sudo '$REPO/local/vm/guest.sh' install ${1:-}" ;;
 _cleanup) as_root _cleanup; cleanup ;;
+# The Windows guest with the same GPU (win.sh); its root parts come back here.
+win) [[ ${1:-} == _root ]] && as_root win "$@"; exec "$HERE/win.sh" "$@" ;;
 *) sed -n '2,/^set -e/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
