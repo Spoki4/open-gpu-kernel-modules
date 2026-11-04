@@ -11,3 +11,4 @@ nvt-game.frag.spv.h
 nvt-bg-*
 nvt-idle-*
 trace-logs/
+__pycache__/
