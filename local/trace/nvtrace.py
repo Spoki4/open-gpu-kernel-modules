@@ -562,7 +562,7 @@ def build_report(d, gap_ms, top):
         m = re.search(r"crtc=(\d+)", ev["body"])
         flips.setdefault(int(m.group(1)) if m else 0, []).append(ev["ts"])
     w("== Frames (page flips delivered to the compositor, per output; a gap counts only")
-    w("   inside continuous motion: 2 normal frames before it, 1 after)")
+    w("   inside continuous motion: 8 normal frames before it, 3 after)")
     if not flips:
         w("  none recorded (no flips: nothing on screen changed, or drm events unavailable)")
     for crtc, ts in sorted(flips.items()):
@@ -571,13 +571,21 @@ def build_report(d, gap_ms, top):
             continue
         med = statistics.median(iv)
         limit = max(gap_ms / 1000.0, 1.8 * med)
-        # A gap only inside continuous motion (two short intervals before, one
-        # after): the compositor does not flip at all while nothing changes.
-        g = [(ts[i], ts[i + 1]) for i in range(2, len(iv) - 1)
-             if iv[i] > limit and iv[i - 1] <= limit and iv[i - 2] <= limit and iv[i + 1] <= limit]
+        # A gap only inside continuous motion (8 normal intervals before, 3
+        # after): the compositor does not flip at all while nothing changes,
+        # and a blinking cursor makes short bursts of flips.
+        g = [(ts[i], ts[i + 1]) for i in range(8, len(iv) - 3)
+             if iv[i] > limit and max(iv[i - 8:i]) <= limit and max(iv[i + 1:i + 4]) <= limit]
+        # Over a second without a frame: idle with a periodic animation as
+        # often as a freeze; listed, not counted (the game's own frame times,
+        # MangoHud, decide).
+        long_ = [(a, b) for a, b in g if b - a >= 1.0]
+        g = [(a, b) for a, b in g if b - a < 1.0]
         gaps += [(crtc, a, b) for a, b in g]
         w(f"  crtc {crtc}: {len(ts)} flips, median {med * 1000:.2f} ms ({1 / med if med else 0:.0f} Hz), "
-          f"p99 {pct(iv, 99) * 1000:.1f} ms, max {max(iv) * 1000:.1f} ms, gaps > {limit * 1000:.1f} ms: {len(g)}")
+          f"p99 {pct(iv, 99) * 1000:.1f} ms, max {max(iv) * 1000:.1f} ms, gaps > {limit * 1000:.1f} ms: {len(g)}"
+          + (f"; pauses >= 1 s (idle or freeze): {len(long_)} at "
+             + ", ".join(f"{a - t0:.1f}s" for a, _ in long_[:6]) if long_ else ""))
     w("")
 
     # --- what the driver did ----------------------------------------------
