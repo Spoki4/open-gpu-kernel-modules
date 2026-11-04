@@ -666,6 +666,17 @@ NvU32 osGetVidmemHint(NvU32 pid, NvU32 *pGeneration)
     return os_get_vidmem_hint(pid, pGeneration);
 }
 
+// Local patch: vidmem trace events (mem_mgr/vidmem_trace.h), Linux tracepoints.
+NvBool osVidmemTraceOn(NvU32 type)
+{
+    return os_vidmem_trace_on(type);
+}
+
+void osVidmemTrace(NvU32 type, NvU32 pid, const NvU64 *pArgs)
+{
+    os_vidmem_trace(type, pid, pArgs);
+}
+
 void osGetCurrentProcessName(char *ProcName, NvU32 Length)
 {
     return os_get_current_process_name(ProcName, Length);

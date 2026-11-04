@@ -41,6 +41,7 @@
 #include "platform/sli/sli.h"
 
 #include "class/cl0040.h" // NV01_MEMORY_LOCAL_USER
+#include "mem_mgr/vidmem_trace.h" // local patch
 
 /*!
  * _vidmemQueryAlignment
@@ -1057,6 +1058,7 @@ vidmemConstruct_IMPL
     NvU64                        offsetOutTemp;
     NvBool                       bLockAcquired         = NV_FALSE;
     NvBool                       bBornEvicted          = NV_FALSE; // local patch
+    NvBool                       bReserveDenied        = NV_FALSE; // local patch: trace
     NvU32                        attr                  = 0;
     NvU32                        attr2                 = 0;
     FB_ALLOC_INFO               *pFbAllocInfo          = NULL;
@@ -1184,6 +1186,7 @@ vidmemConstruct_IMPL
         rmStatus = _vidmemCheckUserReserve(pGpu, vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE),
                                            pCallContext, pRmClient, pAllocData->size,
                                            &bReserveBound, &bExempt);
+        bReserveDenied = (rmStatus == NV_ERR_NO_MEMORY) && bReserveBound;
 
         //
         // Local patch: a visible process the reserve would turn away gets
@@ -1208,6 +1211,20 @@ vidmemConstruct_IMPL
             rmStatus      = NV_OK;
             bReserveBound = NV_FALSE;
             bBornEvicted  = NV_TRUE;
+        }
+        if (bReserveDenied && osVidmemTraceOn(VMT_RESERVE))
+        {
+            PMA   *pPma = vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE)->pPmaObject;
+            NvU64  freeBytes = 0;
+            NvU64  a[VMT_ARGS] = {0};
+
+            pmaGetFreeMemory(pPma, &freeBytes);
+            a[0] = pAllocData->size;
+            a[1] = freeBytes;
+            a[2] = _vidmemReserveBlockFreeBytes(pPma);
+            a[3] = bBornEvicted ? VMT_RES_SYSMEM : ((rmStatus == NV_OK) ? VMT_RES_ROOM : VMT_RES_DENIED);
+            a[4] = (pCallContext != NULL) && (pCallContext->secInfo.privLevel >= RS_PRIV_LEVEL_KERNEL);
+            osVidmemTrace(VMT_RESERVE, (pRmClient != NULL) ? pRmClient->ProcID : osGetCurrentProcess(), a);
         }
         if (NV_OK != rmStatus)
             goto done;

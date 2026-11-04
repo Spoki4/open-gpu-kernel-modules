@@ -37,6 +37,7 @@
 #include "gpu_mgr/gpu_mgr.h"
 #include "resource_desc.h"
 #include "ctrl/ctrl0000/ctrl0000system.h"
+#include "mem_mgr/vidmem_trace.h"
 
 typedef struct
 {
@@ -547,6 +548,12 @@ _rmapiLockFree(void)
     portSyncRwLockDestroy(g_RmApiLock.pLock);
 }
 
+// Local patch (lock trace): where and when (VMT_NOW) the current write owner
+// took the API lock. Read holds are not traced: their start is only in TLS,
+// on the coarse clock.
+static void *_vmtApiWriteRa;
+static NvU64 _vmtApiWriteNs;
+
 NV_STATUS
 rmapiLockAcquire(NvU32 flags, NvU32 module)
 {
@@ -556,6 +563,10 @@ rmapiLockAcquire(NvU32 flags, NvU32 module)
 
     NvU64 myPriority = 0;
     NvU64 startWaitTime = 0;
+    NvBool vmtOn = osVidmemTraceOn(VMT_LOCK);
+    NvU64 vmtWait0 = vmtOn ? VMT_NOW() : 0;
+    NvU64 vmtHolder = g_RmApiLock.threadId;
+    void *vmtHolderRa = _vmtApiWriteRa;
 
     // Make sure lock has been created
     NV_CHECK_OR_RETURN(LEVEL_ERROR, g_RmApiLock.pLock != NULL, NV_ERR_NOT_READY);
@@ -656,6 +667,22 @@ rmapiLockAcquire(NvU32 flags, NvU32 module)
         if (g_RmApiLock.threadId == threadId)
             g_RmApiLock.timestamp = timestamp;
 
+        // Local patch: lock trace (mem_mgr/vidmem_trace.h)
+        NvU64 vmtNow = VMT_NOW();
+
+        if (g_RmApiLock.threadId == threadId)
+        {
+            _vmtApiWriteRa = NV_RETURN_ADDRESS();
+            _vmtApiWriteNs = vmtNow;
+        }
+        if (vmtOn && (vmtNow - vmtWait0 >= vidmemTraceLockNs))
+        {
+            NvU64 a[VMT_ARGS] = { VMT_LOCK_API, g_RmApiLock.threadId == threadId, vmtNow - vmtWait0, 0,
+                                  (NvU64)(NvUPtr)NV_RETURN_ADDRESS(), (vmtHolder != ~0ull) ? vmtHolder : 0,
+                                  (vmtHolder != ~0ull) ? (NvU64)(NvUPtr)vmtHolderRa : 0 };
+            osVidmemTrace(VMT_LOCK, 0, a);
+        }
+
         // save off owning thread
         RMTRACE_RMLOCK(_API_LOCK_ACQUIRE);
 
@@ -717,6 +744,18 @@ rmapiLockRelease(void)
     timestamp = osGetMonotonicTimeNs();
 
     RMTRACE_RMLOCK(_API_LOCK_RELEASE);
+
+    // Local patch: lock trace (mem_mgr/vidmem_trace.h)
+    if ((g_RmApiLock.threadId == threadId) && (_vmtApiWriteNs != 0) && osVidmemTraceOn(VMT_LOCK))
+    {
+        NvU64 hold = VMT_NOW() - _vmtApiWriteNs;
+
+        if (hold >= vidmemTraceLockNs)
+        {
+            NvU64 a[VMT_ARGS] = { VMT_LOCK_API, 1, 0, hold, (NvU64)(NvUPtr)_vmtApiWriteRa };
+            osVidmemTrace(VMT_LOCK, 0, a);
+        }
+    }
 
     // add api lock trace record
     INSERT_LOCK_TRACE(&g_RmApiLock.traceInfo,

@@ -33,6 +33,7 @@ NVIDIA_SOURCES += nvidia/nv-pci-table.c
 NVIDIA_SOURCES += nvidia/nv-kthread-q.c
 NVIDIA_SOURCES += nvidia/nv-memdbg.c
 NVIDIA_SOURCES += nvidia/nv-report-err.c
+NVIDIA_SOURCES += nvidia/nv-vidmem-trace.c
 NVIDIA_SOURCES += nvidia/nv-rsync.c
 NVIDIA_SOURCES += nvidia/nv-msi.c
 NVIDIA_SOURCES += nvidia/nv-caps.c

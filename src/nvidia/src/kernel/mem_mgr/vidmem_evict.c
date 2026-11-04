@@ -48,6 +48,7 @@
 #include "mem_mgr/mem.h"
 #include "mem_mgr/vaspace.h"
 #include "mem_mgr/virtual_mem.h"
+#include "mem_mgr/vidmem_trace.h"
 #include "rmapi/client.h"
 #include "rmapi/mapping_list.h"
 #include "rmapi/rs_utils.h"
@@ -137,6 +138,10 @@ typedef struct
     NvHandle hTsg[VIDMEM_EVICT_MAX_CHANNELS];     // channel group of each channel (0: none)
     NvHandle hDevice[VIDMEM_EVICT_MAX_CHANNELS];  // device the channel belongs to (IDLE_CHANNELS)
     NvU8     bImplicitTsg[VIDMEM_EVICT_MAX_CHANNELS]; // TSG allocated by RM around a bare channel
+    // Trace (VMT_PAUSE): whose channels, when they went off, how the stop went.
+    NvU32    vmtPid;
+    NvU64    vmtOffNs;
+    NvU64    vmtStopArgs[5];   // mode, tsgs, preempt ok, preempt refused, stop ns
 } VIDMEM_EVICT_CHANNELS;
 
 typedef struct
@@ -207,14 +212,14 @@ enum
     VE_PH_QUIESCE, VE_PH_SYSALLOC, VE_PH_COPY, VE_PH_REMAP, VE_PH_PMA, VE_PH_SYSFREE, VE_PH_COUNT
 };
 static NvU64 _vidmemEvictPhaseNs[VE_PH_COUNT];
-#define VE_PHASE_BEGIN() NvU64 _vePhaseT0 = osGetMonotonicTimeNs()
+#define VE_PHASE_BEGIN() NvU64 _vePhaseT0 = VMT_NOW()
 #define VE_PHASE_END(ph)                                                      \
     do {                                                                    \
-        NvU64 _vePhaseT1 = osGetMonotonicTimeNs();                          \
+        NvU64 _vePhaseT1 = VMT_NOW();                                       \
         _vidmemEvictPhaseNs[ph] += _vePhaseT1 - _vePhaseT0;                 \
         _vePhaseT0 = _vePhaseT1;                                            \
     } while (0)
-#define VE_PHASE_SKIP() (_vePhaseT0 = osGetMonotonicTimeNs())
+#define VE_PHASE_SKIP() (_vePhaseT0 = VMT_NOW())
 
 //
 // Partial eviction: when non-zero, an evict call stops once it has moved this
@@ -226,6 +231,12 @@ static NvU64 _vidmemEvictBudgetBytes;
 
 // Process the current evict/restore call works on (recorded in the state).
 static NvU32 _vidmemEvictCurPid;
+
+// Who asked for the next evict/restore call (VMT_WHY_*), set by each caller.
+static NvU32 _vidmemEvictWhy;
+
+// Lock waits/holds shorter than this are not traced ("trace-lock US").
+NvU64 vidmemTraceLockNs = 1000000ULL;
 
 // When set, an evict/restore call handles only this allocation (hot memory).
 static MEMORY_DESCRIPTOR *_vidmemEvictOnlyMemDesc;
@@ -757,6 +768,27 @@ _vidmemEvictPreemptTsgs(OBJGPU *pGpu, VIDMEM_EVICT_CHANNELS *pChannels, VIDMEM_E
     }
 }
 
+// Trace (VMT_PAUSE) when a channel set goes back on: how long it was off.
+static void
+_vidmemTracePause(VIDMEM_EVICT_CHANNELS *pChannels, NV_STATUS status)
+{
+    NvU64 a[VMT_ARGS] = {0};
+
+    if ((pChannels->count != 0) && (pChannels->vmtOffNs != 0) && osVidmemTraceOn(VMT_PAUSE))
+    {
+        a[0] = pChannels->vmtStopArgs[0];
+        a[1] = pChannels->count;
+        a[2] = pChannels->vmtStopArgs[1];
+        a[3] = pChannels->vmtStopArgs[2];
+        a[4] = pChannels->vmtStopArgs[3];
+        a[5] = pChannels->vmtStopArgs[4];
+        a[6] = VMT_NOW() - pChannels->vmtOffNs;
+        a[7] = status;
+        osVidmemTrace(VMT_PAUSE, pChannels->vmtPid, a);
+    }
+    pChannels->vmtOffNs = 0;
+}
+
 //
 // Stop (bDisable) or resume a process's channels; how depends on the
 // "quiesce" knob (see _vidmemEvictQuiesce). Mode 0 (default) never asks the
@@ -774,7 +806,7 @@ static NV_STATUS
 _vidmemEvictSetChannels(OBJGPU *pGpu, VIDMEM_EVICT_CHANNELS *pChannels, NvBool bDisable)
 {
     VIDMEM_EVICT_QUIESCE_STATS stats = {0};
-    NvU64                      startNs = osGetMonotonicTimeNs(), t;
+    NvU64                      startNs = VMT_NOW(), t;
     NV_STATUS                  status = NV_OK;
     VE_PHASE_BEGIN();
 
@@ -782,8 +814,10 @@ _vidmemEvictSetChannels(OBJGPU *pGpu, VIDMEM_EVICT_CHANNELS *pChannels, NvBool b
     {
         status = _vidmemEvictSetChannelsN(pGpu, pChannels, pChannels->count, NV_FALSE, NV_FALSE);
         VE_PHASE_END(VE_PH_QUIESCE);
+        _vidmemTracePause(pChannels, status);
         return status;
     }
+    pChannels->vmtOffNs = 0;
     if (pChannels->count == 0)
         return NV_OK;
 
@@ -795,36 +829,36 @@ _vidmemEvictSetChannels(OBJGPU *pGpu, VIDMEM_EVICT_CHANNELS *pChannels, NvBool b
     {
         case 1:
             status = _vidmemEvictSetChannelsN(pGpu, pChannels, pChannels->count, NV_TRUE, NV_TRUE);
-            stats.disableNs = osGetMonotonicTimeNs() - startNs;
+            stats.disableNs = VMT_NOW() - startNs;
             break;
 
         case 2:
         case 3:
             status = _vidmemEvictSetChannelsN(pGpu, pChannels, pChannels->count, NV_TRUE, NV_FALSE);
-            stats.disableNs = osGetMonotonicTimeNs() - startNs;
+            stats.disableNs = VMT_NOW() - startNs;
             if (status != NV_OK)
                 break;
-            t = osGetMonotonicTimeNs();
+            t = VMT_NOW();
             stats.idleStatus = _vidmemEvictIdleChannels(pGpu, pChannels, stats.mode == 3);
-            stats.idleNs = osGetMonotonicTimeNs() - t;
+            stats.idleNs = VMT_NOW() - t;
             if (stats.idleStatus != NV_OK)
                 osDelayUs(VIDMEM_EVICT_DRAIN_US);
             break;
 
         case 4:
-            t = osGetMonotonicTimeNs();
+            t = VMT_NOW();
             stats.idleStatus = _vidmemEvictIdleChannels(pGpu, pChannels, NV_TRUE);
-            stats.idleNs = osGetMonotonicTimeNs() - t;
-            t = osGetMonotonicTimeNs();
+            stats.idleNs = VMT_NOW() - t;
+            t = VMT_NOW();
             status = _vidmemEvictSetChannelsN(pGpu, pChannels, pChannels->count, NV_TRUE, NV_FALSE);
-            stats.disableNs = osGetMonotonicTimeNs() - t;
+            stats.disableNs = VMT_NOW() - t;
             if ((status == NV_OK) && (stats.idleStatus != NV_OK))
                 osDelayUs(VIDMEM_EVICT_DRAIN_US);
             break;
 
         default:
             status = _vidmemEvictSetChannelsN(pGpu, pChannels, pChannels->count, NV_TRUE, NV_FALSE);
-            stats.disableNs = osGetMonotonicTimeNs() - startNs;
+            stats.disableNs = VMT_NOW() - startNs;
             if (status != NV_OK)
                 break;
             _vidmemEvictPreemptTsgs(pGpu, pChannels, &stats);
@@ -833,8 +867,14 @@ _vidmemEvictSetChannels(OBJGPU *pGpu, VIDMEM_EVICT_CHANNELS *pChannels, NvBool b
             break;
     }
 
-    stats.totalNs = osGetMonotonicTimeNs() - startNs;
+    stats.totalNs = VMT_NOW() - startNs;
     _vidmemEvictLastStop = stats;
+    pChannels->vmtOffNs = startNs;
+    pChannels->vmtStopArgs[0] = stats.mode;
+    pChannels->vmtStopArgs[1] = stats.tsgs;
+    pChannels->vmtStopArgs[2] = stats.preemptOk;
+    pChannels->vmtStopArgs[3] = stats.preemptRefused;
+    pChannels->vmtStopArgs[4] = stats.totalNs;
     VE_PHASE_END(VE_PH_QUIESCE);
 
     if (stats.totalNs > 50000000ULL)
@@ -857,7 +897,10 @@ _vidmemEvictCollectCompositorChannels(VIDMEM_EVICT_CHANNELS *pChannels)
         RsClient *pRsClient = staticCast(*ppClient, RsClient);
 
         if ((pRsClient->type != CLIENT_TYPE_KERNEL) && _vidmemEvictIsCompositor(*ppClient))
+        {
             _vidmemEvictCollectChannels(pRsClient, pChannels);
+            pChannels->vmtPid = (*ppClient)->ProcID;
+        }
     }
 }
 
@@ -1527,6 +1570,7 @@ vidmemEvictRestoreOnAccess(Memory *pMemory)
     NvU32                  numRefs = 0, numHolders = 0, i;
     NvBool                 bLocked = NV_FALSE;
     NV_STATUS              status = NV_OK;
+    NvU64                  startNs = VMT_NOW();
 
     if (_vidmemEvictIsBusyThread() || (pGpu == NULL))
         return NV_OK;
@@ -1551,6 +1595,7 @@ vidmemEvictRestoreOnAccess(Memory *pMemory)
         goto done;
     }
     pChannels->count = 0;
+    pChannels->vmtOffNs = 0;
 
     if (_vidmemEvictCollectHolders(pGpu, pMemDesc, 0, RES_GET_REF(pMemory), NV_FALSE,
                                    pRefs, &numRefs, &numHolders) != NULL)
@@ -1561,6 +1606,12 @@ vidmemEvictRestoreOnAccess(Memory *pMemory)
     _vidmemEvictCollectChannels(RES_GET_CLIENT(pMemory), pChannels);
     for (i = 0; i < numRefs; i++)
         _vidmemEvictCollectChannels(RES_GET_CLIENT(pRefs[i].pHolder), pChannels);
+    {
+        RmClient *pOwner = dynamicCast(RES_GET_CLIENT(pMemory), RmClient);
+
+        pChannels->vmtPid = (pOwner != NULL) ? pOwner->ProcID : 0;
+    }
+    portMemSet(_vidmemEvictPhaseNs, 0, sizeof(_vidmemEvictPhaseNs));
 
     _vidmemEvictSetBusy(NV_TRUE);
     status = _vidmemEvictSetChannels(pGpu, pChannels, NV_TRUE);
@@ -1580,6 +1631,17 @@ vidmemEvictRestoreOnAccess(Memory *pMemory)
 
         if (pRmClient != NULL)
             _vidmemEvictNoteRestoreOnAccess(pRmClient->ProcID);
+        if (osVidmemTraceOn(VMT_MOVE))
+        {
+            // The calling thread (CPU map, scanout, ...) waited all of it.
+            NvU64 a[VMT_ARGS] = { 2, VMT_WHY_ACCESS, (status == NV_OK) ? memdescGetSize(pMemDesc) : 0,
+                                  status == NV_OK, status != NV_OK, numHolders, pChannels->count,
+                                  VMT_NOW() - startNs,
+                                  _vidmemEvictPhaseNs[VE_PH_QUIESCE], _vidmemEvictPhaseNs[VE_PH_SYSALLOC],
+                                  _vidmemEvictPhaseNs[VE_PH_COPY], _vidmemEvictPhaseNs[VE_PH_REMAP],
+                                  _vidmemEvictPhaseNs[VE_PH_PMA], _vidmemEvictPhaseNs[VE_PH_SYSFREE] };
+            osVidmemTrace(VMT_MOVE, (pRmClient != NULL) ? pRmClient->ProcID : 0, a);
+        }
         if ((status == NV_OK) || ((n & (n - 1)) == 0))
             NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: restore on access, %s(%u) memory 0x%x (%llu KB, %u holders): 0x%x%s\n",
                       (pRmClient != NULL) ? pRmClient->name : "?", (pRmClient != NULL) ? pRmClient->ProcID : 0,
@@ -1631,7 +1693,7 @@ _vidmemEvictPidLocked
     VIDMEM_EVICT_MAPREF   *pRefs = NULL;
     VIDMEM_EVICT_PENDING  *pPending = NULL;
     RmClient             **ppClient;
-    NvU64                  startNs = osGetMonotonicTimeNs();
+    NvU64                  startNs = VMT_NOW();
     NvU64                  movedBytes = 0, failedBytes = 0, skippedBytes = 0, sharedBytes = 0;
     NvU32                  moved = 0, failed = 0, skipped = 0, shared = 0, numPending = 0, i;
     NV_STATUS              status;
@@ -1655,10 +1717,13 @@ _vidmemEvictPidLocked
     }
     pChannels->count = 0;
     pCompChannels->count = 0;
+    pChannels->vmtOffNs = 0;
+    pCompChannels->vmtOffNs = 0;
     portMemSet(_vidmemEvictPhaseNs, 0, sizeof(_vidmemEvictPhaseNs));
 
     EVICT_PRINTF("%s pid %u\n", (mode == 0) ? "dry" : ((mode == 1) ? "evict" : "restore"), pid);
     _vidmemEvictCurPid = pid;
+    pChannels->vmtPid = pid;
 
     for (ppClient = serverutilGetFirstClientUnderLock();
          ppClient != NULL;
@@ -1925,17 +1990,26 @@ _vidmemEvictPidLocked
     EVICT_PRINTF("summary: %s %u allocs %llu MB (shared %u, %llu MB), failed %u (%llu MB), not eligible %u (%llu MB), %llu ms\n",
                  (mode == 0) ? "eligible" : ((mode == 1) ? "evicted" : "restored"),
                  moved, movedBytes >> 20, shared, sharedBytes >> 20, failed, failedBytes >> 20,
-                 skipped, skippedBytes >> 20, (osGetMonotonicTimeNs() - startNs) / 1000000);
+                 skipped, skippedBytes >> 20, (VMT_NOW() - startNs) / 1000000);
     EVICT_PRINTF("phases ms: quiesce %llu, sysmem alloc %llu, copy %llu, remap %llu, pma %llu, sysmem free %llu\n",
                  _vidmemEvictPhaseNs[VE_PH_QUIESCE] / 1000000, _vidmemEvictPhaseNs[VE_PH_SYSALLOC] / 1000000,
                  _vidmemEvictPhaseNs[VE_PH_COPY] / 1000000, _vidmemEvictPhaseNs[VE_PH_REMAP] / 1000000,
                  _vidmemEvictPhaseNs[VE_PH_PMA] / 1000000, _vidmemEvictPhaseNs[VE_PH_SYSFREE] / 1000000);
     EVICT_PRINTF("total evicted now: %u allocs %llu MB\n", _vidmemEvictAllocs, _vidmemEvictBytes >> 20);
 
+    if ((mode != 0) && ((moved != 0) || (failed != 0)) && osVidmemTraceOn(VMT_MOVE))
+    {
+        NvU64 a[VMT_ARGS] = { mode, _vidmemEvictWhy, movedBytes, moved, failed, numPending, pChannels->count,
+                              VMT_NOW() - startNs,
+                              _vidmemEvictPhaseNs[VE_PH_QUIESCE], _vidmemEvictPhaseNs[VE_PH_SYSALLOC],
+                              _vidmemEvictPhaseNs[VE_PH_COPY], _vidmemEvictPhaseNs[VE_PH_REMAP],
+                              _vidmemEvictPhaseNs[VE_PH_PMA], _vidmemEvictPhaseNs[VE_PH_SYSFREE] };
+        osVidmemTrace(VMT_MOVE, pid, a);
+    }
     if ((mode != 0) && ((moved != 0) || (failed != 0)))
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: %s pid %u: %u allocs %llu MB (%u with the compositor), failed %u, %llu ms; total %llu MB\n",
                   (mode == 1) ? "evict" : "restore", pid, moved, movedBytes >> 20, numPending, failed,
-                  (osGetMonotonicTimeNs() - startNs) / 1000000, _vidmemEvictBytes >> 20);
+                  (VMT_NOW() - startNs) / 1000000, _vidmemEvictBytes >> 20);
     if (pMovedBytes != NULL)
         *pMovedBytes = movedBytes;
     if ((mode == 1) && (moved != 0))
@@ -3094,12 +3168,14 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
             (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) ||
             (_vidmemActivityIdleSec(pProcs[i].pid) >= VIDMEM_EVICT_IDLE_SEC))
             continue;
+        _vidmemEvictWhy = VMT_WHY_ROOM;
         avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB, pProcs[i].pid,
                                      VE_LEVEL_HIDDEN, "drawing again");
         if (avail < needMB + 16)
             continue;
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: restoring %s (pid %u, drawing again, %llu MB)\n",
                   pProcs[i].name, pProcs[i].pid, needMB);
+        _vidmemEvictWhy = VMT_WHY_RESTORE;
         (void)_vidmemEvictPidLocked(pGpu, 2, pProcs[i].pid, NULL, 0, NULL, NULL);
         pProcs[i].evictedBytes = 0;
         _vidmemActivityFind(pProcs[i].pid, NV_TRUE)->evictedForFgNs = 0;
@@ -3137,6 +3213,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
                 if (_vidmemEvictAvailMB(pGpu) < needMB + VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HYST_MB)
                 {
                     // Only hidden ones make room for a visible (not foreground) app.
+                    _vidmemEvictWhy = VMT_WHY_ROOM;
                     (void)_vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB,
                                                pProcs[i].pid, VE_LEVEL_HIDDEN, "visible again");
                 }
@@ -3144,6 +3221,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
             }
             else
             {
+                _vidmemEvictWhy = VMT_WHY_ROOM;
                 avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB, pProcs[i].pid,
                                              VE_LEVEL_FG_RESTORE, "foreground again");
             }
@@ -3155,6 +3233,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
             }
             NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: restoring %s (pid %u, %s, %llu MB)\n",
                       pProcs[i].name, pProcs[i].pid, (want == VE_HINT_FG) ? "foreground" : "visible", needMB);
+            _vidmemEvictWhy = VMT_WHY_RESTORE;
             (void)_vidmemEvictPidLocked(pGpu, 2, pProcs[i].pid, NULL, 0, NULL, NULL);
             pProcs[i].evictedBytes = 0;
             _vidmemActivityFind(pProcs[i].pid, NV_TRUE)->evictedForFgNs = 0;
@@ -3185,6 +3264,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
             }
         }
         _vidmemLastPressureNs = nowNs;
+        _vidmemEvictWhy = VMT_WHY_PRESSURE;
         (void)_vidmemEvictHintFree(pGpu, pProcs, count, VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HYST_MB, fgPid,
                                    level, (level == VE_LEVEL_HIDDEN) ? "pressure" : "pressure from the foreground game");
         return;
@@ -3205,6 +3285,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
                 continue;
             NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: plenty free (%llu MB), restoring %s (pid %u, %llu MB)\n",
                       avail, pProcs[i].name, pProcs[i].pid, needMB);
+            _vidmemEvictWhy = VMT_WHY_IDLE_BACK;
             (void)_vidmemEvictPidLocked(pGpu, 2, pProcs[i].pid, NULL, 0, NULL, NULL);
             break;
         }
@@ -3237,6 +3318,7 @@ _vidmemHotRestore(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count)
         hint = VE_HINT_STATE(_vidmemHint(pState->ownerPid, NULL));
         if (_vidmemHintsActive() && (hint == VE_HINT_HIDDEN))
             continue;
+        _vidmemEvictWhy = VMT_WHY_ROOM;
         avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB,
                                      pState->ownerPid, VE_LEVEL_HIDDEN, "hot allocation");
         if (avail < needMB + 16)
@@ -3244,6 +3326,7 @@ _vidmemHotRestore(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count)
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hot memory: restoring %llu KB of pid %u (%u notifications)\n",
                   pState->bytes >> 10, pState->ownerPid, pState->hotCount);
         _vidmemEvictOnlyMemDesc = pMemDesc;
+        _vidmemEvictWhy = VMT_WHY_HOT;
         (void)_vidmemEvictPidLocked(pGpu, 2, pState->ownerPid, NULL, 0, NULL, NULL);
         _vidmemEvictOnlyMemDesc = NULL;
         if (pMemDesc->pLocalEvictState == NULL)
@@ -3258,7 +3341,7 @@ _vidmemHotRestore(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count)
 
 // One policy step. API lock RW, GPU lock held.
 static void
-_vidmemEvictPolicyTick(OBJGPU *pGpu)
+_vidmemEvictPolicyStep(OBJGPU *pGpu)
 {
     VIDMEM_EVICT_PROC *pProcs;
     NvU64 nowNs = osGetMonotonicTimeNs();
@@ -3339,6 +3422,7 @@ _vidmemEvictPolicyTick(OBJGPU *pGpu)
             NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: auto: avail %llu MB < %u MB, evicting %s (pid %u, %llu MB, idle %s%u s)\n",
                       avail, _vidmemLowMB, pPick->name, pPick->pid, pPick->eligibleBytes >> 20,
                       (pickIdle == NV_U32_MAX) ? ">" : "", (pickIdle == NV_U32_MAX) ? 10 : pickIdle);
+            _vidmemEvictWhy = VMT_WHY_AUTO;
             (void)_vidmemEvictPidLocked(pGpu, 1, pPick->pid, NULL, 0, NULL, &moved);
             pPick->eligibleBytes = 0;
             avail += moved >> 20;
@@ -3377,11 +3461,72 @@ _vidmemEvictPolicyTick(OBJGPU *pGpu)
         {
             NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: auto: avail %llu MB, restoring %s (pid %u, %llu MB)\n",
                       avail, pPick->name, pPick->pid, pPick->evictedBytes >> 20);
+            _vidmemEvictWhy = VMT_WHY_AUTO;
             (void)_vidmemEvictPidLocked(pGpu, 2, pPick->pid, NULL, 0, NULL, NULL);
         }
     }
 
     portMemFree(pProcs);
+}
+
+//
+// One policy step, traced (VMT_TICK, VMT_PROC): everything in it runs with
+// the API lock held for writing and the GPU lock, i.e. every other RM call
+// waits. trigger: 0 timer (queuedNs: when the work item was queued), 1 hints.
+//
+static NvU64 _vidmemTickQueuedNs;
+
+static void
+_vidmemEvictPolicyTick(OBJGPU *pGpu, NvU32 trigger)
+{
+    NvU64 startNs = VMT_NOW();
+    NvU64 blockBytes = 0, blockFree = 0, blockLargest = 0;
+    NvU32 procs = 0;
+
+    _vidmemEvictPolicyStep(pGpu);
+
+    if (osVidmemTraceOn(VMT_PROC))
+    {
+        VIDMEM_EVICT_PROC *pProcs = portMemAllocNonPaged(sizeof(*pProcs) * VIDMEM_EVICT_MAX_PROCS);
+        NvU64 nowNs = osGetMonotonicTimeNs();
+        NvU32 i;
+
+        if (pProcs != NULL)
+        {
+            procs = _vidmemEvictGatherProcs(pGpu, pProcs, VIDMEM_EVICT_MAX_PROCS);
+            for (i = 0; i < procs; i++)
+            {
+                VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(pProcs[i].pid, NV_FALSE);
+                NvU64 a[VMT_ARGS] = { pProcs[i].vidmemBytes, pProcs[i].evictedBytes, pProcs[i].eligibleBytes,
+                                      pProcs[i].hint, _vidmemActivityIdleSec(pProcs[i].pid),
+                                      (pAct != NULL) ? pAct->recentSamples : 0,
+                                      ((pAct != NULL) && (pAct->lastSubmitNs != 0)) ?
+                                          (nowNs - pAct->lastSubmitNs) / 1000000000ULL : NV_U32_MAX,
+                                      pProcs[i].bNever };
+                osVidmemTrace(VMT_PROC, pProcs[i].pid, a);
+            }
+            portMemFree(pProcs);
+        }
+    }
+    if (osVidmemTraceOn(VMT_TICK))
+    {
+        NvU64 a[VMT_ARGS] = {0};
+
+        if (GPU_GET_HEAP(pGpu) != NULL)
+            (void)vidmemGetUserReserveBlockInfo(GPU_GET_HEAP(pGpu)->pPmaObject, &blockBytes, &blockFree,
+                                                &blockLargest);
+        a[0] = VMT_NOW() - startNs;
+        a[1] = ((trigger == 0) && (_vidmemTickQueuedNs != 0)) ? startNs - _vidmemTickQueuedNs : 0;
+        a[2] = _vidmemEvictAvailMB(pGpu);
+        a[3] = blockFree >> 20;
+        a[4] = blockLargest >> 20;
+        a[5] = _vidmemEvictBytes >> 20;
+        a[6] = _vidmemBusiestPid;
+        a[7] = _vidmemHintsActive();
+        a[8] = procs;
+        a[9] = trigger;
+        osVidmemTrace(VMT_TICK, 0, a);
+    }
 }
 
 static void
@@ -3394,7 +3539,7 @@ _vidmemEvictWorkItem(NvU32 gpuInstance, void *pArgs)
         rmapiLockIsWriteOwner() &&
         (rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_MEM) == NV_OK))
     {
-        _vidmemEvictPolicyTick(pGpu);
+        _vidmemEvictPolicyTick(pGpu, 0);
         rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     }
     _vidmemWorkQueued = 0;
@@ -3409,6 +3554,7 @@ _vidmemEvict1HzCallback(OBJGPU *pGpu, void *pData)
         return;
 
     _vidmemWorkQueued = 1;
+    _vidmemTickQueuedNs = VMT_NOW();
     if (osQueueWorkItem(pGpu, _vidmemEvictWorkItem, NULL,
                         (OsQueueWorkItemFlags){
                             .apiLock = WORKITEM_FLAGS_API_LOCK_READ_WRITE,
@@ -3532,6 +3678,7 @@ vidmemEvictMakeRoom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
     NvU32              count;
     NvBool             bOk;
     NvBool             bLocked = NV_FALSE;
+    NvU64              t0;
 
     if (!_vidmemAutoActive() || (pRmClient == NULL) || (pRmClient->ProcID == 0) || !_vidmemHintsActive() ||
         _vidmemEvictIsBusyThread())
@@ -3549,6 +3696,7 @@ vidmemEvictMakeRoom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
     if ((lastFruitlessNs != 0) && (nowNs - lastFruitlessNs < 1000000000ULL))
         return NV_FALSE;
 
+    t0 = VMT_NOW();
     if (!rmGpuLockIsOwner() && !rmDeviceGpuLockIsOwner(pGpu->gpuInstance))
     {
         if (rmDeviceGpuLocksAcquire(pGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_MEM) != NV_OK)
@@ -3567,6 +3715,7 @@ vidmemEvictMakeRoom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
 
     // Some headroom, so the next allocations do not each come here.
     wantMB = (size >> 20) + 1 + VIDMEM_EVICT_HINT_LOW_MB;
+    _vidmemEvictWhy = VMT_WHY_ALLOC;
     avail  = _vidmemEvictHintFree(pGpu, pProcs, count, wantMB, pRmClient->ProcID,
                                   (VE_HINT_STATE(_vidmemHint(pRmClient->ProcID, NULL)) == VE_HINT_FG) ?
                                       VE_LEVEL_FG_IDLE : VE_LEVEL_HIDDEN, "allocation");
@@ -3579,6 +3728,13 @@ vidmemEvictMakeRoom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
     portMemFree(pProcs);
     if (bLocked)
         rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
+    if (osVidmemTraceOn(VMT_MAKEROOM))
+    {
+        NvU64 a[VMT_ARGS] = { size, wantMB, avail, bOk, VMT_NOW() - t0,
+                              (VE_HINT_STATE(_vidmemHint(pRmClient->ProcID, NULL)) == VE_HINT_FG) ?
+                                  VE_LEVEL_FG_IDLE : VE_LEVEL_HIDDEN };
+        osVidmemTrace(VMT_MAKEROOM, pRmClient->ProcID, a);
+    }
     return bOk;
 }
 
@@ -3596,6 +3752,7 @@ vidmemEvictBornAllocation(OBJGPU *pGpu, Memory *pMemory)
     const char          *reason;
     NvU32                numRefs = 0;
     NV_STATUS            status;
+    NvU64                startNs = VMT_NOW();
 
     NV_ASSERT_OR_RETURN(rmGpuLockIsOwner() || rmDeviceGpuLockIsOwner(pGpu->gpuInstance),
                         NV_ERR_INVALID_LOCK_STATE);
@@ -3634,6 +3791,12 @@ vidmemEvictBornAllocation(OBJGPU *pGpu, Memory *pMemory)
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: could not move a new allocation of %s(%u) to sysmem (%s, 0x%x); it stays in vidmem\n",
                   (pRmClient != NULL) ? pRmClient->name : "?", (pRmClient != NULL) ? pRmClient->ProcID : 0,
                   (reason != NULL) ? reason : "-", status);
+    }
+    if (osVidmemTraceOn(VMT_MOVE))
+    {
+        NvU64 a[VMT_ARGS] = { 1, VMT_WHY_BORN, (status == NV_OK) ? memdescGetSize(pMemory->pMemDesc) : 0,
+                              status == NV_OK, status != NV_OK, 0, 0, VMT_NOW() - startNs };
+        osVidmemTrace(VMT_MOVE, (pRmClient != NULL) ? pRmClient->ProcID : 0, a);
     }
 
     portMemFree(pRefs);
@@ -3967,6 +4130,7 @@ vidmemEvictProcess
 
     if (mode <= 2)
     {
+        _vidmemEvictWhy = VMT_WHY_MANUAL;
         status = _vidmemEvictPidLocked(pGpu, mode, arg, buf, bufSize, pLen, NULL);
     }
     else if (mode == 3)
@@ -3997,8 +4161,13 @@ vidmemEvictProcess
     else if (mode == 9)
     {
         // Window hints changed (procfs vidmem_hints): run the policy now.
-        _vidmemEvictPolicyTick(pGpu);
+        _vidmemEvictPolicyTick(pGpu, 1);
         EVICT_PRINTF("policy run\n");
+    }
+    else if (mode == 11)
+    {
+        vidmemTraceLockNs = (NvU64)arg * 1000;
+        EVICT_PRINTF("lock waits/holds traced from %u us\n", arg);
     }
     else if (mode == 8)
     {

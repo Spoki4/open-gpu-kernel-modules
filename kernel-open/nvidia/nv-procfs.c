@@ -454,6 +454,8 @@ nv_procfs_write_vidmem_evict(
         mode = 8;
     else if (strcmp(cmd, "hot") == 0)
         mode = 10;
+    else if (strcmp(cmd, "trace-lock") == 0)
+        mode = 11;
     else
         return -EINVAL;
 
@@ -463,7 +465,7 @@ nv_procfs_write_vidmem_evict(
         if (arg == NULL)
             return -EINVAL;
         ret = kstrtouint(strim(arg), 10, &pid);
-        if ((ret < 0) || ((mode != 4) && (mode != 6) && (mode != 7) && (mode != 8) && (mode != 10) && (pid == 0)))
+        if ((ret < 0) || ((mode != 4) && (mode != 6) && (mode != 7) && (mode != 8) && (mode != 10) && (mode != 11) && (pid == 0)))
         {
             return -EINVAL;
         }
@@ -541,6 +543,7 @@ static const nv_proc_ops_t nv_procfs_vidmem_evict_fops = {
 #define NV_VIDMEM_HINT_MAX_ENTRIES 512
 
 void nv_vidmem_hints_set(const NvU32 *pids, const NvU8 *states, NvU32 count, NvBool bAppend);  // os-interface.c
+void nv_vidmem_trace_hints(const NvU32 *pids, const NvU8 *states, NvU32 count);                // nv-vidmem-trace.c
 NvU32 nv_vidmem_hints_get(NvU32 *pids, NvU8 *states, NvU32 max, NvU32 *pGen);
 
 static nv_state_t *nv_vidmem_hint_nv;
@@ -659,6 +662,7 @@ nv_procfs_write_vidmem_hints(
     }
 
     nv_vidmem_hints_set(pids, states, n, *pos != 0);
+    nv_vidmem_trace_hints(pids, states, n);
     *pos += count;
     atomic_inc(&nv_vidmem_hint_writes);
     kfree(text);
