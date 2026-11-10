@@ -19,6 +19,9 @@
 #   sudo ./evict.sh windows on|off              # also evict window buffers (default off)
 #   sudo ./evict.sh moveshared on|off           # window buffers may move to other vidmem pages
 #                                               # (compaction, cleared windows; default on)
+#   sudo ./evict.sh fgown on|off                # a focused app that is not a game gets an allocation
+#                                               # nobody can make room for; as much of its own older
+#                                               # memory goes to sysmem (BACKLOG #7; default on)
 #   sudo ./evict.sh hot     on|off              # access counters: evicted allocations in use
 #                                               # come back one by one (experiment)
 #   sudo ./evict.sh quiesce 0..4                # how channels are stopped (experiment, see
@@ -26,7 +29,7 @@
 set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "evict.sh: run with sudo" >&2; exit 1; }
-usage() { echo "usage: sudo $0 status | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows|moveshared on|off | quiesce 0..4 | compact MB | trace-lock US" >&2; exit 2; }
+usage() { echo "usage: sudo $0 status | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows|moveshared|fgown on|off | quiesce 0..4 | compact MB | trace-lock US" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 
 mode=$1
@@ -39,7 +42,7 @@ case $mode in
         [[ $# -eq 2 ]] || usage
         case $2 in on|1) cmd="hot 1" ;; off|0) cmd="hot 0" ;; *) usage ;; esac
         ;;
-    auto|trace|windows|moveshared)
+    auto|trace|windows|moveshared|fgown)
         [[ $# -eq 2 ]] || usage
         case $2 in
             on|1) cmd="$mode 1" ;;

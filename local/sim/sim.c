@@ -828,6 +828,7 @@ static int setKnob(const char *k, const char *v)
     else if (strcmp(k, "copy_gbs") == 0)     gCopyGBs = d;
     else if (strcmp(k, "frag") == 0)         gFrag = d;
     else if (strcmp(k, "longest") == 0)      gLongestMB = (NvU64)d;
+    else if (strcmp(k, "fg_own") == 0)       _vidmemFgOwnEnabled = (NvU32)d;
     else if (strcmp(k, "autotick") == 0)     gAutoTick = (int)d;
     else if (strcmp(k, "hints") == 0)        gHintsActive = (int)d;
     else return 0;

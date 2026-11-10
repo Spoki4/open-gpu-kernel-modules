@@ -1,0 +1,19 @@
+# BACKLOG #7, the other half: a focused game that finds no room is turned
+# away as before (nobody's memory moves inside its allocation; vkd3d and GL
+# drivers place by the budget and fall back by themselves).
+cap 4000
+proc 1614 kwin_wayland old
+proc 700 pinned old never chunk=64
+proc 5000 game chunk=64
+act 1614 0 4
+act 700 0 10
+place 700 3000 0 0
+
+hint 5000 f full launched
+act 5000 0 30
+target 5000 900 0.9
+at 6
+alloc 5000 192 n=3
+at 10
+expect denied 5000 >= 1
+expect evicted 5000 == 0
