@@ -28,6 +28,15 @@
 #define VIDMEM_EVICT_QUIET_SEC      30
 // A hidden process comes back by itself only after it would have fitted for this long.
 #define VIDMEM_EVICT_HIDDEN_BACK_SEC 300
+// Background compaction: the free run to keep (MB; knob "compact", 0: off), MB
+// moved per policy step (less next to a focused game: each step holds the RM
+// locks for its copy), and the pause after a step that had nothing to do.
+#define VIDMEM_EVICT_COMPACT_RUN_MB   1024
+#define VIDMEM_EVICT_COMPACT_STEP_MB  32
+#define VIDMEM_EVICT_COMPACT_GAME_MB  8
+// (not a round number: a 30 s rest met a process that works every 30 s each time)
+#define VIDMEM_EVICT_COMPACT_REST_SEC 14
+extern NvU32 _vidmemCompactRunMB;
 #define VIDMEM_EVICT_HYST_MB        512
 #define VIDMEM_EVICT_MAX_PROCS      128
 #define VIDMEM_EVICT_MAX_PER_TICK   2
@@ -216,6 +225,11 @@ NvBool vepPlatChunkInfo(OBJGPU *pGpu, NvU64 *pFreeChunks, NvU64 *pLongest);
 // Clear a contiguous window of `size` (aligned) for the compositor.
 NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
                          NvU64 *pMovedMB);
+// Background compaction (BACKLOG #16): lengthen the longest run of free 2 MB
+// chunks by moving up to `budgetMB` of memory next to it (of processes not
+// drawing now, never the foreground) to other vidmem pages. Nothing to do when the run already has `wantMB`.
+// Returns the MB moved (0: nothing to do or nothing possible now).
+NvU64  vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budgetMB, NvU64 wantMB);
 // Total evicted bytes right now (the engine's count).
 extern NvU64 _vidmemEvictBytes;
 // kwin_wayland / Xwayland (video_mem.c).

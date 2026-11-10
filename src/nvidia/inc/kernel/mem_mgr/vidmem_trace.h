@@ -38,6 +38,7 @@
 #define VMT_WHY_HOT       7   // access counters: one hot allocation back
 #define VMT_WHY_ACCESS    8   // restore on access (CPU map, scanout, ...)
 #define VMT_WHY_BORN      9   // new allocation created in sysmem
+#define VMT_WHY_COMPACT   10  // background compaction: moved inside vidmem to lengthen the free run
 
 // VMT_RESERVE outcome
 #define VMT_RES_DENIED    0

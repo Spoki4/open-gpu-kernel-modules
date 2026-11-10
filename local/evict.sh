@@ -6,6 +6,7 @@
 #   sudo ./evict.sh status                      # per process: vram, ram, evictable, idle
 #   sudo ./evict.sh dry     <pid|chrome|name>   # list what could move, and why not
 #   sudo ./evict.sh move    <pid|chrome|name>   # move its vidmem to other vidmem pages (no sysmem; BACKLOG #16)
+#   sudo ./evict.sh compact MB                  # background compaction keeps a free run of MB (0: off; BACKLOG #16)
 #   sudo ./evict.sh evict   <pid|chrome|name>
 #   sudo ./evict.sh restore <pid|chrome|name>
 #   sudo ./evict.sh auto    on|off|hints        # automatic eviction under VRAM pressure
@@ -23,7 +24,7 @@
 set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "evict.sh: run with sudo" >&2; exit 1; }
-usage() { echo "usage: sudo $0 status | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows on|off | quiesce 0..4 | trace-lock US" >&2; exit 2; }
+usage() { echo "usage: sudo $0 status | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows on|off | quiesce 0..4 | compact MB | trace-lock US" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 
 mode=$1
@@ -48,6 +49,10 @@ case $mode in
     quiesce)
         [[ $# -eq 2 && $2 =~ ^[0-4]$ ]] || usage
         cmd="quiesce $2"
+        ;;
+    compact)
+        [[ $# -eq 2 && $2 =~ ^[0-9]+$ ]] || usage
+        cmd="compact $2"
         ;;
     trace-lock)
         [[ $# -eq 2 && $2 =~ ^[0-9]+$ ]] || usage

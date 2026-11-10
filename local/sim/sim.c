@@ -366,6 +366,13 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
     return NV_TRUE;
 }
 
+// Fragmentation is not modelled: nothing to compact.
+NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budgetMB, NvU64 wantMB)
+{
+    (void)pGpu; (void)pProcs; (void)count; (void)budgetMB; (void)wantMB;
+    return 0;
+}
+
 // --- processes and allocations -------------------------------------------
 
 static Proc *getProc(NvU32 pid, const char *name)

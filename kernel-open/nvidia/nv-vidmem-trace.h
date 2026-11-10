@@ -22,7 +22,7 @@
 #define NV_VMT_WHY                                                           \
     { 0, "manual" }, { 1, "auto" }, { 2, "pressure" }, { 3, "alloc" },       \
     { 4, "restore" }, { 5, "room" }, { 6, "idle-back" }, { 7, "hot" },       \
-    { 8, "access" }, { 9, "born" }
+    { 8, "access" }, { 9, "born" }, { 10, "compact" }
 
 #define NV_VMT_HINT { 0, "-" }, { 1, "h" }, { 2, "v" }, { 3, "f" }
 
@@ -365,7 +365,7 @@ TRACE_EVENT(vidmem_frag,
     TP_printk("at=%s pid=%u comm=%s why=%s total_mb=%llu free_mb=%llu chunk_mb=%llu holes_mb=%llu "
               "longest_mb=%llu runs=%u runs32=%u runs128=%u partial=%u partial_used_mb=%llu "
               "longest_before_mb=%llu chunk_before_mb=%llu scan_us=%llu",
-              (__entry->at == 0) ? "tick" : ((__entry->at == 1) ? "evict" : "restore"),
+              (__entry->at == 0) ? "tick" : ((__entry->at == 1) ? "evict" : ((__entry->at == 2) ? "restore" : "move")),
               __entry->pid, __entry->comm, __print_symbolic(__entry->why, NV_VMT_WHY),
               __entry->total_mb, __entry->free_mb, __entry->chunk_mb,
               __entry->free_mb - __entry->chunk_mb, __entry->longest_mb, __entry->runs,
