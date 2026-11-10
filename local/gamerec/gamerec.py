@@ -529,8 +529,8 @@ def cmd_mark(a):
         shots = os.path.join(LOGS, st["id"], "shots")
         os.makedirs(shots, exist_ok=True)
         shot = os.path.join(shots, datetime.datetime.now().strftime("%H%M%S") + ".png")
-        # The monitor under the pointer, no window, no notification.
-        if subprocess.run(["spectacle", "-b", "-n", "-m", "-o", shot], stdout=subprocess.DEVNULL,
+        # Every monitor (the page that "broke" was on the other one, BACKLOG #15), no window, no notification.
+        if subprocess.run(["spectacle", "-b", "-n", "-f", "-o", shot], stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL, timeout=15).returncode == 0 and os.path.exists(shot):
             req["shot"] = "shots/" + os.path.basename(shot)
     send("mark", **req)

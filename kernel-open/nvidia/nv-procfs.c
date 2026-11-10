@@ -461,6 +461,8 @@ nv_procfs_write_vidmem_evict(
         mode = 12;
     else if (strcmp(cmd, "compact") == 0)
         mode = 13;
+    else if (strcmp(cmd, "moveshared") == 0)
+        mode = 14;
     else
         return -EINVAL;
 

@@ -56,6 +56,8 @@ typedef struct
     NvU64  evictKB, restoreKB, deniedKB, bornKB;
     double lastEvictS, lastRestoreS;
     double stallMs, maxStallMs;   // moves made inside its own allocations
+    NvU64  windowKB;              // a contiguous window cleared for it and not used yet
+    NvU32  windows;               // windows cleared for it
 } Proc;
 
 static Proc   gProcs[MAXP];
@@ -72,6 +74,7 @@ static int    gHintsActive;
 static int    gVerbose;
 static double gCopyGBs = 3.5;     // copy speed of a move (2026-11-06 CoD: 494 MB in 139 ms)
 static double gFrag = 1.0;        // share of free memory in free 2 MB chunks
+static NvU64  gLongestMB;         // longest free run (0: no limit): a bigger contiguous buffer comes back only into a cleared window
 static long   gClockOffset;       // display: wall clock (unix s) at scenario time 0
 static int    gHaveClock;
 static const char *gScenario;
@@ -239,6 +242,12 @@ NvU32 vepPlatGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs
             else if (p->a[k].where == W_EVICT)
             {
                 q->evictedBytes += p->a[k].kb << 10;
+                if (p->a[k].contig)
+                {
+                    q->evictedContigBytes += p->a[k].kb << 10;
+                    q->evictedContigMax    = NV_MAX(q->evictedContigMax, p->a[k].kb << 10);
+                    q->evictedContigAlign  = 2ULL << 20;
+                }
             }
         }
     }
@@ -291,6 +300,16 @@ NV_STATUS vepPlatMovePid(OBJGPU *pGpu, NvU32 mode, NvU32 pid, NvU64 *pMovedBytes
             {
                 failed++;
                 continue;
+            }
+            // Contiguous and longer than any free run: only into a window cleared for it.
+            if (a->contig && (gLongestMB != 0) && (a->kb > (gLongestMB << 10)))
+            {
+                if (p->windowKB < a->kb)
+                {
+                    failed++;
+                    continue;
+                }
+                p->windowKB = 0;
             }
             a->where = W_VID;
             kb += a->kb;
@@ -361,8 +380,16 @@ NvBool vepPlatChunkInfo(OBJGPU *pGpu, NvU64 *pFreeChunks, NvU64 *pLongest)
 NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
                          NvU32 forPid, NvU32 level, NvU64 *pMovedMB)
 {
-    (void)pGpu; (void)pProcs; (void)count; (void)size; (void)align; (void)forPid; (void)level;
+    Proc *p = (forPid != 0) ? findProc(forPid) : NULL;
+
+    (void)pGpu; (void)pProcs; (void)count; (void)align; (void)level;
     *pMovedMB = 0;
+    // Always found, by moving what is in it to other vidmem pages (no cost modelled).
+    if ((p != NULL) && (p->windowKB < (size >> 10)))
+    {
+        p->windowKB = size >> 10;
+        p->windows++;
+    }
     return NV_TRUE;
 }
 
@@ -760,6 +787,7 @@ static double metric(const char *m, Proc *p)
     if (strcmp(m, "evicts") == 0)     return p->evicts;
     if (strcmp(m, "restores") == 0)   return p->restores;
     if (strcmp(m, "restorefails") == 0) return p->restoreFails;
+    if (strcmp(m, "windows") == 0)    return p->windows;
     if (strcmp(m, "pingpong") == 0)   return p->pingpong;
     if (strcmp(m, "denied") == 0)     return p->denied;
     if (strcmp(m, "born") == 0)       return p->born;
@@ -799,6 +827,7 @@ static int setKnob(const char *k, const char *v)
     else if (strcmp(k, "high") == 0)         _vidmemHighMB = (NvU32)d;
     else if (strcmp(k, "copy_gbs") == 0)     gCopyGBs = d;
     else if (strcmp(k, "frag") == 0)         gFrag = d;
+    else if (strcmp(k, "longest") == 0)      gLongestMB = (NvU64)d;
     else if (strcmp(k, "autotick") == 0)     gAutoTick = (int)d;
     else if (strcmp(k, "hints") == 0)        gHintsActive = (int)d;
     else return 0;

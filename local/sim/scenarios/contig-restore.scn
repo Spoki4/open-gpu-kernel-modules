@@ -1,0 +1,38 @@
+# BACKLOG #15: contiguous buffers of the window in focus come back through a
+# cleared window, not by moving the game on the other monitor out. On the
+# host (2026-11-10 20:45) Chrome's 130 MB buffers sat in sysmem, 379 MB of WoW
+# went out "for the foreground again", and the buffers still did not fit
+# ("restore failed 4"): free bytes are no place for a contiguous buffer.
+cap 11000
+set longest 64
+proc 1614 kwin_wayland old
+proc 2617 chrome old chunk=16
+proc 12557 game old chunk=64
+
+act 1614 0 4
+mark the browser alone, focused: three contiguous buffers and ordinary memory
+hint 2617 f
+act 2617 0 20
+target 2617 600 0.8
+alloc 2617 390 n=3 contig   # 3 x 130 MB
+at 6
+
+mark the game takes the focus and nearly all of vidmem: the browser, hidden, pays
+hint 2617 h
+hint 12557 f
+act 12557 0 30
+act 2617 30 0
+target 12557 10850 0.75 spread=20
+at 40
+expect evicted 2617 >= 860
+
+mark back to the browser, the game stays visible on the other monitor and keeps drawing
+hint 12557 v
+hint 2617 f
+act 2617 0 20
+step
+at 60
+expect evicted 2617 == 0         # everything back, the contiguous buffers too
+expect windows 2617 >= 3         # each through a window cleared for it
+expect restorefails 2617 <= 3    # no retry storm
+expect moved_out 12557 <= 1600   # the game gives what the browser's ordinary memory needs, not 3 x 130 MB more
