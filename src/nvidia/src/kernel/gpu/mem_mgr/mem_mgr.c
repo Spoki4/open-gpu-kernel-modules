@@ -987,6 +987,8 @@ memmgrStateLoad_IMPL
     return NV_OK;
 }
 
+void vidmemEvictHotTeardown(OBJGPU *pGpu);   // local patch, mem_mgr/vidmem_evict.c
+
 NV_STATUS
 memmgrStatePreUnload_IMPL
 (
@@ -996,6 +998,9 @@ memmgrStatePreUnload_IMPL
 )
 {
     KernelMemorySystem *pKernelMemorySystem = GPU_GET_KERNEL_MEMORY_SYSTEM(pGpu);
+
+    // Local patch: the vidmem eviction's access counter buffer (re-created on demand).
+    vidmemEvictHotTeardown(pGpu);
     NV_ASSERT((flags & GPU_STATE_FLAGS_PRESERVING) || !_memmgrIsZbcSurfaceReferenced(pGpu, pMemoryManager));
 
     if ((flags & GPU_STATE_FLAGS_PRESERVING))
@@ -2290,6 +2295,8 @@ memmgrCalcReservedFbSpace_IMPL
 }
 
 
+void vidmemEvictFreeEvicted(OBJGPU *pGpu, MEMORY_DESCRIPTOR *pMemDesc); // local patch, mem_mgr/vidmem_evict.c
+
 NV_STATUS memmgrFree_IMPL
 (
     OBJGPU             *pGpu,
@@ -2334,6 +2341,14 @@ NV_STATUS memmgrFree_IMPL
         status = vaspaceFree(pVAS, offsetAlign);
         memdescDestroy(pMemDesc);
         return status;
+    }
+
+    // Local patch: an allocation moved to sysmem has no PMA pages left.
+    if (pMemDesc->pLocalEvictState != NULL)
+    {
+        vidmemEvictFreeEvicted(pGpu, pMemDesc);
+        memdescDestroy(pMemDesc);
+        return NV_OK;
     }
 
     // Free up the memory allocated by PMA.

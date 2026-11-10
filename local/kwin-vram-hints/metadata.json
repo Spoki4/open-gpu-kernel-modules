@@ -1,0 +1,11 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Description": "Tells the patched NVIDIA driver which processes have visible windows, so it keeps their video memory and moves hidden ones to system memory",
+        "Id": "nvidia-vram-hints",
+        "License": "MIT",
+        "Name": "NVIDIA VRAM window hints"
+    },
+    "X-Plasma-API": "declarativescript",
+    "X-Plasma-MainScript": "ui/main.qml"
+}

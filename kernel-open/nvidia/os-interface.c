@@ -860,6 +860,143 @@ void NV_API_CALL os_get_current_process_name(char *buf, NvU32 len)
     task_unlock(current);
 }
 
+// Local patch: comm of the thread group leader, i.e. the process name even
+// when the calling thread has renamed itself (vidmem user reserve).
+void NV_API_CALL os_get_current_process_leader_name(char *buf, NvU32 len)
+{
+    struct task_struct *leader = current->group_leader;
+
+    task_lock(leader);
+    if (strscpy(buf, leader->comm, len) < 0) {
+        // Truncation is acceptable, as in os_get_current_process_name().
+    }
+    task_unlock(leader);
+}
+
+//
+// Local patch: window state hints from the compositor (procfs vidmem_hints,
+// written by the KWin script local/kwin-vram-hints). A snapshot of
+// (pid, state) pairs; RM asks for a process's state with
+// os_get_vidmem_hint(), which falls back to the nearest ancestor that has
+// one: the GPU memory of Chrome, Electron or CEF apps is held by a child
+// (GPU) process, the windows by the browser process.
+//
+#define NV_VIDMEM_HINT_MAX   512
+#define NV_VIDMEM_HINT_DEPTH 6
+
+static DEFINE_SPINLOCK(nv_vidmem_hint_lock);
+static NvU32 nv_vidmem_hint_pid[NV_VIDMEM_HINT_MAX];
+static NvU8  nv_vidmem_hint_state[NV_VIDMEM_HINT_MAX];
+static NvU32 nv_vidmem_hint_count;
+static NvU32 nv_vidmem_hint_gen;
+
+void nv_vidmem_hints_set(const NvU32 *pids, const NvU8 *states, NvU32 count, NvBool bAppend);  // nv-procfs.c
+NvU32 nv_vidmem_hints_get(NvU32 *pids, NvU8 *states, NvU32 max, NvU32 *pGen);
+
+// bAppend: more lines of the snapshot started by an earlier write() of the
+// same open file (shell printf writes line by line).
+void nv_vidmem_hints_set(const NvU32 *pids, const NvU8 *states, NvU32 count, NvBool bAppend)
+{
+    unsigned long flags;
+    NvU32 base;
+
+    spin_lock_irqsave(&nv_vidmem_hint_lock, flags);
+    base = bAppend ? nv_vidmem_hint_count : 0;
+    count = min_t(NvU32, count, NV_VIDMEM_HINT_MAX - base);
+    memcpy(nv_vidmem_hint_pid + base, pids, count * sizeof(*pids));
+    memcpy(nv_vidmem_hint_state + base, states, count * sizeof(*states));
+    nv_vidmem_hint_count = base + count;
+    nv_vidmem_hint_gen++;
+    spin_unlock_irqrestore(&nv_vidmem_hint_lock, flags);
+}
+
+NvU32 nv_vidmem_hints_get(NvU32 *pids, NvU8 *states, NvU32 max, NvU32 *pGen)
+{
+    unsigned long flags;
+    NvU32 n;
+
+    spin_lock_irqsave(&nv_vidmem_hint_lock, flags);
+    n = min_t(NvU32, max, nv_vidmem_hint_count);
+    memcpy(pids, nv_vidmem_hint_pid, n * sizeof(*pids));
+    memcpy(states, nv_vidmem_hint_state, n * sizeof(*states));
+    *pGen = nv_vidmem_hint_gen;
+    spin_unlock_irqrestore(&nv_vidmem_hint_lock, flags);
+    return n;
+}
+
+static NvU32 nv_vidmem_hint_lookup(NvU32 pid)
+{
+    NvU32 i;
+
+    for (i = 0; i < nv_vidmem_hint_count; i++)
+    {
+        if (nv_vidmem_hint_pid[i] == pid)
+            return nv_vidmem_hint_state[i];
+    }
+    return 0;
+}
+
+//
+// State of `pid` (0 unknown, 1 hidden, 2 visible, 3 foreground) from its own
+// windows or those of its nearest ancestor with windows (then with bit 8 set:
+// inherited, and bit 9 too if that ancestor has another name: a program
+// started by a launcher, not a helper process of the same app); bit 10: that
+// process has a fullscreen window ("g"); bit 11: `pid` was started by
+// Steam's game launcher (an ancestor named "reaper": every Steam game, native
+// or Proton, runs under it). BACKLOG R4.
+// *pGen: snapshot generation (0: no snapshot was ever written, hints are off).
+//
+#define NV_VIDMEM_HINT_LAUNCHER_DEPTH 16
+NvU32 NV_API_CALL os_get_vidmem_hint(NvU32 pid, NvU32 *pGen)
+{
+    struct task_struct *task, *self;
+    unsigned long flags;
+    NvU32 state = 0, depth;
+
+    spin_lock_irqsave(&nv_vidmem_hint_lock, flags);
+    *pGen = nv_vidmem_hint_gen;
+    spin_unlock_irqrestore(&nv_vidmem_hint_lock, flags);
+    if (*pGen == 0)
+        return 0;
+
+    rcu_read_lock();
+    task = pid_task(find_pid_ns(pid, &init_pid_ns), PIDTYPE_PID);
+    self = task;
+    for (depth = 0; (task != NULL) && (depth < NV_VIDMEM_HINT_DEPTH); depth++)
+    {
+        spin_lock_irqsave(&nv_vidmem_hint_lock, flags);
+        state = nv_vidmem_hint_lookup(task->tgid);
+        spin_unlock_irqrestore(&nv_vidmem_hint_lock, flags);
+        if (state != 0)
+        {
+            state = (state & 3) | ((state & 4) ? 0x400 : 0);
+            if (depth != 0)
+            {
+                state |= 0x100;
+                if (strncmp(self->group_leader->comm, task->group_leader->comm, TASK_COMM_LEN) != 0)
+                    state |= 0x200;
+            }
+            break;
+        }
+        if (task->tgid <= 1)
+            break;
+        task = rcu_dereference(task->real_parent);
+    }
+    for (task = self, depth = 0; (task != NULL) && (depth < NV_VIDMEM_HINT_LAUNCHER_DEPTH); depth++)
+    {
+        if (strncmp(task->group_leader->comm, "reaper", TASK_COMM_LEN) == 0)
+        {
+            state |= 0x800;
+            break;
+        }
+        if (task->tgid <= 1)
+            break;
+        task = rcu_dereference(task->real_parent);
+    }
+    rcu_read_unlock();
+    return state;
+}
+
 NV_STATUS NV_API_CALL os_iommu_sva_bind(void *arg, void **handle, NvU32 *pasid)
 {
     nv_state_t *nv = arg;

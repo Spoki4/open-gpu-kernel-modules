@@ -43,6 +43,9 @@
 #include "gpu/mem_mgr/heap.h"
 #include "gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.h"
 
+// Local patch: vidmem_evict.c (BACKLOG #13).
+NvBool vidmemEvictMakeRoomForKernel(OBJGPU *pGpu, NvU32 pid, NvU64 size);
+
 /*
  * @brief Are memory pools supported for context buffers
  *
@@ -297,7 +300,21 @@ ctxBufPoolReserve
     {
         if (totalSize[i] > 0)
         {
-            NV_ASSERT_OK_OR_GOTO(status, rmMemPoolReserve(pCtxBufPool->pMemPool[i], totalSize[i], 0), done);
+            //
+            // Local patch (BACKLOG #13): vidmem full, or its free part in
+            // 64 KB holes: make room as for an allocation of the process that
+            // creates the channel (hidden processes move out; for the
+            // foreground also what its allocations may take) and try once
+            // more, instead of failing its channel (2026-11-06:
+            // xdg-desktop-portal-kde died with 35 MB free in 1 MB pieces).
+            //
+            status = rmMemPoolReserve(pCtxBufPool->pMemPool[i], totalSize[i], 0);
+            if ((status == NV_ERR_NO_MEMORY) &&
+                vidmemEvictMakeRoomForKernel(pGpu, osGetCurrentProcess(), totalSize[i]))
+            {
+                status = rmMemPoolReserve(pCtxBufPool->pMemPool[i], totalSize[i], 0);
+            }
+            NV_ASSERT_OK_OR_GOTO(status, status, done);
             NV_PRINTF(LEVEL_INFO, "Reserved 0x%llx bytes in pool with RM_ATTR_PAGE_SIZE_* = 0x%x\n", totalSize[i], i);
         }
     }

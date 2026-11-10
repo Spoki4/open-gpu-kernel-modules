@@ -2132,11 +2132,17 @@ pmaRegmapScanDiscontiguous
     // Handle restricted allocations
     if (rangeStart != 0 || rangeEnd != 0)
     {
+        //
+        // Local patch: pmaAllocatePages() requires physBegin/physEnd aligned
+        // as absolute addresses; rangeStart/rangeEnd are relative to the
+        // region base, which is not always page aligned (615.71.09 on
+        // GA102: region 0 starts at 0x5380000), so check the absolute ones.
         // Embedded % requires special handling.
-        NV_ASSERT_OR_ELSE_STR(rangeStart % pageSize == 0,
-            "rangeStart %% pageSize == 0", /*do nothing*/);
-        NV_ASSERT_OR_ELSE_STR((rangeEnd + 1) % pageSize == 0,
-            "(rangeEnd + 1) %% pageSize == 0", /*do nothing*/);
+        //
+        NV_ASSERT_OR_ELSE_STR((addrBase + rangeStart) % pageSize == 0,
+            "(addrBase + rangeStart) %% pageSize == 0", /*do nothing*/);
+        NV_ASSERT_OR_ELSE_STR((addrBase + rangeEnd + 1) % pageSize == 0,
+            "(addrBase + rangeEnd + 1) %% pageSize == 0", /*do nothing*/);
 
         localStart = rangeStart >> PMA_PAGE_SHIFT;
         localEnd   = NV_MIN(rangeEnd >> PMA_PAGE_SHIFT, pRegmap->totalFrames - 1);

@@ -69,6 +69,10 @@
 #include "resserv/rs_server.h"
 #include "resserv/rs_client.h"
 #include "resserv/rs_resource.h"
+#include "class/cl0040.h" // NV01_MEMORY_LOCAL_USER, for rm_vidmem_census()
+#include "class/cl0071.h" // NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, for rm_vidmem_census()
+#include "gpu/mem_mgr/heap.h" // for rm_vidmem_pma_info()
+#include "gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.h"
 #include "gpu/gpu_uuid.h"
 
 #include "platform/chipset/pci_pbi.h"
@@ -4923,6 +4927,325 @@ finish:
 
     NV_EXIT_RM_RUNTIME(sp,fp);
 
+    return status;
+}
+
+//
+// Local patch: vidmem census (read-only).
+//
+// Lists the vidmem allocations (NV01_MEMORY_LOCAL_USER objects in FBMEM) of
+// every RM client owned by process `pid`, and sorts them into what a later
+// eviction patch could move to sysmem and what it could not:
+//   shared     - DupCount > 1: also referenced by another client/process
+//                (e.g. window buffers handed to the compositor)
+//   compressed - compressible PTE kind; GA102 cannot map compressed sysmem
+//   cpu-mapped - has CPU (BAR1) mappings that would have to be redirected
+//   candidate  - private, uncompressed, not CPU-mapped
+// RM-internal allocations (GR context buffers, page tables) are not Memory
+// objects and do not show up here.
+//
+typedef struct
+{
+    NvU32 count;
+    NvU64 bytes;
+} RM_VIDMEM_CENSUS_BUCKET;
+
+// Per-allocation lines stop RM_CENSUS_SUMMARY_RESERVE bytes before the end of
+// the buffer so the summary always fits.
+#define RM_CENSUS_SUMMARY_RESERVE 2048
+
+#define RM_CENSUS_PRINTF(limit, ...)                                        \
+    do {                                                                    \
+        if (len + 1 < (limit))                                              \
+        {                                                                   \
+            int written = nvDbgSnprintf(buf + len, (limit) - len, __VA_ARGS__); \
+            if (written > 0)                                                \
+                len = NV_MIN(len + (NvU32)written, (limit) - 1);            \
+        }                                                                   \
+    } while (0)
+
+static void
+_rmCensusAdd(RM_VIDMEM_CENSUS_BUCKET *pBucket, NvU64 bytes)
+{
+    pBucket->count++;
+    pBucket->bytes += bytes;
+}
+
+NV_STATUS NV_API_CALL rm_vidmem_census(
+    nvidia_stack_t *sp,
+    nv_state_t     *nv,
+    NvU32           pid,
+    char           *buf,
+    NvU32           bufSize
+)
+{
+    THREAD_STATE_NODE        threadState;
+    void                    *fp;
+    RM_API                  *pRmApi;
+    OBJGPU                  *pGpu;
+    MemoryManager           *pMemoryManager;
+    RmClient               **ppClient;
+    RM_VIDMEM_CENSUS_BUCKET  total = {0}, candidate = {0}, compressed = {0};
+    RM_VIDMEM_CENSUS_BUCKET  cpuMapped = {0}, shared = {0};
+    RM_VIDMEM_CENSUS_BUCKET  page4K = {0}, page64K = {0}, page2M = {0}, pageOther = {0};
+    RM_VIDMEM_CENSUS_BUCKET  sysmem = {0}, sysmemOsDesc = {0};
+    NvU32                    len = 0;
+    NvU32                    clients = 0;
+    NvU32                    skipped = 0;
+    NvU32                    detailLimit;
+
+    if ((buf == NULL) || (bufSize < 2 * RM_CENSUS_SUMMARY_RESERVE))
+        return NV_ERR_INVALID_ARGUMENT;
+    buf[0] = '\0';
+    detailLimit = bufSize - RM_CENSUS_SUMMARY_RESERVE;
+
+    NV_ENTER_RM_RUNTIME(sp,fp);
+
+    pRmApi = RmUnixRmApiPrologue(nv, &threadState, RM_LOCK_MODULES_MEM);
+    if (pRmApi == NULL)
+    {
+        NV_EXIT_RM_RUNTIME(sp,fp);
+        return NV_ERR_INVALID_STATE;
+    }
+
+    pGpu = NV_GET_NV_PRIV_PGPU(nv);
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+
+    RM_CENSUS_PRINTF(detailLimit, "pid %u\n", pid);
+    RM_CENSUS_PRINTF(detailLimit, "# handle class type size_kb kind verdict dup owner cpu_maps gpu_maps page_kb contig\n");
+
+    for (ppClient = serverutilGetFirstClientUnderLock();
+         ppClient != NULL;
+         ppClient = serverutilGetNextClientUnderLock(ppClient))
+    {
+        RmClient    *pRmClient = *ppClient;
+        RsClient    *pRsClient = staticCast(pRmClient, RsClient);
+        RS_ITERATOR  iter;
+
+        if ((pRsClient->type == CLIENT_TYPE_KERNEL) || (pRmClient->ProcID != pid))
+            continue;
+
+        clients++;
+        RM_CENSUS_PRINTF(detailLimit, "client 0x%x name %s\n", pRsClient->hClient, pRmClient->name);
+
+        iter = serverutilRefIter(pRsClient->hClient, NV01_NULL_OBJECT, 0,
+                                 RS_ITERATE_DESCENDANTS, NV_TRUE);
+        while (clientRefIterNext(iter.pClient, &iter))
+        {
+            RsResourceRef     *pRef = iter.pResourceRef;
+            Memory            *pMemory = dynamicCast(pRef->pResource, Memory);
+            MEMORY_DESCRIPTOR *pMemDesc;
+            NvU32              kind;
+            NvU32              cpuMaps;
+            NvU32              gpuMaps;
+            NvU64              pageSize;
+            NvBool             bCompressed;
+            NvBool             bShared;
+            const char        *verdict;
+
+            //
+            // GPU-visible sysmem of the process (e.g. resources a game or
+            // vkd3d-proton placed in system memory): totals only.
+            //
+            if ((pMemory != NULL) && (pMemory->pMemDesc != NULL) &&
+                (memdescGetAddressSpace(pMemory->pMemDesc) == ADDR_SYSMEM) &&
+                pMemory->isMemDescOwner)
+            {
+                if (pRef->externalClassId == NV01_MEMORY_SYSTEM_OS_DESCRIPTOR)
+                    _rmCensusAdd(&sysmemOsDesc, pMemory->Length);
+                else
+                    _rmCensusAdd(&sysmem, pMemory->Length);
+                continue;
+            }
+
+            if ((pMemory == NULL) || (pMemory->pMemDesc == NULL) ||
+                (pRef->externalClassId != NV01_MEMORY_LOCAL_USER) ||
+                (pMemory->categoryClassId != NV01_MEMORY_LOCAL_USER))
+                continue;
+
+            pMemDesc = pMemory->pMemDesc;
+            if ((memdescGetAddressSpace(pMemDesc) != ADDR_FBMEM) ||
+                memdescGetFlag(pMemDesc, MEMDESC_FLAGS_LIST_MEMORY))
+                continue;
+
+            kind        = memdescGetPteKind(pMemDesc);
+            bCompressed = memmgrIsKind_HAL(pMemoryManager, FB_IS_KIND_COMPRESSIBLE, kind);
+            bShared     = (pMemDesc->DupCount > 1);
+            cpuMaps     = listCount(&pRef->cpuMappings);
+            gpuMaps     = listCount(&pRef->interBackRefsMappable);
+            pageSize    = memdescGetPageSize(pMemDesc, AT_GPU);
+
+            _rmCensusAdd(&total, pMemory->Length);
+            if (bShared)
+            {
+                verdict = "shared";
+                _rmCensusAdd(&shared, pMemory->Length);
+            }
+            else if (bCompressed)
+            {
+                verdict = "compressed";
+                _rmCensusAdd(&compressed, pMemory->Length);
+            }
+            else if (cpuMaps != 0)
+            {
+                verdict = "cpu-mapped";
+                _rmCensusAdd(&cpuMapped, pMemory->Length);
+            }
+            else
+            {
+                verdict = "candidate";
+                _rmCensusAdd(&candidate, pMemory->Length);
+            }
+
+            if (pageSize == RM_PAGE_SIZE)
+                _rmCensusAdd(&page4K, pMemory->Length);
+            else if (pageSize == RM_PAGE_SIZE_64K)
+                _rmCensusAdd(&page64K, pMemory->Length);
+            else if (pageSize == RM_PAGE_SIZE_HUGE)
+                _rmCensusAdd(&page2M, pMemory->Length);
+            else
+                _rmCensusAdd(&pageOther, pMemory->Length);
+
+            if (len + 256 >= detailLimit)
+            {
+                skipped++;
+                continue;
+            }
+
+            RM_CENSUS_PRINTF(detailLimit, "0x%x 0x%x %u %llu 0x%x %s %u %u %u %u %llu %u\n",
+                             RES_GET_HANDLE(pMemory), pRef->externalClassId,
+                             pMemory->Type, pMemory->Length >> 10, kind, verdict,
+                             pMemDesc->DupCount, pMemory->isMemDescOwner ? 1 : 0,
+                             cpuMaps, gpuMaps, pageSize >> 10,
+                             memdescGetContiguity(pMemDesc, AT_GPU) ? 1 : 0);
+        }
+    }
+
+    RmUnixRmApiEpilogue(nv, &threadState);
+
+    RM_CENSUS_PRINTF(bufSize, "summary: clients %u\n", clients);
+    RM_CENSUS_PRINTF(bufSize, "  total      %u allocs %llu MB\n", total.count, total.bytes >> 20);
+    RM_CENSUS_PRINTF(bufSize, "  candidate  %u allocs %llu MB\n", candidate.count, candidate.bytes >> 20);
+    RM_CENSUS_PRINTF(bufSize, "  compressed %u allocs %llu MB\n", compressed.count, compressed.bytes >> 20);
+    RM_CENSUS_PRINTF(bufSize, "  cpu-mapped %u allocs %llu MB\n", cpuMapped.count, cpuMapped.bytes >> 20);
+    RM_CENSUS_PRINTF(bufSize, "  shared     %u allocs %llu MB\n", shared.count, shared.bytes >> 20);
+    RM_CENSUS_PRINTF(bufSize, "  sysmem     %u allocs %llu MB (+ %u os-descriptor allocs %llu MB)\n",
+                     sysmem.count, sysmem.bytes >> 20, sysmemOsDesc.count, sysmemOsDesc.bytes >> 20);
+    RM_CENSUS_PRINTF(bufSize, "  pages 4K %llu MB, 64K %llu MB, 2M %llu MB, other %llu MB\n",
+                     page4K.bytes >> 20, page64K.bytes >> 20, page2M.bytes >> 20,
+                     pageOther.bytes >> 20);
+    if (skipped != 0)
+        RM_CENSUS_PRINTF(bufSize, "  (%u allocation lines not shown, buffer full)\n", skipped);
+
+    NV_EXIT_RM_RUNTIME(sp,fp);
+
+    return NV_OK;
+}
+
+//
+// Local patch: move a process's vidmem to sysmem and back
+// (mem_mgr/vidmem_evict.c). mode 0: dry run, 1: evict, 2: restore (pid),
+// 3: status, 4: automatic policy off/on (0/1), 5: shared-memory report (pid),
+// 6: remap trace off/on (0/1), 7: evict window buffers off/on (0/1).
+//
+NV_STATUS vidmemEvictProcess(OBJGPU *pGpu, NvU32 mode, NvU32 pid, char *buf,
+                             NvU32 bufSize, NvU32 *pLen);
+
+NV_STATUS NV_API_CALL rm_vidmem_evict(
+    nvidia_stack_t *sp,
+    nv_state_t     *nv,
+    NvU32           mode,
+    NvU32           pid,
+    char           *buf,
+    NvU32           bufSize
+)
+{
+    THREAD_STATE_NODE  threadState;
+    void              *fp;
+    RM_API            *pRmApi;
+    NvU32              len = 0;
+    NV_STATUS          status;
+
+    if ((buf == NULL) || (bufSize < 256) || (mode > 11))
+        return NV_ERR_INVALID_ARGUMENT;
+    buf[0] = '\0';
+
+    NV_ENTER_RM_RUNTIME(sp,fp);
+
+    pRmApi = RmUnixRmApiPrologue(nv, &threadState, RM_LOCK_MODULES_MEM);
+    if (pRmApi == NULL)
+    {
+        NV_EXIT_RM_RUNTIME(sp,fp);
+        return NV_ERR_INVALID_STATE;
+    }
+
+    status = vidmemEvictProcess(NV_GET_NV_PRIV_PGPU(nv), mode, pid, buf, bufSize, &len);
+
+    RmUnixRmApiEpilogue(nv, &threadState);
+    NV_EXIT_RM_RUNTIME(sp,fp);
+
+    return status;
+}
+
+//
+// Local patch: free vidmem and the largest physically contiguous free block
+// in PMA, plus the same for the bottom reserve block of the vidmem user
+// reserve (mem_mgr/video_mem.c), for /proc/driver/nvidia/gpus/<bdf>/vidmem_pma.
+// Scanout buffers are allocated PHYSICALITY_CONTIGUOUS (nvkms-kapi.c), so total
+// free memory alone does not say whether the compositor can still get one.
+// Takes the API lock for reading only, so polling it does not stall
+// allocations.
+//
+NvBool vidmemGetUserReserveBlockInfo(PMA *pPma, NvU64 *pBlockBytes, NvU64 *pFreeBytes,
+                                     NvU64 *pLargestFreeBytes);
+
+NV_STATUS NV_API_CALL rm_vidmem_pma_info(
+    nvidia_stack_t *sp,
+    nv_state_t     *nv,
+    NvU64          *pInfo,
+    NvU32           count
+)
+{
+    THREAD_STATE_NODE  threadState;
+    void              *fp;
+    OBJGPU            *pGpu;
+    Heap              *pHeap;
+    NvU64              info[RM_VIDMEM_PMA_INFO_COUNT] = {0};
+    NvU64              regionBase = 0;
+    NvU64              largestOffset = 0;
+    NV_STATUS          status = NV_OK;
+
+    if ((pInfo == NULL) || (count > RM_VIDMEM_PMA_INFO_COUNT))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    NV_ENTER_RM_RUNTIME(sp,fp);
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    if (rmapiLockAcquire(RMAPI_LOCK_FLAGS_READ, RM_LOCK_MODULES_MEM) != NV_OK)
+    {
+        status = NV_ERR_INVALID_STATE;
+        goto done;
+    }
+
+    pGpu = NV_GET_NV_PRIV_PGPU(nv);
+    pHeap = (pGpu != NULL && nv->rmapi.hClient != 0) ? GPU_GET_HEAP(pGpu) : NULL;
+    if ((pHeap == NULL) || (pHeap->pPmaObject == NULL))
+    {
+        status = NV_ERR_NOT_SUPPORTED;
+    }
+    else
+    {
+        pmaGetFreeMemory(pHeap->pPmaObject, &info[0]);
+        pmaGetLargestFree(pHeap->pPmaObject, &info[1], &regionBase, &largestOffset);
+        vidmemGetUserReserveBlockInfo(pHeap->pPmaObject, &info[2], &info[3], &info[4]);
+    }
+
+    rmapiLockRelease();
+done:
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    NV_EXIT_RM_RUNTIME(sp,fp);
+
+    portMemCopy(pInfo, count * sizeof(NvU64), info, count * sizeof(NvU64));
     return status;
 }
 

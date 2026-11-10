@@ -1288,6 +1288,13 @@ NvBool     NV_API_CALL rm_is_chipset_io_coherent(nv_stack_t *);
 NvBool     NV_API_CALL rm_init_event_locks(nvidia_stack_t *, nv_state_t *);
 void       NV_API_CALL rm_destroy_event_locks(nvidia_stack_t *, nv_state_t *);
 NV_STATUS  NV_API_CALL rm_get_gpu_numa_info(nvidia_stack_t *, nv_state_t *, nv_ioctl_numa_info_t *);
+NV_STATUS  NV_API_CALL rm_vidmem_census(nvidia_stack_t *, nv_state_t *, NvU32, char *, NvU32);
+/* rm_vidmem_pma_info() fills: free, largest contiguous free, reserve block size, its free, its largest free (bytes) */
+#define RM_VIDMEM_PMA_INFO_COUNT 5
+NV_STATUS  NV_API_CALL rm_vidmem_pma_info(nvidia_stack_t *, nv_state_t *, NvU64 *, NvU32);
+/* rm_vidmem_evict(): mode 0 dry run, 1 evict, 2 restore all eligible vidmem of a process, 3 status, 4 auto,
+   5 shared, 6 trace, 7 windows, 8 quiesce, 9 window hints changed (run the policy now); text result in buf */
+NV_STATUS  NV_API_CALL rm_vidmem_evict(nvidia_stack_t *, nv_state_t *, NvU32, NvU32, char *, NvU32);
 NV_STATUS  NV_API_CALL rm_gpu_numa_online(nvidia_stack_t *, nv_state_t *);
 NV_STATUS  NV_API_CALL rm_gpu_numa_offline(nvidia_stack_t *, nv_state_t *);
 NvBool     NV_API_CALL rm_is_device_sequestered(nvidia_stack_t *, nv_state_t *);

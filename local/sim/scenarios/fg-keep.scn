@@ -1,0 +1,76 @@
+# BACKLOG #6 and #9: apps moved out for the focused game stay out while the
+# game is near its limit (they used to come back every 30-60 s next to WoW and
+# go out again at the game's next allocation, a 30-40 ms frame each time; and
+# ghostty came back in the very step it was moved out in). They come back at
+# once when clicked, and by themselves when the game leaves room.
+cap 11000
+proc 1614 kwin_wayland old
+proc 1625 plasmashell old
+proc 2094 ghostty old chunk=8           # visible on monitor 2, idle
+proc 9000 claude-desktop old chunk=16   # visible on monitor 2, draws now and then
+proc 2378 bottles old chunk=8           # hidden
+proc 5000 game chunk=64
+
+hint 1625 v
+hint 2094 v
+hint 9000 v
+hint 2378 h
+act 1614 0 4
+act 1625 0 4
+act 2094 60 0
+act 9000 60 0
+act 2378 300 0
+target 1614 280 0.75
+target 1625 480 0.4
+target 2094 250 0.6
+target 9000 600 0.7
+target 2378 300 0.8
+at 10
+
+mark the game starts focused and takes nearly all of vidmem
+hint 5000 f
+act 5000 0 30
+target 5000 4000 0.75 spread=10
+at 20
+target 5000 8800 0.75 spread=20
+at 60
+expect sys 5000 == 0
+expect evicted 2378 > 0          # the hidden one paid first
+expect evicted 9000 > 0          # then visible idle ones, for the focused game
+
+mark the game keeps streaming near its limit; the terminal draws a little now and then
+act 9000 1 2
+act 2094 1 2
+at 70
+act 9000 60 0
+act 2094 60 0
+target 5000 8900 0.75 spread=60
+at 130
+target 5000 8800 0.75 spread=60
+at 190
+expect pingpong 2094 == 0        # nobody came back to be moved out again
+expect pingpong 9000 == 0
+expect restores 9000 == 0        # not while the game is near its limit
+expect restores 2094 == 0
+
+mark the user clicks Claude on monitor 2: it comes back at once
+hint 5000 v
+hint 9000 f
+act 9000 0 4
+step
+at 192
+expect sys 9000 == 0
+mark back to the game
+hint 9000 v
+act 9000 30 0
+hint 5000 f
+step
+at 194
+expect sys 5000 == 0
+
+mark the game quits: the rest comes back
+free 5000 8800
+hint 5000 -
+at 260
+expect sys 2094 == 0
+expect sys 9000 == 0

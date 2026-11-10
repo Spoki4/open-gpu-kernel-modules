@@ -1,0 +1,76 @@
+# BACKLOG R and #7: the focused window comes first.
+#  - #7: Chrome focused on monitor 2 next to a fullscreen game drawing on
+#    monitor 1 gets its WebGPU memory: the game gives what is needed, not
+#    more (it was denied and the page died next to CoD).
+#  - R3: the window focused before the current one keeps its memory against
+#    the foreground's headroom (alt-tab back is instant); older ones go first.
+#  - R5: when the focused game finds nothing else, a video drawing on the
+#    other monitor gives what the game needs (the game wins), and only that.
+cap 11000
+proc 1614 kwin_wayland old
+proc 1625 plasmashell old
+proc 2589 chrome old chunk=16       # monitor 2
+proc 9000 claude-desktop old chunk=16
+proc 3877 spotify old chunk=16
+proc 3000 mpv old chunk=16          # a video playing on monitor 2 all along
+proc 5000 game chunk=64             # fullscreen on monitor 1
+
+hint 1625 v
+hint 2589 v
+hint 9000 f
+hint 3877 h
+hint 3000 v
+act 1614 0 4
+act 1625 0 4
+act 2589 60 0
+act 9000 0 4
+act 3877 600 0
+act 3000 0 4
+target 1614 280 0.75
+target 1625 480 0.4
+target 2589 600 0.7
+target 9000 700 0.7
+target 3877 400 0.8
+target 3000 200 0.8
+at 10
+
+mark the user works in Claude, then starts the game (Claude is now the previous window)
+hint 9000 h
+act 9000 30 0
+hint 5000 f full
+act 5000 0 30
+step
+target 5000 4000 0.75 spread=10
+at 20
+target 5000 8400 0.75 spread=30
+at 60
+expect sys 5000 == 0
+expect evicted 3877 > 0           # the hidden one focused never gave first
+expect evicted 9000 == 0          # the previous window kept its memory
+expect sys 2589 > 0               # Chrome (visible, idle) gave for the game
+
+mark the user clicks Chrome on monitor 2: a WebGPU page needs 1.2 GB more, more than the others hold
+hint 5000 v full
+act 5000 0 30
+hint 2589 f
+act 2589 0 4
+step
+at 62
+target 2589 1800 0.7 spread=4
+at 70
+expect denied 2589 == 0           # #7: no denial for the focused page
+expect evicted 5000 > 0           # the game gave what the others did not have...
+expect evicted 5000 <= 900        # ...and about only that
+expect sys 2589 == 0
+
+mark back to the game, which then streams in more than the idle ones hold
+hint 2589 v
+act 2589 30 0
+hint 5000 f full
+step
+at 80
+target 5000 9300 0.75 spread=20
+at 110
+expect sys 5000 == 0
+expect denied 5000 == 0           # R5: the game got it, the video gave last
+expect evicted 3000 > 0
