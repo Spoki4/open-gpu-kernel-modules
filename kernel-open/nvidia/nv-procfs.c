@@ -366,6 +366,7 @@ static const nv_proc_ops_t nv_procfs_vidmem_census_fops = {
 //
 //   echo "dry 1234"     > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
 //   echo "evict 1234"   > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
+//   echo "move 1234" > ... (to other vidmem pages, BACKLOG #16)
 //   echo "restore 1234" > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
 //   echo "status"       > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
 //   echo "auto 0"       > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict  (1: on)
@@ -456,6 +457,8 @@ nv_procfs_write_vidmem_evict(
         mode = 10;
     else if (strcmp(cmd, "trace-lock") == 0)
         mode = 11;
+    else if (strcmp(cmd, "move") == 0)
+        mode = 12;
     else
         return -EINVAL;
 

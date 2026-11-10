@@ -698,6 +698,8 @@ _vidmemEvictCollectHolders
 // Fills pRefs with the GPU mappings of the allocation pRef (in any holder);
 // returns NULL when it can be moved, else the reason it cannot.
 //
+#define VE_MODE_NAME(mode) (((mode) == 1) ? "evict" : (((mode) == 2) ? "restore" : "move"))
+
 static const char *
 _vidmemEvictCheck
 (
@@ -1700,6 +1702,184 @@ _vidmemRestoreCommit(OBJGPU *pGpu, MEMORY_DESCRIPTOR *pMemDesc, VIDMEM_EVICT_MAP
 }
 
 //
+// Move an allocation to other vidmem pages without the detour through sysmem
+// (BACKLOG #16: compaction, and room for contiguous requests without taking
+// the memory out of vidmem). Channels of the owner disabled, no mapping of
+// the compositor (the caller skips those). New pages outside [avoidLo,
+// avoidHi) when that is given (the window being cleared), one CE copy from
+// the old pages to the new ones through the FB alias, the mappings remade at
+// their VAs on the new pages with their kinds, the old pages back to PMA.
+//
+static NV_STATUS
+_vidmemRelocate
+(
+    OBJGPU              *pGpu,
+    MEMORY_DESCRIPTOR   *pMemDesc,
+    VIDMEM_EVICT_MAPREF *pRefs,
+    NvU32                numRefs,
+    NvU64                avoidLo,
+    NvU64                avoidHi
+)
+{
+    MemoryManager      *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    PMA_ALLOC_INFO     *pPmaInfo = pMemDesc->pPmaAllocInfo;
+    PMA                *pPma = pMemDesc->pHeap->pPmaObject;
+    PMA_ALLOCATION_OPTIONS allocOptions = {0};
+    CEUTILS_MEMCOPY_PARAMS copyParams = {0};
+    MEMORY_DESCRIPTOR  *pOld = NULL;
+    NvU64              *pNewPages = NULL, *pOldPages = NULL;
+    NvU32              *pKinds = NULL;
+    NvU32               numPages = pPmaInfo->bContig ? 1 : pPmaInfo->pageCount;
+    NvU64               maxMapPageSize = 0;
+    NvU32               bar1Refs = 0, i, try;
+    NvBool              bRemapFailed = NV_FALSE;
+    NV_STATUS           status;
+    VE_PHASE_BEGIN();
+
+    pNewPages = portMemAllocNonPaged(sizeof(NvU64) * pPmaInfo->pageCount);
+    pOldPages = portMemAllocNonPaged(sizeof(NvU64) * numPages);
+    pKinds    = portMemAllocNonPaged(sizeof(NvU32) * NV_MAX(numRefs, 1));
+    if ((pNewPages == NULL) || (pOldPages == NULL) || (pKinds == NULL))
+    {
+        status = NV_ERR_NO_MEMORY;
+        goto done;
+    }
+    for (i = 0; i < numRefs; i++)
+    {
+        maxMapPageSize = NV_MAX(maxMapPageSize, pRefs[i].pDmaMappingInfo->mapPageSize);
+        pKinds[i] = memdescGetPteKind(pRefs[i].pDmaMappingInfo->pMemDesc);
+    }
+
+    // New pages, as a restore takes them (pinned; see _vidmemRestoreBegin()).
+    allocOptions.flags     = PMA_ALLOCATE_FORCE_ALIGNMENT | PMA_ALLOCATE_PINNED |
+                             (pPmaInfo->flags & PMA_ALLOCATE_PERSISTENT);
+    allocOptions.alignment = pPmaInfo->pageSize;
+    if (pPmaInfo->bContig)
+    {
+        allocOptions.flags    |= PMA_ALLOCATE_CONTIGUOUS;
+        allocOptions.alignment = NV_MAX(NV_MAX(pPmaInfo->pageSize, maxMapPageSize),
+                                        NV_MAX(pMemDesc->Alignment, RM_PAGE_SIZE));
+    }
+    status = NV_ERR_NO_MEMORY;
+    for (try = 0; (try < 2) && (status != NV_OK); try++)
+    {
+        PMA_ALLOCATION_OPTIONS opt = allocOptions;
+
+        if (avoidHi != 0)
+        {
+            // Below the window, then above it.
+            opt.flags    |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
+            opt.physBegin = (try == 0) ? 0 : NV_ALIGN_UP64(avoidHi, opt.alignment);
+            opt.physEnd   = (try == 0) ? NV_ALIGN_DOWN64(avoidLo, opt.alignment) :
+                                         NV_ALIGN_DOWN64(NV_U64_MAX, opt.alignment);
+            if (opt.physEnd <= opt.physBegin)
+                continue;
+            opt.physEnd -= 1;
+        }
+        else
+        {
+            if (try != 0)
+                break;
+            if (vidmemUserReserveBoundRangeAny(pPma, opt.alignment, &opt.physBegin, &opt.physEnd))
+                opt.flags |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
+        }
+        status = pmaAllocatePages(pPma, pPmaInfo->pageCount, pPmaInfo->pageSize, &opt, pNewPages);
+    }
+    VE_PHASE_END(VE_PH_PMA);
+    if (status != NV_OK)
+        goto done;
+
+    // The old pages: a snapshot memdesc to copy from, the list to free.
+    status = memdescCreateSubMem(&pOld, pMemDesc, pGpu, 0, memdescGetSize(pMemDesc));
+    if (status != NV_OK)
+    {
+        pmaFreePages(pPma, pNewPages, numPages, pPmaInfo->bContig ? pPmaInfo->allocSize : pPmaInfo->pageSize, 0);
+        goto done;
+    }
+    portMemCopy(pOldPages, sizeof(NvU64) * numPages, pPmaInfo->pageArray, sizeof(NvU64) * numPages);
+    _vidmemEvictDropStaticBar1(pGpu, pMemDesc, &bar1Refs);
+
+    // The allocation is the new pages from here on.
+    if (pPmaInfo->bContig)
+    {
+        NV_ASSERT(pMemDesc->PteAdjust == 0);
+        pPmaInfo->pageArray[0] = pNewPages[0];
+        pMemDesc->_pteArray[0] = pNewPages[0];
+    }
+    else
+    {
+        portMemCopy(pPmaInfo->pageArray, sizeof(NvU64) * numPages, pNewPages, sizeof(NvU64) * numPages);
+        memdescFillPages(pMemDesc, 0, pPmaInfo->pageArray, pPmaInfo->pageCount, pPmaInfo->pageSize);
+    }
+    for (i = 0; i < bar1Refs; i++)
+    {
+        status = kbusIncreaseStaticBar1Refcount_HAL(pGpu, GPU_GET_KERNEL_BUS(pGpu), pMemDesc,
+                                                    BUS_MAP_FB_FLAGS_NONE);
+        if ((status != NV_OK) && (status != NV_ERR_NOT_SUPPORTED))
+            NV_PRINTF(LEVEL_ERROR, "vidmem evict: static BAR1 reference on move: 0x%x\n", status);
+    }
+    VE_PHASE_END(VE_PH_PMA);
+
+    copyParams.pSrcMemDesc = pOld;
+    copyParams.pDstMemDesc = pMemDesc;
+    copyParams.length      = memdescGetSize(pMemDesc);
+    status = ceutilsMemcopy(pMemoryManager->pCeUtils, &copyParams);
+    VE_PHASE_END(VE_PH_COPY);
+    if (status != NV_OK)
+    {
+        // Nothing points at the new pages yet: back to the old ones.
+        NV_PRINTF(LEVEL_ERROR, "vidmem evict: move copy failed: 0x%x\n", status);
+        _vidmemEvictDropStaticBar1(pGpu, pMemDesc, NULL);
+        _vidmemEvictFreePma(pMemDesc);
+        if (pPmaInfo->bContig)
+        {
+            pPmaInfo->pageArray[0] = pOldPages[0];
+            pMemDesc->_pteArray[0] = pOldPages[0];
+        }
+        else
+        {
+            portMemCopy(pPmaInfo->pageArray, sizeof(NvU64) * numPages, pOldPages, sizeof(NvU64) * numPages);
+            memdescFillPages(pMemDesc, 0, pPmaInfo->pageArray, pPmaInfo->pageCount, pPmaInfo->pageSize);
+        }
+        for (i = 0; i < bar1Refs; i++)
+            (void)kbusIncreaseStaticBar1Refcount_HAL(pGpu, GPU_GET_KERNEL_BUS(pGpu), pMemDesc, BUS_MAP_FB_FLAGS_NONE);
+        goto done;
+    }
+
+    //
+    // Old and new pages hold the same data now (the channels are stopped), so
+    // a mapping may point at either until all are remade. One that could not
+    // be remade keeps the old pages: then they are not given back (a leak,
+    // not a mapping of somebody else's memory).
+    //
+    for (i = 0; i < numRefs; i++)
+    {
+        NV_STATUS st = _vidmemEvictRemapOne(pGpu, &pRefs[i], pMemDesc, pKinds[i]);
+
+        if (st != NV_OK)
+        {
+            bRemapFailed = NV_TRUE;
+            status = st;
+        }
+    }
+    VE_PHASE_END(VE_PH_REMAP);
+    if (bRemapFailed)
+        NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: move: a mapping was not remade (0x%x), %llu KB of old pages are not freed\n",
+                  status, memdescGetSize(pMemDesc) >> 10);
+    else
+        pmaFreePages(pPma, pOldPages, numPages, pPmaInfo->bContig ? pPmaInfo->allocSize : pPmaInfo->pageSize, 0);
+    VE_PHASE_END(VE_PH_PMA);
+
+done:
+    if (pOld != NULL)
+        memdescDestroy(pOld);
+    portMemFree(pNewPages);
+    portMemFree(pOldPages);
+    portMemFree(pKinds);
+    return status;
+}
+
+//
 // memmgrFree() of a holder of an evicted allocation (the client freed it, or
 // exited). Like vidmemPmaFree(): one PMA reference per holder; with the last
 // one the sysmem copy goes instead of the (long gone) PMA pages. GPU lock held.
@@ -2087,7 +2267,7 @@ _vidmemEvictPidLocked
     // Fragmentation before the batch (VMT_FRAG after it, BACKLOG #16).
     bFrag = (mode != 0) && osVidmemTraceOn(VMT_FRAG) && _vidmemFragStats(pGpu, &fragBefore);
 
-    EVICT_PRINTF("%s pid %u\n", (mode == 0) ? "dry" : ((mode == 1) ? "evict" : "restore"), pid);
+    EVICT_PRINTF("%s pid %u\n", (mode == 0) ? "dry" : VE_MODE_NAME(mode), pid);
     _vidmemEvictCurPid = pid;
     pChannels->vmtPid = pid;
 
@@ -2274,11 +2454,26 @@ _vidmemEvictPidLocked
                         continue;
                 }
 
-                status = _vidmemEvictBegin(pGpu, pMemDesc, pRefs, numRefs, &pState);
-                if ((status == NV_OK) && _vidmemEvictHasCompositor(pRefs, numRefs))
-                    bPending = NV_TRUE;
-                else if (status == NV_OK)
-                    status = _vidmemEvictCommit(pGpu, pMemDesc, pState, pRefs, numRefs);
+                if (mode == 3)
+                {
+                    // What the compositor maps too stays where it is (its channels are not stopped here).
+                    if (_vidmemEvictHasCompositor(pRefs, numRefs))
+                    {
+                        skipped++;
+                        skippedBytes += bytes;
+                        continue;
+                    }
+                    status = _vidmemRelocate(pGpu, pMemDesc, pRefs, numRefs,
+                                             _vidmemEvictRangeLo, _vidmemEvictRangeHi);
+                }
+                else
+                {
+                    status = _vidmemEvictBegin(pGpu, pMemDesc, pRefs, numRefs, &pState);
+                    if ((status == NV_OK) && _vidmemEvictHasCompositor(pRefs, numRefs))
+                        bPending = NV_TRUE;
+                    else if (status == NV_OK)
+                        status = _vidmemEvictCommit(pGpu, pMemDesc, pState, pRefs, numRefs);
+                }
             }
 
             if (bPending)
@@ -2315,7 +2510,7 @@ _vidmemEvictPidLocked
                 failed++;
                 failedBytes += bytes;
                 EVICT_PRINTF("0x%x %llu KB %s failed 0x%x\n", RES_GET_HANDLE(pMemory), bytes >> 10,
-                             (mode == 1) ? "evict" : "restore", status);
+                             VE_MODE_NAME(mode), status);
             }
         }
     }
@@ -2361,7 +2556,7 @@ _vidmemEvictPidLocked
                 failed++;
                 failedBytes += bytes;
                 EVICT_PRINTF("0x%x %llu KB %s (shared with compositor) failed 0x%x\n", pP->hMemory,
-                             bytes >> 10, (mode == 1) ? "evict" : "restore", st);
+                             bytes >> 10, VE_MODE_NAME(mode), st);
             }
             portMemFree(pP->pRefs);
         }
@@ -2384,7 +2579,7 @@ _vidmemEvictPidLocked
     status = NV_OK;
 
     EVICT_PRINTF("summary: %s %u allocs %llu MB (shared %u, %llu MB), failed %u (%llu MB), not eligible %u (%llu MB), %llu ms\n",
-                 (mode == 0) ? "eligible" : ((mode == 1) ? "evicted" : "restored"),
+                 (mode == 0) ? "eligible" : ((mode == 1) ? "evicted" : ((mode == 2) ? "restored" : "moved")),
                  moved, movedBytes >> 20, shared, sharedBytes >> 20, failed, failedBytes >> 20,
                  skipped, skippedBytes >> 20, (VMT_NOW() - startNs) / 1000000);
     EVICT_PRINTF("phases ms: quiesce %llu, sysmem alloc %llu, copy %llu, remap %llu, pma %llu, sysmem free %llu\n",
@@ -2409,7 +2604,7 @@ _vidmemEvictPidLocked
         _vidmemFragTrace(pGpu, mode, _vidmemEvictWhy, pid, &fragBefore);
     if ((mode != 0) && ((moved != 0) || (failed != 0)))
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: %s pid %u: %u allocs %llu MB (%u with the compositor), failed %u, %llu ms; total %llu MB\n",
-                  (mode == 1) ? "evict" : "restore", pid, moved, movedBytes >> 20, numPending, failed,
+                  VE_MODE_NAME(mode), pid, moved, movedBytes >> 20, numPending, failed,
                   (VMT_NOW() - startNs) / 1000000, _vidmemEvictBytes >> 20);
     if (pMovedBytes != NULL)
         *pMovedBytes = movedBytes;
@@ -3510,10 +3705,42 @@ _vidmemEvictChunkInfo(PMA *pPma, NvU64 *pFree, NvU64 *pLongest)
     return NV_TRUE;
 }
 
+// Does `pid` hold a movable-looking allocation with a page in the window being cleared?
+static NvBool
+_vidmemPidHasInRange(NvU32 pid)
+{
+    RmClient **ppClient;
+
+    for (ppClient = serverutilGetFirstClientUnderLock(); ppClient != NULL;
+         ppClient = serverutilGetNextClientUnderLock(ppClient))
+    {
+        RsClient   *pRsClient = staticCast(*ppClient, RsClient);
+        RS_ITERATOR iter;
+
+        if ((pRsClient->type == CLIENT_TYPE_KERNEL) || ((*ppClient)->ProcID != pid))
+            continue;
+        iter = serverutilRefIter(pRsClient->hClient, NV01_NULL_OBJECT, 0, RS_ITERATE_DESCENDANTS, NV_TRUE);
+        while (clientRefIterNext(iter.pClient, &iter))
+        {
+            Memory *pMemory = dynamicCast(iter.pResourceRef->pResource, Memory);
+
+            if ((pMemory != NULL) && (pMemory->pMemDesc != NULL) &&
+                (iter.pResourceRef->externalClassId == NV01_MEMORY_LOCAL_USER) &&
+                (pMemory->pMemDesc->pLocalEvictState == NULL) &&
+                _vidmemMemDescInRange(pMemory->pMemDesc, _vidmemEvictRangeLo, _vidmemEvictRangeHi))
+                return NV_TRUE;
+        }
+    }
+    return NV_FALSE;
+}
+
+static NvU64 _vidmemContigInVidmemMB;   // moved inside vidmem by window clearing, in all (status)
+
 static NvBool
 _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
                        NvU64 *pMovedMB)
 {
+    NvU64   inVidmem = 0, *pInVidmemMB = &inVidmem;
     Heap   *pHeap = GPU_GET_HEAP(pGpu);
     PMA    *pPma = (pHeap != NULL) ? pHeap->pPmaObject : NULL;
     NvU64   base = 0, frames = 0, largest = 0, words, chunks, need, off, freeChunks, longest;
@@ -3599,33 +3826,23 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     _vidmemEvictRangeHi = _vidmemEvictRangeLo + (need << 21);
     for (i = 0; i < count; i++)
     {
-        RmClient **ppClient;
-        NvBool     bHas = NV_FALSE;
-        NvU64      moved = 0;
+        NvU64 moved = 0;
 
-        if (!_vidmemEvictHintVictimOk(&pProcs[i], 0, nowNs, VE_LEVEL_COMPOSITOR))
+        if (!_vidmemEvictHintVictimOk(&pProcs[i], 0, nowNs, VE_LEVEL_COMPOSITOR) ||
+            !_vidmemPidHasInRange(pProcs[i].pid))
             continue;
-        for (ppClient = serverutilGetFirstClientUnderLock(); (ppClient != NULL) && !bHas;
-             ppClient = serverutilGetNextClientUnderLock(ppClient))
-        {
-            RsClient   *pRsClient = staticCast(*ppClient, RsClient);
-            RS_ITERATOR iter;
-
-            if ((pRsClient->type == CLIENT_TYPE_KERNEL) || ((*ppClient)->ProcID != pProcs[i].pid))
-                continue;
-            iter = serverutilRefIter(pRsClient->hClient, NV01_NULL_OBJECT, 0, RS_ITERATE_DESCENDANTS, NV_TRUE);
-            while (!bHas && clientRefIterNext(iter.pClient, &iter))
-            {
-                Memory *pMemory = dynamicCast(iter.pResourceRef->pResource, Memory);
-
-                bHas = (pMemory != NULL) && (pMemory->pMemDesc != NULL) &&
-                       (iter.pResourceRef->externalClassId == NV01_MEMORY_LOCAL_USER) &&
-                       (pMemory->pMemDesc->pLocalEvictState == NULL) &&
-                       _vidmemMemDescInRange(pMemory->pMemDesc, _vidmemEvictRangeLo, _vidmemEvictRangeHi);
-            }
-        }
-        if (!bHas)
+        //
+        // To other vidmem pages first (BACKLOG #16, #15: Chrome's contiguous
+        // buffers pushed the game's memory out to sysmem, which then ran from
+        // there until a restore); to sysmem what is left in the window: what
+        // the compositor maps too, or when no vidmem outside it is free.
+        //
+        (void)_vidmemEvictPidLocked(pGpu, 3, pProcs[i].pid, NULL, 0, NULL, &moved);
+        *pMovedMB += moved >> 20;
+        *pInVidmemMB += moved >> 20;
+        if (!_vidmemPidHasInRange(pProcs[i].pid))
             continue;
+        moved = 0;
         (void)_vidmemEvictPidLocked(pGpu, 1, pProcs[i].pid, NULL, 0, NULL, &moved);
         *pMovedMB += moved >> 20;
     }
@@ -3636,6 +3853,9 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     portMemSet(pMovable, 0, words * sizeof(NvU64));
     bOk = (pUsed != NULL) &&
           (_vidmemEvictBestWindow(pUsed, pMovable, pCost, base, off, chunks, need, align, NULL) == 0);
+    _vidmemContigInVidmemMB += inVidmem;
+    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: window %s: %llu MB moved, %llu of them inside vidmem\n",
+              bOk ? "cleared" : "not cleared", *pMovedMB, inVidmem);
 
 done:
     portMemFree(pUsed);
@@ -3962,6 +4182,8 @@ _vidmemEvictPrintBlock(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
                      "room made for the compositor %u times (%u failed), %llu MB moved, longest %llu us\n",
                      largest >> 20, _vidmemBgCushionMB, _vidmemCompRooms, _vidmemCompRoomFails,
                      _vidmemCompRoomMovedMB, _vidmemCompRoomMaxNs / 1000);
+        EVICT_PRINTF("windows cleared for contiguous allocations: %llu MB moved inside vidmem\n",
+                     _vidmemContigInVidmemMB);
         if (_vidmemFragStats(pGpu, &fr))
             EVICT_PRINTF("fragmentation: free %llu MB of %llu; in whole 2 MB chunks %llu MB in %u runs "
                          "(%u of 32 MB or more, %u of 128 MB or more, longest %llu MB); in holes %llu MB "
@@ -4206,7 +4428,10 @@ vidmemEvictProcess
     if (status != NV_OK)
         return status;
 
-    if (mode <= 2)
+    // 12: move inside vidmem (BACKLOG #16), mode 3 of _vidmemEvictPidLocked().
+    if (mode == 12)
+        status = _vidmemEvictPidLocked(pGpu, 3, arg, buf, bufSize, pLen, NULL);
+    else if (mode <= 2)
     {
         _vidmemEvictWhy = VMT_WHY_MANUAL;
         status = _vidmemEvictPidLocked(pGpu, mode, arg, buf, bufSize, pLen, NULL);

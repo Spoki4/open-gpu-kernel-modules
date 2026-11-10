@@ -71,7 +71,7 @@ TRACE_EVENT(vidmem_move,
     TP_printk("op=%s pid=%u comm=%s why=%s kb=%llu allocs=%u failed=%u shared=%u channels=%u "
               "total_us=%llu quiesce_us=%llu sysalloc_us=%llu copy_us=%llu remap_us=%llu "
               "pma_us=%llu sysfree_us=%llu",
-              (__entry->op == 1) ? "evict" : "restore", __entry->pid, __entry->comm,
+              (__entry->op == 1) ? "evict" : ((__entry->op == 2) ? "restore" : "move"), __entry->pid, __entry->comm,
               __print_symbolic(__entry->why, NV_VMT_WHY), __entry->kb, __entry->allocs,
               __entry->failed, __entry->shared, __entry->channels, __entry->total_us,
               __entry->quiesce_us, __entry->sysalloc_us, __entry->copy_us, __entry->remap_us,
