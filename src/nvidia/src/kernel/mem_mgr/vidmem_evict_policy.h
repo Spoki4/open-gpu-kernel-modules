@@ -28,12 +28,13 @@
 #define VIDMEM_EVICT_QUIET_SEC      30
 // A hidden process comes back by itself only after it would have fitted for this long.
 #define VIDMEM_EVICT_HIDDEN_BACK_SEC 300
-// Background compaction: the free run to keep (MB; knob "compact", 0: off), MB
-// moved per policy step (less next to a focused game: each step holds the RM
-// locks for its copy), and the pause after a step that had nothing to do.
+// Background compaction: the free run to keep (MB; knob "compact", 0: off;
+// three quarters of the free memory when that is more), MB moved per policy
+// step (each step holds the RM locks for its copy and pauses the owners), and
+// the pause after a step that had nothing to do (doubles up to 15 min while
+// nothing changes).
 #define VIDMEM_EVICT_COMPACT_RUN_MB   1024
 #define VIDMEM_EVICT_COMPACT_STEP_MB  32
-#define VIDMEM_EVICT_COMPACT_GAME_MB  8
 // (not a round number: a 30 s rest met a process that works every 30 s each time)
 #define VIDMEM_EVICT_COMPACT_REST_SEC 14
 extern NvU32 _vidmemCompactRunMB;

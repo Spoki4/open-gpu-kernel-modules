@@ -85,14 +85,21 @@ reload() {
         sleep 1
         holders=$(gpu_holders)
     fi
-    if [[ -n $holders ]]; then
+    # Whoever is left (started over ssh, outside the session). Several rounds:
+    # Steam started that way restarts its helpers while it is being killed,
+    # and one round left nvidia_drm in use (2026-11-10).
+    local round
+    for round in 1 2 3 4 5; do
+        [[ -n $holders ]] || break
         # shellcheck disable=SC2086
         kill $holders 2>/dev/null || true
         sleep 2
         holders=$(gpu_holders)
         # shellcheck disable=SC2086
-        [[ -z $holders ]] || { kill -9 $holders 2>/dev/null || true; sleep 1; }
-    fi
+        [[ -z $holders ]] || { kill -9 $holders 2>/dev/null || true; sleep 1; holders=$(gpu_holders); }
+    done
+    # shellcheck disable=SC2086
+    [[ -z $holders ]] || echo "still holding the GPU: $(ps -o pid=,comm= -p $holders | tr '\n' ';')" >&2
     local m
     for m in "${UNLOAD[@]}"; do
         grep -q "^$m " /proc/modules || continue

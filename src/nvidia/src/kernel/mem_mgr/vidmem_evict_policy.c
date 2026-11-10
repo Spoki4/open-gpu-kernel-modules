@@ -127,6 +127,8 @@ NvU32  _vidmemHighMB = 2560;
 NvU64  _vidmemLastPressureNs;
 NvU32  _vidmemCompactRunMB = VIDMEM_EVICT_COMPACT_RUN_MB;
 static NvU64 _vidmemCompactRestNs;   // no compaction step before this (monotonic ns)
+static NvU32 _vidmemCompactIdleSteps; // steps in a row that had nothing to do (the rest doubles)
+static NvU32 _vidmemCompactRunSeenMB; // the knob at the last step (a new value: try at once)
 NvU32  _vidmemBusiestPid;          // updated every tick
 NvU64  _vidmemBusiestSinceNs;      // since when it is the busiest without a break
 NvU64  _vidmemBornBytes;           // allocations created in sysmem
@@ -1123,15 +1125,32 @@ vepPolicyStep(OBJGPU *pGpu)
         // (BACKLOG #16), so a contiguous request finds its window instead of
         // waiting for one to be cleared.
         //
-        if ((moves == _vidmemPolicyMoves) && (evicted == _vidmemEvictBytes) && (_vidmemCompactRunMB != 0) &&
-            (nowNs >= _vidmemCompactRestNs) &&
-            (VE_AGO_NS(nowNs, _vidmemLastPressureNs) >= (VIDMEM_EVICT_QUIET_SEC * 1000000000ULL)))
+        if (_vidmemCompactRunSeenMB != _vidmemCompactRunMB)
+        {
+            _vidmemCompactRunSeenMB = _vidmemCompactRunMB;
+            _vidmemCompactRestNs    = 0;
+            _vidmemCompactIdleSteps = 0;
+        }
+        if ((moves != _vidmemPolicyMoves) || (evicted != _vidmemEvictBytes))
+        {
+            // The layout changed: the next quiet step looks again without the long rest.
+            _vidmemCompactIdleSteps = 0;
+        }
+        else if ((_vidmemCompactRunMB != 0) && (nowNs >= _vidmemCompactRestNs) &&
+                 (VE_AGO_NS(nowNs, _vidmemLastPressureNs) >= (VIDMEM_EVICT_QUIET_SEC * 1000000000ULL)))
         {
             _vidmemEvictWhy = VMT_WHY_COMPACT;
-            if (vepPlatCompact(pGpu, pProcs, count,
-                               _vidmemFgIsGame ? VIDMEM_EVICT_COMPACT_GAME_MB : VIDMEM_EVICT_COMPACT_STEP_MB,
-                               _vidmemCompactRunMB) == 0)
-                _vidmemCompactRestNs = nowNs + VIDMEM_EVICT_COMPACT_REST_SEC * 1000000000ULL;
+            if (vepPlatCompact(pGpu, pProcs, count, VIDMEM_EVICT_COMPACT_STEP_MB, _vidmemCompactRunMB) != 0)
+            {
+                _vidmemCompactIdleSteps = 0;
+            }
+            else
+            {
+                // Nothing to do: 14 s, 28 s, ... up to 15 min while nothing changes.
+                _vidmemCompactRestNs = nowNs + ((VIDMEM_EVICT_COMPACT_REST_SEC * 1000000000ULL) <<
+                                                NV_MIN(_vidmemCompactIdleSteps, 6));
+                _vidmemCompactIdleSteps++;
+            }
         }
         // Moves change what is left to reclaim: walk again only after some.
         if ((moves != _vidmemPolicyMoves) || (evicted != _vidmemEvictBytes))
