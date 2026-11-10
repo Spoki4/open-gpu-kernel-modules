@@ -1715,7 +1715,7 @@ NvU64 *vidmemPmaUsedMap(PMA *pPma, NvU64 *pBase, NvU64 *pFrames, NvU64 *pLargest
 //
 static NvBool
 _vidmemBestFitRange(PMA *pPma, NvU64 bytes, NvU64 align, NvU64 aLo, NvU64 aHi, NvU64 bLo, NvU64 bHi,
-                    NvU64 *pBegin, NvU64 *pEnd)
+                    NvU64 *pBegin, NvU64 *pEnd, NvU64 *pRegionBase)
 {
     NvU64  base = 0, frames = 0, largest = 0, f, start = 0, best = NV_U64_MAX;
     NvU64 *pUsed = vidmemPmaUsedMap(pPma, &base, &frames, &largest);
@@ -1723,6 +1723,7 @@ _vidmemBestFitRange(PMA *pPma, NvU64 bytes, NvU64 align, NvU64 aLo, NvU64 aHi, N
 
     if (pUsed == NULL)
         return NV_FALSE;
+    *pRegionBase = base;
     for (f = 0; f <= frames; f++)
     {
         NvU64  addr = base + (f << PMA_PAGE_SHIFT);
@@ -1822,7 +1823,7 @@ _vidmemRelocate
         NvU64 aLo = avoidLo, aHi = avoidHi, bLo = _vidmemRelocateKeepLo, bHi = _vidmemRelocateKeepHi;
         NvU64 gapLo[3], gapHi[3];
         PMA_ALLOCATION_OPTIONS opt = allocOptions;
-        NvU64 resBegin = 0, resEnd = 0;
+        NvU64 resBegin = 0, resEnd = 0, regionBase = 0;
 
         // With a user reserve: never into its block (as a restore).
         if ((bHi == 0) && vidmemUserReserveBoundRangeAny(pPma, allocOptions.alignment, &resBegin, &resEnd) &&
@@ -1832,7 +1833,7 @@ _vidmemRelocate
             bHi = resBegin;
         }
         if (_vidmemBestFitRange(pPma, (NvU64)pPmaInfo->pageCount * pPmaInfo->pageSize, allocOptions.alignment,
-                                aLo, aHi, bLo, bHi, &opt.physBegin, &opt.physEnd))
+                                aLo, aHi, bLo, bHi, &opt.physBegin, &opt.physEnd, &regionBase))
         {
             opt.flags |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
             status = pmaAllocatePages(pPma, pPmaInfo->pageCount, pPmaInfo->pageSize, &opt, pNewPages);
@@ -1854,7 +1855,12 @@ _vidmemRelocate
             t = aLo; aLo = bLo; bLo = t;
             t = aHi; aHi = bHi; bHi = t;
         }
-        gapLo[0] = 0;                 gapHi[0] = (aHi != 0) ? aLo : NV_ALIGN_DOWN64(NV_U64_MAX, allocOptions.alignment);
+        //
+        // From the region's base, not 0: PMA clips a range to the region, and
+        // the base is not 2 MB aligned (the regmap.c range assert on the host,
+        // 2026-11-10 20:45, a 2 MB-page allocation of the game moved for a window).
+        //
+        gapLo[0] = regionBase;        gapHi[0] = (aHi != 0) ? aLo : NV_ALIGN_DOWN64(NV_U64_MAX, allocOptions.alignment);
         gapLo[1] = aHi;               gapHi[1] = bLo;
         gapLo[2] = NV_MAX(aHi, bHi);  gapHi[2] = NV_ALIGN_DOWN64(NV_U64_MAX, allocOptions.alignment);
         for (try = 0; (try < 3) && (status != NV_OK); try++)
@@ -2596,6 +2602,17 @@ _vidmemEvictPidLocked
                 failedBytes += bytes;
                 EVICT_PRINTF("0x%x %llu KB %s failed 0x%x\n", RES_GET_HANDLE(pMemory), bytes >> 10,
                              VE_MODE_NAME(mode), status);
+                if (mode == 3)
+                {
+                    static NvU32 moveFailLogged;
+
+                    // Why a move inside vidmem did not happen (BACKLOG #15: "failed 1" said nothing).
+                    if ((moveFailLogged++ < 8) || ((moveFailLogged % 64) == 0))
+                        NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: move of %llu KB%s of pid %u inside vidmem failed: 0x%x\n",
+                                  bytes >> 10,
+                                  ((pMemDesc->pPmaAllocInfo != NULL) && pMemDesc->pPmaAllocInfo->bContig) ?
+                                  " (contiguous)" : "", pid, status);
+                }
             }
         }
     }
@@ -3725,11 +3742,16 @@ _vidmemEvictFreeChunks(const NvU64 *pUsed, NvU64 base, NvU64 frames, NvU64 *pFre
 // The cheapest window of `need` 2 MB chunks starting at a multiple of `align`:
 // frames to move (in use and movable, pMovable), NV_U64_MAX if every window
 // holds a frame that cannot be freed. *pStart (optional) gets its first chunk.
-// pCost is scratch space for `chunks` entries.
+// pCost is scratch space for `chunks` entries. A frame in pHeavy (optional:
+// memory of a process that is drawing in a window the user sees, BACKLOG
+// #15) counts VIDMEM_EVICT_HEAVY_COST times: a window over hidden programs
+// is taken before a smaller one over the game on the other monitor.
 //
+#define VIDMEM_EVICT_HEAVY_COST 4
+
 static NvU64
-_vidmemEvictBestWindow(const NvU64 *pUsed, const NvU64 *pMovable, NvU32 *pCost, NvU64 base, NvU64 off,
-                       NvU64 chunks, NvU64 need, NvU64 align, NvU64 *pStart)
+_vidmemEvictBestWindow(const NvU64 *pUsed, const NvU64 *pMovable, const NvU64 *pHeavy, NvU32 *pCost, NvU64 base,
+                       NvU64 off, NvU64 chunks, NvU64 need, NvU64 align, NvU64 *pStart)
 {
     NvU64 c, f, s, best = NV_U64_MAX;
 
@@ -3747,7 +3769,8 @@ _vidmemEvictBestWindow(const NvU64 *pUsed, const NvU64 *pMovable, NvU32 *pCost, 
                 n = NV_U32_MAX;
                 break;
             }
-            n += bUsed;
+            if (bUsed)
+                n += ((pHeavy != NULL) && ((pHeavy[f >> 6] >> (f & 63)) & 1)) ? VIDMEM_EVICT_HEAVY_COST : 1;
         }
         pCost[c] = n;
     }
@@ -3821,17 +3844,26 @@ _vidmemPidHasInRange(NvU32 pid)
 
 static NvU64 _vidmemContigInVidmemMB;   // moved inside vidmem by window clearing, in all (status)
 
+//
+// Who gives for a window: for the compositor (forPid 0) anyone but the
+// desktop; for an allocation of `forPid` those who may give at its `level`
+// (so a visible Chrome's buffer does not move the focused game). forPid's own
+// memory is moved only inside vidmem, and only what is not contiguous: on
+// the host its previous 130 MB buffer went to sysmem for each new one, up to
+// 30 times a second, and came back as "the foreground's memory" at the cost
+// of the game's (BACKLOG #15, 165 clearings in two hours).
+//
 static NvBool
 _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
-                       NvU64 *pMovedMB)
+                       NvU32 forPid, NvU32 level, NvU64 *pMovedMB)
 {
     NvU64   inVidmem = 0, *pInVidmemMB = &inVidmem;
     Heap   *pHeap = GPU_GET_HEAP(pGpu);
     PMA    *pPma = (pHeap != NULL) ? pHeap->pPmaObject : NULL;
     NvU64   base = 0, frames = 0, largest = 0, words, chunks, need, off, freeChunks, longest;
-    NvU64  *pUsed, *pMovable = NULL;
+    NvU64  *pUsed, *pMovable = NULL, *pHeavy = NULL;
     NvU32  *pCost = NULL;
-    NvU64   bestStart = NV_U64_MAX, bestCost = NV_U64_MAX;
+    NvU64   bestStart = NV_U64_MAX, bestCost = NV_U64_MAX, f;
     VIDMEM_EVICT_MAPREF *pRefs = NULL;
     NvU64   nowNs = osGetMonotonicTimeNs();
     NvBool  bOk = NV_FALSE;
@@ -3853,13 +3885,16 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     off    = (NV_ALIGN_UP64(base, 2ULL << 20) - base) >> PMA_PAGE_SHIFT;
     chunks = (frames > off) ? (frames - off) / VIDMEM_EVICT_CHUNK_FRAMES : 0;
     pMovable = portMemAllocNonPaged(words * sizeof(NvU64));
+    pHeavy   = portMemAllocNonPaged(words * sizeof(NvU64));
     pCost    = portMemAllocNonPaged(chunks * sizeof(NvU32));
     pRefs    = portMemAllocNonPaged(sizeof(*pRefs) * VIDMEM_EVICT_MAX_MAPPINGS);
-    if ((pMovable == NULL) || (pCost == NULL) || (pRefs == NULL) || (need == 0) || (need > chunks))
+    if ((pMovable == NULL) || (pHeavy == NULL) || (pCost == NULL) || (pRefs == NULL) || (need == 0) ||
+        (need > chunks))
         goto done;
     portMemSet(pMovable, 0, words * sizeof(NvU64));
+    portMemSet(pHeavy, 0, words * sizeof(NvU64));
     // Already there: an aligned window with nothing in it.
-    if (_vidmemEvictBestWindow(pUsed, pMovable, pCost, base, off, chunks, need, align, NULL) == 0)
+    if (_vidmemEvictBestWindow(pUsed, pMovable, NULL, pCost, base, off, chunks, need, align, NULL) == 0)
     {
         bOk = NV_TRUE;
         goto done;
@@ -3869,8 +3904,11 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     for (i = 0; i < count; i++)
     {
         RmClient **ppClient;
+        NvBool     bSelf = (forPid != 0) && (pProcs[i].pid == forPid);
+        // Given only because of the level (drawing in a window the user sees): costly.
+        NvBool     bHeavy = !bSelf && !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, VE_LEVEL_HIDDEN);
 
-        if (!_vidmemEvictHintVictimOk(&pProcs[i], 0, nowNs, VE_LEVEL_COMPOSITOR))
+        if (!bSelf && !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, level))
             continue;
         for (ppClient = serverutilGetFirstClientUnderLock(); ppClient != NULL;
              ppClient = serverutilGetNextClientUnderLock(ppClient))
@@ -3891,29 +3929,50 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
                     (pMemory->pMemDesc->pLocalEvictState != NULL) ||
                     (_vidmemEvictCheck(pGpu, iter.pResourceRef, pProcs[i].pid, pRefs, &numRefs) != NULL))
                     continue;
+                //
+                // Its own: only what can go to free pages elsewhere in vidmem
+                // (not a contiguous buffer: the window is cleared because no
+                // free run of that size is left, and not what the compositor
+                // maps: _vidmemRelocate() leaves that).
+                //
+                if (bSelf && ((pMemory->pMemDesc->pPmaAllocInfo == NULL) ||
+                              pMemory->pMemDesc->pPmaAllocInfo->bContig ||
+                              _vidmemEvictHasCompositor(pRefs, numRefs)))
+                    continue;
                 (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pMovable, base, frames);
+                if (bHeavy)
+                    (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pHeavy, base, frames);
             }
         }
     }
 
-    bestCost = _vidmemEvictBestWindow(pUsed, pMovable, pCost, base, off, chunks, need, align, &bestStart);
+    (void)_vidmemEvictBestWindow(pUsed, pMovable, pHeavy, pCost, base, off, chunks, need, align, &bestStart);
     if (bestStart == NV_U64_MAX)
     {
-        NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: compositor: no %llu MB window aligned to %llu KB can be cleared (longest free %llu MB)\n",
-                  need * 2, align >> 10, longest * 2);
+        static NvU32 noneLogged;
+
+        // A page asking 30 times a second (BACKLOG #15): the first few, then one in 64.
+        if ((noneLogged++ < 8) || ((noneLogged % 64) == 0))
+            NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: contiguous: no %llu MB window aligned to %llu KB can be cleared for pid %u (longest free %llu MB)\n",
+                      need * 2, align >> 10, forPid, longest * 2);
         goto done;
     }
+    // What is in it, in MB (the cost above counts some frames several times).
+    bestCost = 0;
+    for (f = off + bestStart * VIDMEM_EVICT_CHUNK_FRAMES; f < off + (bestStart + need) * VIDMEM_EVICT_CHUNK_FRAMES; f++)
+        bestCost += (pUsed[f >> 6] >> (f & 63)) & 1;
 
-    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: compositor: clearing %llu MB at 0x%llx for a contiguous %llu KB aligned to %llu KB (longest free %llu MB, %llu MB to move)\n",
+    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: contiguous: clearing %llu MB at 0x%llx for %llu KB aligned to %llu KB of pid %u (longest free %llu MB, %llu MB to move)\n",
               need * 2, base + ((off + bestStart * VIDMEM_EVICT_CHUNK_FRAMES) << PMA_PAGE_SHIFT), size >> 10,
-              align >> 10, longest * 2, (bestCost << PMA_PAGE_SHIFT) >> 20);
+              align >> 10, forPid, longest * 2, (bestCost << PMA_PAGE_SHIFT) >> 20);
     _vidmemEvictRangeLo = base + ((off + bestStart * VIDMEM_EVICT_CHUNK_FRAMES) << PMA_PAGE_SHIFT);
     _vidmemEvictRangeHi = _vidmemEvictRangeLo + (need << 21);
     for (i = 0; i < count; i++)
     {
-        NvU64 moved = 0;
+        NvU64  moved = 0;
+        NvBool bSelf = (forPid != 0) && (pProcs[i].pid == forPid);
 
-        if (!_vidmemEvictHintVictimOk(&pProcs[i], 0, nowNs, VE_LEVEL_COMPOSITOR) ||
+        if ((!bSelf && !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, level)) ||
             !_vidmemPidHasInRange(pProcs[i].pid))
             continue;
         //
@@ -3925,7 +3984,7 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
         (void)_vidmemEvictPidLocked(pGpu, 3, pProcs[i].pid, NULL, 0, NULL, &moved);
         *pMovedMB += moved >> 20;
         *pInVidmemMB += moved >> 20;
-        if (!_vidmemPidHasInRange(pProcs[i].pid))
+        if (bSelf || !_vidmemPidHasInRange(pProcs[i].pid))
             continue;
         moved = 0;
         (void)_vidmemEvictPidLocked(pGpu, 1, pProcs[i].pid, NULL, 0, NULL, &moved);
@@ -3937,7 +3996,7 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     pUsed = vidmemPmaUsedMap(pPma, &base, &frames, &largest);
     portMemSet(pMovable, 0, words * sizeof(NvU64));
     bOk = (pUsed != NULL) &&
-          (_vidmemEvictBestWindow(pUsed, pMovable, pCost, base, off, chunks, need, align, NULL) == 0);
+          (_vidmemEvictBestWindow(pUsed, pMovable, NULL, pCost, base, off, chunks, need, align, NULL) == 0);
     _vidmemContigInVidmemMB += inVidmem;
     NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: window %s: %llu MB moved, %llu of them inside vidmem\n",
               bOk ? "cleared" : "not cleared", *pMovedMB, inVidmem);
@@ -3945,6 +4004,7 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
 done:
     portMemFree(pUsed);
     portMemFree(pMovable);
+    portMemFree(pHeavy);
     portMemFree(pCost);
     portMemFree(pRefs);
     return bOk;
@@ -4217,9 +4277,9 @@ vepPlatChunkInfo(OBJGPU *pGpu, NvU64 *pFreeChunks, NvU64 *pLongest)
 
 NvBool
 vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
-                  NvU64 *pMovedMB)
+                  NvU32 forPid, NvU32 level, NvU64 *pMovedMB)
 {
-    return _vidmemEvictMakeContig(pGpu, pProcs, count, size, align, pMovedMB);
+    return _vidmemEvictMakeContig(pGpu, pProcs, count, size, align, forPid, level, pMovedMB);
 }
 
 //

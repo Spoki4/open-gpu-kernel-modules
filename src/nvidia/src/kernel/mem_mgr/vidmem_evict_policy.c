@@ -1598,7 +1598,7 @@ _vidmemEvictMakeChunks(OBJGPU *pGpu, NvU64 size, NvBool bContig, NvU64 align, Nv
 
         // What moved changed what the victims hold.
         count = _vidmemEvictGatherProcs(pGpu, pProcs, VIDMEM_EVICT_MAX_PROCS);
-        bOk = vepPlatMakeContig(pGpu, pProcs, count, size, align, &contigMB);
+        bOk = vepPlatMakeContig(pGpu, pProcs, count, size, align, exceptPid, level, &contigMB);
         movedMB += contigMB;
     }
     _vidmemEvictUpdateReclaimable(pProcs, count, osGetMonotonicTimeNs());

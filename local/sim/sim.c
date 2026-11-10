@@ -359,9 +359,9 @@ NvBool vepPlatChunkInfo(OBJGPU *pGpu, NvU64 *pFreeChunks, NvU64 *pLongest)
 }
 
 NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
-                         NvU64 *pMovedMB)
+                         NvU32 forPid, NvU32 level, NvU64 *pMovedMB)
 {
-    (void)pGpu; (void)pProcs; (void)count; (void)size; (void)align;
+    (void)pGpu; (void)pProcs; (void)count; (void)size; (void)align; (void)forPid; (void)level;
     *pMovedMB = 0;
     return NV_TRUE;
 }
