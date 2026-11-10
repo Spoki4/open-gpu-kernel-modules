@@ -34,7 +34,9 @@ Layout (vm mode):
   NOPASSWD sudo), Plasma Wayland with SDDM autologin, Steam, Chromium (not
   google-chrome: `nvt-session.sh` calls `google-chrome`, untested in the guest).
   Kernel, headers, `linux-cachyos-nvidia-open` and `nvidia-utils` are pinned
-  (`IgnorePkg`) at 7.3.1-1 / 615.78.08; update them together on purpose only.
+  (`IgnorePkg`) at 7.3.3-1 / 620.70.06 (since 2026-11-10; before: 7.3.1 /
+  615.78.08, the old pacman.conf is /etc/pacman.conf.pin-615); update them
+  together on purpose only.
 - The repo is shared into the guest at the same path (virtiofs), so edit on the
   host and build in the guest. QEMU runs as root in `nvvm.service` (transient,
   `nvvm.slice`), virtiofsd in `nvvm-virtiofsd.service`.
@@ -2108,3 +2110,15 @@ builds in the guest (vm.sh build) when the host has no headers for the guest
 kernel. #16 step 1 passed nvtest all 15/15 there (vmtest-2026-11-10_131303)
 plus a guest trace during comproom (local/trace-logs/fragchk-132411):
 vidmem_frag every ~10 s and after each batch, scan 22-30 us.
+
+2026-11-10 13:45, driver 620.70.06: branch `local/vidmem-620` = tag
+620.70.06 + one port commit (aaa57a24: the whole 615.78.08..0b994351 diff
+applied with git apply -3; conflicts in mem.c, video_mem.c (SLI loop and
+bcState gone upstream), nv-linux.h (upstream's own CXL guard taken),
+nvidia-sources.Kbuild) + 7a383f22 (intermapGetDmaMapping without gpuMask,
+no pNext / per-subdevice arrays). The per-commit history stays on
+local/vidmem-615 (= 9723fcad). Guest upgraded (pacman -Syu with the pins
+lifted, pins put back): kernel 7.3.3, nvidia-utils 620.70.06. nvtest all
+15/15 PASS on the port (vmtest-2026-11-10_133003), no NVRM errors.
+vidmem_frag and the status line work on 620 too. Work continues on
+local/vidmem-620.
