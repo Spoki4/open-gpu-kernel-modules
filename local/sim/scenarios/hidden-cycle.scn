@@ -1,0 +1,107 @@
+# BACKLOG #6, host 2026-11-08 (recording 20261107_234433): the focused window
+# grew and wanted its headroom, the hidden Battle.net, Claude and Steam
+# (~900 MB) went out; 37-81 s later it gave the memory back, 4 GB were free,
+# and after 30 quiet seconds they all came back, to go out again at its next
+# growth: 1.8 GB of copies a round, and two 0.75 s freezes with Battle.net.
+# Hidden apps are in no hurry: they stay out while the window they made room
+# for is in focus, come back at once when shown, and by themselves only after
+# the room has been there for minutes.
+cap 11000
+proc 1614 kwin_wayland old
+proc 1625 plasmashell old
+proc 3562 Battle.net old chunk=16        # hidden launchers
+proc 9000 claude-desktop old chunk=16
+proc 4100 steamwebhelper old chunk=16
+proc 5000 Wow.exe chunk=64
+proc 7000 chrome old chunk=32
+
+hint 1625 v
+hint 3562 h
+hint 9000 h
+hint 4100 h
+hint 7000 v
+act 1614 0 4
+act 1625 0 4
+act 3562 600 0
+act 9000 600 0
+act 4100 600 0
+act 7000 5 2
+target 1614 280 0.75
+target 1625 480 0.4
+target 3562 560 0.9
+target 9000 220 0.9
+target 4100 130 0.9
+target 7000 900 0.7
+at 10
+
+mark the game is focused and loads: it wants its headroom, the hidden ones go out
+hint 5000 f
+act 5000 0 30
+target 5000 5200 0.75 spread=10
+at 30
+target 5000 7600 0.75 spread=20
+at 90
+expect sys 5000 == 0
+expect evicted 3562 > 0
+
+mark it gives 2.5 GB back for ten minutes: 4 GB free, nobody comes back while it is in focus
+target 5000 5200 0.75 spread=5
+at 700
+expect restores 3562 == 0
+expect restores 9000 == 0
+expect restores 4100 == 0
+
+mark it grows and shrinks three more times, half an hour apart
+target 5000 7600 0.75 spread=20
+at 780
+target 5000 5200 0.75 spread=5
+at 2500
+target 5000 7600 0.75 spread=20
+at 2580
+target 5000 5200 0.75 spread=5
+at 4300
+target 5000 7600 0.75 spread=20
+at 4380
+target 5000 5200 0.75 spread=5
+at 4500
+expect restores 3562 == 0
+expect restores 9000 == 0
+expect restores 4100 == 0
+expect moved_out 3562 <= 600      # out once, not once a round
+expect sys 5000 == 0
+
+mark the user opens Battle.net: it is back at once
+hint 5000 v
+hint 3562 f
+act 3562 0 4
+step
+at 4502
+expect sys 3562 == 0
+mark back to the game
+hint 3562 h
+act 3562 30 0
+hint 5000 f
+step
+at 4520
+
+mark the user switches to Chrome for two minutes and back: still nobody comes back
+hint 5000 v
+hint 7000 f
+step
+at 4640
+expect restores 9000 == 0
+hint 7000 v
+hint 5000 f
+step
+at 4700
+
+mark the game quits; five minutes later the hidden ones are back
+free 5000 5200
+hint 5000 -
+hint 7000 f
+step
+at 4900
+expect restores 9000 == 0
+at 5060
+expect sys 9000 == 0
+expect sys 4100 == 0
