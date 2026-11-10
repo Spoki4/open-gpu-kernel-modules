@@ -893,6 +893,7 @@ ceutilsMemcopy_IMPL
 
     copyLength = length;
     NvU64 statT0 = osGetMonotonicTimeNs(), statT1;
+    NvU64 srcRunEnd = 0, dstRunEnd = 0;     // offsets up to which the current contiguous run reaches
 
     do
     {
@@ -906,10 +907,22 @@ ceutilsMemcopy_IMPL
         //
         NvU64 srcAddr = memdescGetPhysAddr(pSrcMemDesc, srcAddrTranslation, srcOffset);
         NvU64 dstAddr = memdescGetPhysAddr(pDstMemDesc, dstAddrTranslation, dstOffset);
-        NvU64 maxContigSizeSrc = bSrcContig ? copyLength :
-            _ceutilsContigRun(pSrcMemDesc, srcAddrTranslation, srcOffset, copyLength, srcPageGranularity);
-        NvU64 maxContigSizeDst = bDstContig ? copyLength :
-            _ceutilsContigRun(pDstMemDesc, dstAddrTranslation, dstOffset, copyLength, dstPageGranularity);
+        NvU64 maxContigSizeSrc, maxContigSizeDst;
+
+        //
+        // A run is walked once and remembered until the copy has passed it.
+        // Walked again for every piece, a long run on one side cut into
+        // small pieces by the other side cost a walk of up to 64K entries
+        // per piece: 256 MB of contiguous vidmem going to 64 KB sysmem
+        // chunks took 4096 pieces of ~140 us (BACKLOG #5: 0.45 GB/s for
+        // WoW's and Battle.net's DXVK blocks, 2026-11-08..10).
+        //
+        if (!bSrcContig && (srcOffset >= srcRunEnd))
+            srcRunEnd = srcOffset + _ceutilsContigRun(pSrcMemDesc, srcAddrTranslation, srcOffset, copyLength, srcPageGranularity);
+        if (!bDstContig && (dstOffset >= dstRunEnd))
+            dstRunEnd = dstOffset + _ceutilsContigRun(pDstMemDesc, dstAddrTranslation, dstOffset, copyLength, dstPageGranularity);
+        maxContigSizeSrc = bSrcContig ? copyLength : (srcRunEnd - srcOffset);
+        maxContigSizeDst = bDstContig ? copyLength : (dstRunEnd - dstOffset);
         NvU32 copySizeContig = (NvU32)NV_MIN(NV_MIN(copyLength, NV_MIN(maxContigSizeSrc, maxContigSizeDst)), CE_MAX_BYTES_PER_LINE);
 
         NV_PRINTF(LEVEL_INFO, "CeUtils Memcopy dstAddr: %llx, srcAddr: %llx, size: %x\n",
