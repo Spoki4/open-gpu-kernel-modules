@@ -1,6 +1,6 @@
 #!/bin/bash
-# One check of the working tree on the GPU: build the driver on the host (same
-# kernel as the guest), load it in the test VM guest and run nvtest there.
+# One check of the working tree on the GPU: build the driver (on the host when
+# it has the guest kernel's headers, else in the guest), load it in the test VM guest and run nvtest there.
 # Two watchdogs: the guest's around nvtest (a stuck scenario is killed and its
 # test session cleaned up), the host's around the ssh session. A silent ssh
 # session is not a hung guest (2026-11-06 23:24: a test left its Chrome
@@ -33,16 +33,6 @@ mkdir -p local/stress-logs
 log=local/stress-logs/vmtest-$(date +%F_%H%M%S).log
 say() { echo "$*" | tee -a "$log"; }
 
-if (( build )); then
-    say "build: $(git log -1 --format='%h %s')$(git diff --quiet HEAD -- src kernel-open || echo ' + working tree')"
-    if ! make modules -j"$(nproc)" SYSSRC="/lib/modules/$(uname -r)/build" LD=ld.lld IGNORE_CC_MISMATCH=1 \
-            >>"$log" 2>&1; then
-        grep -E 'error|Error' "$log" | head -20
-        say "VMTEST FAIL build"
-        exit 1
-    fi
-fi
-
 if [[ $(local/vm/vm.sh status 2>/dev/null) != running:* ]]; then
     say "guest not running: starting it"
     local/vm/vm.sh start >>"$log" 2>&1 && timeout 300 local/vm/vm.sh wait >>"$log" 2>&1 ||
@@ -50,6 +40,25 @@ if [[ $(local/vm/vm.sh status 2>/dev/null) != running:* ]]; then
 fi
 # Just started or reset by a watchdog: wait until it answers.
 timeout 300 local/vm/vm.sh wait >>"$log" 2>&1 || { say "VMTEST FAIL guest does not answer ssh"; exit 1; }
+if (( build )); then
+    say "build: $(git log -1 --format='%h %s')$(git diff --quiet HEAD -- src kernel-open || echo ' + working tree')"
+    # On the host when it has the guest kernel's headers (same kernel), else in
+    # the guest (2026-11-10: host updated to 7.3.3, guest pinned at 7.3.1).
+    gk=$(local/vm/vm.sh ssh 'uname -r' 2>/dev/null | tr -d '\r')
+    if [[ -n $gk && -d /lib/modules/$gk/build ]]; then
+        say "build on the host for $gk"
+        make modules -j"$(nproc)" SYSSRC="/lib/modules/$gk/build" LD=ld.lld IGNORE_CC_MISMATCH=1 >>"$log" 2>&1
+    else
+        say "build in the guest (${gk:-?}; host has no headers for it)"
+        timeout 1800 local/vm/vm.sh build >>"$log" 2>&1
+    fi
+    if (( $? != 0 )); then
+        grep -E 'error|Error' "$log" | head -20
+        say "VMTEST FAIL build"
+        exit 1
+    fi
+fi
+
 if (( reload )); then
     if ! timeout 180 local/vm/vm.sh reload tree 2>&1 | tee -a "$log" | grep '^now:'; then
         say "VMTEST FAIL reload (guest log: local/vm/vm.sh log)"
