@@ -202,6 +202,9 @@ sudo ./local/vm/mode.sh vm               # host stops loading nvidia; move a mon
 ./local/vm/vm.sh install                 # the tree build becomes what the guest boots
 ./local/vm/vm.sh log                     # serial log: oopses survive a hung guest
 ./local/vm/vm.sh reset                   # reboot the guest (--force: hard reset of a dead one, may wedge the GPU until a host reboot)
+./local/vm/vm.sh ssh $PWD/local/move-test.sh    # evict.sh move keeps the content (BACKLOG #16)
+./local/vm/vm.sh ssh $PWD/local/contig-test.sh  # contiguous buffers in fragmented vidmem: moved inside vidmem
+./local/vm/vm.sh ssh $PWD/local/fragchurn.sh    # fragment vidmem like a long session
 ./local/vm/vmtest.sh [all|focus|...]     # build on the host, reload in the guest, nvtest under watchdogs
 sudo ./local/vm/mode.sh host             # back to the 3080 Ti on the host after a reboot
 ```

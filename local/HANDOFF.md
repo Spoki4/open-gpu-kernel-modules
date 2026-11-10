@@ -2172,3 +2172,34 @@ root on the image: EFI Internal Shell over the serial console
 `fs0:\vmlinuz-linux-cachyos initrd=... root=PARTUUID=...`, then the entry
 rewritten and synced. After writing to the guest's /boot: `sync`.
 The GPU is still wedged from 14:03: host reboot needed.
+
+2026-11-10 15:40 (VM, after the host reboot; GPU fine). BACKLOG #6 committed
+(da914ba9; nvtest all 14/15, vaflip hit a "Flip event timeout" WARNING in
+nvidia-drm once, 3 reruns clean: BACKLOG I14). BACKLOG #16:
+- local/fragchurn.sh [SECONDS] [moves]: random starts/exits of up to 24
+  nvt-game --idle processes with 2-256 MB buffers; reproduces the host's
+  picture (2.2-5.3 GB free, longest run ~1 GB). Evict/restore churn mostly
+  adds partly used 2 MB chunks.
+- _vidmemRelocate() (vidmem_evict.c): an allocation moves to other vidmem
+  pages: new PMA pages (outside [avoidLo, avoidHi) when a window is being
+  cleared), a sub-memdesc snapshot of the old pages as the CE copy source,
+  mappings remade with their kinds (_vidmemEvictRemapOne), old pages freed.
+  A mapping that cannot be remade leaves the old pages unfreed (leak, logged).
+  Skips what the compositor maps. Mode 3 of _vidmemEvictPidLocked(), procfs
+  "move PID" (rm_vidmem_evict mode 12), `evict.sh move`; trace op=move.
+  local/move-test.sh: 10 moves each of rendering+rewriting nvt-game (compute
+  and --gfx), an idle one, compr-test (2 MB and 64 KB pages, cleared and
+  noise): no errors. ~1 GB in 120 ms on 64 KB pages (half of it PMA
+  alloc/free of 16K pages), 2 GB on 2 MB pages in 127 ms.
+- _vidmemEvictMakeContig() now moves a victim's allocations in the window
+  inside vidmem first (mode 3 with the range set) and evicts to sysmem only
+  what is left. Kernel log: "window cleared: N MB moved, M of them inside
+  vidmem"; status line "windows cleared for contiguous allocations".
+  local/contig-test.sh (interleaved 16 MB buffers, every other app exits,
+  then 18 contiguous 256 MB scanout buffers as kwin_wayland): all granted,
+  976 MB moved inside vidmem, 0 to sysmem, survivors intact. nvtest all 15/15
+  (it hardly reaches this path: one 6 MB window in the whole run).
+Next for #16: background compaction when idle; relocating compositor-mapped
+allocations (two-phase like evict); letting the window clearing move (not
+evict) drawing processes too. #5 still open: NVVM_VIOMMU=1 experiment not run
+(needs a guest restart: `vm.sh stop` then `NVVM_VIOMMU=1 vm.sh start`).
