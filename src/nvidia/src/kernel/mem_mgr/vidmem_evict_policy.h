@@ -160,7 +160,7 @@ extern NvU64  _vidmemBusiestSinceNs;
 extern NvU64  _vidmemBornBytes;
 extern NvU32  _vidmemBornAllocs, _vidmemBornFailed;
 extern NvU64  _vidmemReclaimableBytes, _vidmemReclaimableFgBytes;
-extern NvU32  _vidmemFgHeadroomMB, _vidmemBgCushionMB;
+extern NvU32  _vidmemFgHeadroomMB, _vidmemBgCushionMB, _vidmemFgOwnEnabled;
 extern NvU64  _vidmemPrevFgNs;          // lastFgNs of the window focused before the current one
 // Set by the policy around a move, read by the engine (vidmem_evict.c).
 extern NvU32  _vidmemEvictWhy;          // VMT_WHY_* of the next evict/restore call

@@ -639,6 +639,20 @@ NvU64 _vidmemReclaimableFgBytes;    // for the foreground: + visible ones (FG_AL
 // What could move per level at the last walk, without the margin (BACKLOG #8).
 static NvU64 _vidmemMovableHiddenBytes = NV_U64_MAX, _vidmemMovableFgIdleBytes = NV_U64_MAX,
              _vidmemMovableFgAllocBytes = NV_U64_MAX;
+// What the foreground itself could give for its own allocation (0: a game, or nothing; BACKLOG #7).
+static NvU64 _vidmemMovableFgOwnBytes = NV_U64_MAX;
+
+//
+// The foreground's allocation fits nowhere and nobody is left to give: an
+// app that is not a game gets it anyway, and as much of its own older memory
+// goes to sysmem instead (BACKLOG #7, the user's choice 2026-11-06: "memory
+// in sysmem for the focused window rather than a denial"; a WebGPU page
+// denied next to a game died). A game is turned away as before: its engine
+// places by its budget and falls back by itself (vkd3d), and a move inside
+// its allocation is a stall of its frame (BACKLOG #5). Registry-less knob for
+// tests: evict.sh fgown on|off.
+//
+NvU32 _vidmemFgOwnEnabled = 1;
 
 //
 // Free-memory targets with hints. Smaller than lowMB/hysteresis of the
@@ -673,6 +687,12 @@ _vidmemEvictUpdateReclaimable(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 nowN
     _vidmemMovableHiddenBytes = sum;
     _vidmemMovableFgIdleBytes = sumFgIdle;
     _vidmemMovableFgAllocBytes = sumFg;
+    _vidmemMovableFgOwnBytes = 0;
+    for (i = 0; i < count; i++)
+    {
+        if ((VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) && !pProcs[i].bNever && !_vidmemEvictIsGame(&pProcs[i]))
+            _vidmemMovableFgOwnBytes += pProcs[i].eligibleBytes;
+    }
 }
 
 //
@@ -808,6 +828,32 @@ vepHotRestoreKeepMB(NvU32 pid)
            _vidmemLastKeepMB : VIDMEM_EVICT_RESTORE_MARGIN_MB;
 }
 
+//
+// A process about to get its memory back has contiguous buffers in sysmem:
+// free bytes are no place for them (host, 2026-11-10 20:45: 379 MB of the
+// game on the other monitor moved out for Chrome's 130 MB buffers, which then
+// did not fit: "restore failed 4"). A window is cleared for the biggest one,
+// one a step, by moving what is in it to other vidmem pages first, from those
+// who may give at `level` (BACKLOG #15, I11). After a failure no new try for
+// 10 s. NV_TRUE: a window is there.
+//
+static NvBool
+_vidmemEvictContigWindow(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU32 i, NvU32 level, NvU64 nowNs)
+{
+    VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(pProcs[i].pid, NV_TRUE);
+    NvU64  windowMB = 0;
+    NvBool bWindow;
+
+    if ((pProcs[i].evictedContigBytes == 0) ||
+        ((pAct->contigFailNs != 0) && (VE_AGO_NS(nowNs, pAct->contigFailNs) < 10 * 1000000000ULL)))
+        return NV_FALSE;
+    _vidmemEvictWhy = VMT_WHY_ALLOC;
+    bWindow = vepPlatMakeContig(pGpu, pProcs, count, pProcs[i].evictedContigMax, pProcs[i].evictedContigAlign,
+                                pProcs[i].pid, level, &windowMB);
+    pAct->contigFailNs = bWindow ? 0 : nowNs;
+    return bWindow;
+}
+
 // The policy step when window hints are on. API lock RW, GPU lock held.
 static void
 _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 nowNs)
@@ -836,24 +882,13 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
         _vidmemEvictWhy = VMT_WHY_ROOM;
         //
         // Room for all of it plus the low mark if others can give it. Not for
-        // its contiguous buffers: free bytes are no place for them (host,
-        // 2026-11-10 20:45: 379 MB of the game on the other monitor moved out
-        // for Chrome's 130 MB buffers, which then did not fit: "restore failed
-        // 4"). They get a window cleared, one a step, by moving what is in it
-        // to other vidmem pages first (BACKLOG #15).
+        // its contiguous buffers: they get a window (_vidmemEvictContigWindow()).
         //
         avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB - contigMB + VIDMEM_EVICT_HINT_LOW_MB,
                                      pProcs[i].pid, VE_LEVEL_FG_RESTORE, "foreground again");
-        if ((contigMB != 0) &&
-            ((pAct->contigFailNs == 0) || (VE_AGO_NS(nowNs, pAct->contigFailNs) >= 10 * 1000000000ULL)))
+        if (contigMB != 0)
         {
-            NvU64 windowMB = 0;
-
-            _vidmemEvictWhy = VMT_WHY_ALLOC;
-            bWindow = vepPlatMakeContig(pGpu, pProcs, count, pProcs[i].evictedContigMax,
-                                        pProcs[i].evictedContigAlign, pProcs[i].pid, VE_LEVEL_FG_RESTORE,
-                                        &windowMB);
-            pAct->contigFailNs = bWindow ? 0 : nowNs;
+            bWindow = _vidmemEvictContigWindow(pGpu, pProcs, count, i, VE_LEVEL_FG_RESTORE, nowNs);
             avail = vepPlatAvailMB(pGpu);
         }
         //
@@ -945,6 +980,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
         }
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: restoring %s (pid %u, visible, %llu MB)\n",
                   pProcs[i].name, pProcs[i].pid, needMB);
+        (void)_vidmemEvictContigWindow(pGpu, pProcs, count, i, VE_LEVEL_HIDDEN, nowNs);
         _vidmemEvictWhy = VMT_WHY_RESTORE;
         (void)_veMove(pGpu, 2, pProcs[i].pid, NULL);
         pProcs[i].evictedBytes = 0;
@@ -993,6 +1029,8 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
         }
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: restoring %s (pid %u, drawing again, %s, %llu MB)\n",
                   pProcs[i].name, pProcs[i].pid, bVisible ? "visible" : "not visible", needMB);
+        if (bVisible)
+            (void)_vidmemEvictContigWindow(pGpu, pProcs, count, i, VE_LEVEL_HIDDEN, nowNs);
         _vidmemEvictWhy = VMT_WHY_RESTORE;
         (void)_veMove(pGpu, 2, pProcs[i].pid, NULL);
         pProcs[i].evictedBytes = 0;
@@ -1413,7 +1451,9 @@ vepMakeRoomAllowed(NvU32 pid)
         return NV_FALSE;
     // Nobody to move for it as of the last walk: no walk now (#8).
     if (!_vidmemEvictAnyMovable((VE_HINT_STATE(_vidmemHint(pid, NULL)) == VE_HINT_FG) ?
-                                VE_LEVEL_FG_ALLOC : VE_LEVEL_HIDDEN))
+                                VE_LEVEL_FG_ALLOC : VE_LEVEL_HIDDEN) &&
+        !((VE_HINT_STATE(_vidmemHint(pid, NULL)) == VE_HINT_FG) && _vidmemFgOwnEnabled &&
+          (_vidmemMovableFgOwnBytes >= (4ULL << 20))))
         return NV_FALSE;
     return NV_TRUE;
 }
@@ -1457,6 +1497,30 @@ vepMakeRoomRun(OBJGPU *pGpu, NvU32 pid, NvU64 size, NvU64 headroomMB, const char
         avail = _vidmemEvictHintFree(pGpu, pProcs, count, (size >> 20) + 1 + VIDMEM_EVICT_RESTORE_MARGIN_MB, pid,
                                      VE_LEVEL_FG_ALLOC, "allocation of the foreground");
     bOk    = (avail > (size >> 20));
+    // Nobody left to give: its own older memory, as much as this allocation takes.
+    if (bFg && !bOk && _vidmemFgOwnEnabled && (size <= (512ULL << 20)))
+    {
+        NvU32 k;
+
+        for (k = 0; k < count; k++)
+        {
+            NvU64 moved = 0;
+
+            if ((pProcs[k].pid != pid) || pProcs[k].bNever || _vidmemEvictIsGame(&pProcs[k]) ||
+                (pProcs[k].eligibleBytes < size + (16ULL << 20)))
+                continue;
+            NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: allocation of the foreground: free %llu MB, nobody left to give, %llu MB of %s's own memory (pid %u) to sysmem for its %llu KB\n",
+                      avail, (size >> 20) + 16, pProcs[k].name, pid, size >> 10);
+            _vidmemEvictWhy = VMT_WHY_ALLOC;
+            _vidmemEvictBudgetBytes = size + (16ULL << 20);
+            (void)_veMove(pGpu, 1, pid, &moved);
+            _vidmemEvictBudgetBytes = 0;
+            pProcs[k].eligibleBytes -= NV_MIN(pProcs[k].eligibleBytes, moved);
+            avail = vepPlatAvailMB(pGpu);
+            bOk   = (avail > (size >> 20));
+            break;
+        }
+    }
     _vidmemEvictUpdateReclaimable(pProcs, count, nowNs);
     _vidmemMakeRoomFruitlessNs = bOk ? 0 : nowNs;
     if (bOk)

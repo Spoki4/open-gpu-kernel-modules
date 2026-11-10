@@ -184,6 +184,34 @@ static NvU32 _vidmemEvictWindows;
 //
 static NvU32  _vidmemMoveShared = 1;
 static NvBool _vidmemCheckForMove;
+//
+// The same for a buffer another application holds too (BACKLOG I10; it was
+// "shared-other-app", never moved): for a move inside vidmem that
+// application's channels stop in phase 2 with the compositor's. Never the
+// window in focus (its frames come first), and never out to sysmem: the
+// rules of who may be moved out are per owner, the other holder would draw
+// from sysmem without having been asked. The processes to stop, as the
+// checks of the current _vidmemEvictPidLocked() found them:
+//
+#define VIDMEM_EVICT_MAX_OTHER_PIDS 8
+static NvU32 _vidmemOtherPids[VIDMEM_EVICT_MAX_OTHER_PIDS];
+static NvU32 _vidmemOtherPidCount;
+
+static NvBool
+_vidmemOtherPidAdd(NvU32 pid)
+{
+    NvU32 i;
+
+    for (i = 0; i < _vidmemOtherPidCount; i++)
+    {
+        if (_vidmemOtherPids[i] == pid)
+            return NV_TRUE;
+    }
+    if (_vidmemOtherPidCount == VIDMEM_EVICT_MAX_OTHER_PIDS)
+        return NV_FALSE;
+    _vidmemOtherPids[_vidmemOtherPidCount++] = pid;
+    return NV_TRUE;
+}
 
 //
 // "quiesce N": how a process's channels are stopped before its memory moves
@@ -621,7 +649,12 @@ _vidmemEvictHolderOne
         }
         else
         {
-            return "shared-other-app";
+            if (!(_vidmemCheckForMove && _vidmemMoveShared) || (pRmClient == NULL) ||
+                (VE_HINT_STATE(_vidmemHint(pRmClient->ProcID, NULL)) == VE_HINT_FG) ||
+                !_vidmemOtherPidAdd(pRmClient->ProcID))
+                return "shared-other-app";
+            // Its mappings are remade in phase 2, as the compositor's.
+            bCompositor = NV_TRUE;
         }
     }
     else
@@ -1100,6 +1133,32 @@ _vidmemEvictCollectCompositorChannels(VIDMEM_EVICT_CHANNELS *pChannels)
         {
             _vidmemEvictCollectChannels(pRsClient, pChannels);
             pChannels->vmtPid = (*ppClient)->ProcID;
+        }
+    }
+}
+
+// Channels of the other applications holding buffers being moved (_vidmemOtherPids).
+static void
+_vidmemEvictCollectOtherChannels(VIDMEM_EVICT_CHANNELS *pChannels)
+{
+    RmClient **ppClient;
+    NvU32      i;
+
+    for (ppClient = serverutilGetFirstClientUnderLock();
+         (ppClient != NULL) && (_vidmemOtherPidCount != 0);
+         ppClient = serverutilGetNextClientUnderLock(ppClient))
+    {
+        RsClient *pRsClient = staticCast(*ppClient, RsClient);
+
+        if ((pRsClient->type == CLIENT_TYPE_KERNEL) || _vidmemEvictIsCompositor(*ppClient))
+            continue;
+        for (i = 0; i < _vidmemOtherPidCount; i++)
+        {
+            if ((*ppClient)->ProcID == _vidmemOtherPids[i])
+            {
+                _vidmemEvictCollectChannels(pRsClient, pChannels);
+                break;
+            }
         }
     }
 }
@@ -2408,6 +2467,7 @@ _vidmemEvictPidLocked
     }
 
     // Phase 1, only the process itself paused.
+    _vidmemOtherPidCount = 0;
     for (ppClient = serverutilGetFirstClientUnderLock();
          ppClient != NULL;
          ppClient = serverutilGetNextClientUnderLock(ppClient))
@@ -2636,6 +2696,8 @@ _vidmemEvictPidLocked
     if (numPending != 0)
     {
         _vidmemEvictCollectCompositorChannels(pCompChannels);
+        if (mode == 3)
+            _vidmemEvictCollectOtherChannels(pCompChannels);
         status = _vidmemEvictSetChannels(pGpu, pCompChannels, NV_TRUE);
         if (status != NV_OK)
             EVICT_PRINTF("disabling compositor channels failed: 0x%x\n", status);
@@ -3881,7 +3943,13 @@ static NvU64 _vidmemContigInVidmemMB;   // moved inside vidmem by window clearin
 // the host its previous 130 MB buffer went to sysmem for each new one, up to
 // 30 times a second, and came back as "the foreground's memory" at the cost
 // of the game's (BACKLOG #15, 165 clearings in two hours).
+// Those who may not be moved out at `level` but whose memory compaction may
+// move (_vidmemCompactVictim(): anyone but the focus and the compositor)
+// still give for a window, by a move to other vidmem pages only: it stays in
+// vidmem, the price is a pause for the copy (BACKLOG #16).
 //
+static NvBool _vidmemCompactVictim(VIDMEM_EVICT_PROC *p);
+
 static NvBool
 _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
                        NvU32 forPid, NvU32 level, NvU64 *pMovedMB)
@@ -3936,8 +4004,10 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
         NvBool     bSelf = (forPid != 0) && (pProcs[i].pid == forPid);
         // Given only because of the level (drawing in a window the user sees): costly.
         NvBool     bHeavy = !bSelf && !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, VE_LEVEL_HIDDEN);
+        // Moved inside vidmem only: itself, and those not to be moved out at this level.
+        NvBool     bMoveOnly = bSelf || !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, level);
 
-        if (!bSelf && !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, level))
+        if (bMoveOnly && !bSelf && !_vidmemCompactVictim(&pProcs[i]))
             continue;
         for (ppClient = serverutilGetFirstClientUnderLock(); ppClient != NULL;
              ppClient = serverutilGetNextClientUnderLock(ppClient))
@@ -3965,12 +4035,12 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
                 if (bRefused)
                     continue;
                 //
-                // Its own: only what can go to free pages elsewhere in vidmem
+                // Moved inside vidmem only: what can go to free pages elsewhere
                 // (not a contiguous buffer: the window is cleared because no
                 // free run of that size is left).
                 //
-                if (bSelf && ((pMemory->pMemDesc->pPmaAllocInfo == NULL) ||
-                              pMemory->pMemDesc->pPmaAllocInfo->bContig))
+                if (bMoveOnly && ((pMemory->pMemDesc->pPmaAllocInfo == NULL) ||
+                                  pMemory->pMemDesc->pPmaAllocInfo->bContig))
                     continue;
                 (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pMovable, base, frames);
                 if (bHeavy)
@@ -4004,8 +4074,9 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     {
         NvU64  moved = 0;
         NvBool bSelf = (forPid != 0) && (pProcs[i].pid == forPid);
+        NvBool bMoveOnly = bSelf || !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, level);
 
-        if ((!bSelf && !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, level)) ||
+        if ((bMoveOnly && !bSelf && !_vidmemCompactVictim(&pProcs[i])) ||
             !_vidmemPidHasInRange(pProcs[i].pid))
             continue;
         //
@@ -4017,7 +4088,7 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
         (void)_vidmemEvictPidLocked(pGpu, 3, pProcs[i].pid, NULL, 0, NULL, &moved);
         *pMovedMB += moved >> 20;
         *pInVidmemMB += moved >> 20;
-        if (bSelf || !_vidmemPidHasInRange(pProcs[i].pid))
+        if (bMoveOnly || !_vidmemPidHasInRange(pProcs[i].pid))
             continue;
         moved = 0;
         (void)_vidmemEvictPidLocked(pGpu, 1, pProcs[i].pid, NULL, 0, NULL, &moved);
@@ -4870,7 +4941,12 @@ vidmemEvictProcess
         return status;
 
     // 12: move inside vidmem (BACKLOG #16), mode 3 of _vidmemEvictPidLocked().
-    if (mode == 14)
+    if (mode == 15)
+    {
+        _vidmemFgOwnEnabled = (arg != 0);
+        EVICT_PRINTF("the foreground's own memory for its allocation: %s\n", _vidmemFgOwnEnabled ? "on" : "off");
+    }
+    else if (mode == 14)
     {
         _vidmemMoveShared = (arg != 0);
         EVICT_PRINTF("window buffers %s inside vidmem\n", _vidmemMoveShared ? "move" : "do not move");

@@ -1,0 +1,24 @@
+# BACKLOG #7 (the user's choice 2026-11-06): the focused window gets its
+# allocation even when nobody is left to give; as much of its own older memory
+# goes to sysmem instead. A WebGPU page focused next to memory that cannot
+# move was denied and died. A game is still turned away (its engine falls back
+# by itself, and a move inside its allocation stalls its frame, #5).
+cap 4000
+proc 1614 kwin_wayland old
+proc 700 pinned old never chunk=64      # nobody may move it
+proc 2617 chrome old chunk=16
+act 1614 0 4
+act 700 0 10
+place 700 3000 0 0
+
+mark the browser, focused, fills what is left and asks for more
+hint 2617 f
+act 2617 0 20
+target 2617 900 0.9
+at 6
+alloc 2617 192 n=6
+at 10
+expect denied 2617 == 0          # it got all of them
+expect evicted 2617 >= 64        # paid with its own older memory
+expect evicted 2617 <= 400       # about what it asked for, not more
+expect evicted 700 == 0

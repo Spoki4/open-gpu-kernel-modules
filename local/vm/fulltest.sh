@@ -15,6 +15,7 @@
 #   contig       contig-test.sh      windows for the compositor's contiguous buffers (#16, #12)
 #   contigloop   contigloop-test.sh  a focused app remaking a contiguous buffer: no loop (#15)
 #   compact      compact-test.sh     background compaction lengthens the free run (#16)
+#   fgown        fgown-test.sh       the focused app gets memory nobody can make room for (#7)
 #   nvtest       vmtest.sh all       the whole bench (15 scenarios; S, #5-#13, R)
 #   desktop      the guest's Plasma session under fragchurn with moves: compaction and
 #                windows now also move buffers the compositor maps (evict.sh
@@ -47,7 +48,7 @@ say() { echo "$*" | tee -a "$log"; }
 gssh() { timeout "${GSSH_T:-60}" local/vm/vm.sh ssh "$@" 2>/dev/null | tr -d '\r'; }
 BAD='Xid|BUG:|Oops|general protection|kernel panic|soft lockup|hung task'
 NOISE="$BAD|can.t update VA|[Aa]ssert|not remade|move copy failed"
-CLEAN="cd '$ROOT/local' && { ./nvt-session.sh stop; pkill -f '[n]vt-'; pkill -x gbm-hog; pkill -f '[f]ragchurn'; pkill -f '[c]ontig'; pkill -f '[c]ompact-test'; : | sudo -n tee /proc/driver/nvidia/vidmem_hints; } >/dev/null 2>&1; true"
+CLEAN="cd '$ROOT/local' && { ./nvt-session.sh stop; pkill -f '[n]vt-'; pkill -x gbm-hog; pkill -f '^[.]/sddm-greeter'; pkill -f '[f]ragchurn'; pkill -f '[c]ontig'; pkill -f '[c]ompact-test'; : | sudo -n tee /proc/driver/nvidia/vidmem_hints; } >/dev/null 2>&1; true"
 
 names=() verdicts=() notes=()
 stop_why=
@@ -121,6 +122,7 @@ stage move 180 900 'MOVETEST PASS' "./move-test.sh"
 stage contig 180 600 'CONTIGTEST PASS' "./contig-test.sh"
 stage contigloop 180 600 'CONTIGLOOPTEST PASS' "./contigloop-test.sh"
 stage compact 180 900 'COMPACTTEST PASS' "./compact-test.sh 120 4096"
+stage fgown 180 600 'FGOWNTEST PASS' "./fgown-test.sh"
 vmt nvtest --no-build --no-reload all
 
 # The real session: kwin and plasmashell with their window buffers, vidmem
