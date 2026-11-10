@@ -125,6 +125,8 @@ NvBool _vidmemAutoActive(void)
 NvU32  _vidmemLowMB = 1024;
 NvU32  _vidmemHighMB = 2560;
 NvU64  _vidmemLastPressureNs;
+NvU32  _vidmemCompactRunMB = VIDMEM_EVICT_COMPACT_RUN_MB;
+static NvU64 _vidmemCompactRestNs;   // no compaction step before this (monotonic ns)
 NvU32  _vidmemBusiestPid;          // updated every tick
 NvU64  _vidmemBusiestSinceNs;      // since when it is the busiest without a break
 NvU64  _vidmemBornBytes;           // allocations created in sysmem
@@ -1116,6 +1118,21 @@ vepPolicyStep(OBJGPU *pGpu)
         }
         _vidmemEvictUpdateReclaimable(pProcs, count, nowNs);
         _vidmemEvictPolicyHints(pGpu, pProcs, count, nowNs);
+        //
+        // A quiet step (nothing moved, no pressure lately): compact a little
+        // (BACKLOG #16), so a contiguous request finds its window instead of
+        // waiting for one to be cleared.
+        //
+        if ((moves == _vidmemPolicyMoves) && (evicted == _vidmemEvictBytes) && (_vidmemCompactRunMB != 0) &&
+            (nowNs >= _vidmemCompactRestNs) &&
+            (VE_AGO_NS(nowNs, _vidmemLastPressureNs) >= (VIDMEM_EVICT_QUIET_SEC * 1000000000ULL)))
+        {
+            _vidmemEvictWhy = VMT_WHY_COMPACT;
+            if (vepPlatCompact(pGpu, pProcs, count,
+                               _vidmemFgIsGame ? VIDMEM_EVICT_COMPACT_GAME_MB : VIDMEM_EVICT_COMPACT_STEP_MB,
+                               _vidmemCompactRunMB) == 0)
+                _vidmemCompactRestNs = nowNs + VIDMEM_EVICT_COMPACT_REST_SEC * 1000000000ULL;
+        }
         // Moves change what is left to reclaim: walk again only after some.
         if ((moves != _vidmemPolicyMoves) || (evicted != _vidmemEvictBytes))
         {

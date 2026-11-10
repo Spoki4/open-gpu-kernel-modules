@@ -205,6 +205,7 @@ sudo ./local/vm/mode.sh vm               # host stops loading nvidia; move a mon
 ./local/vm/vm.sh ssh $PWD/local/move-test.sh    # evict.sh move keeps the content (BACKLOG #16)
 ./local/vm/vm.sh ssh $PWD/local/contig-test.sh  # contiguous buffers in fragmented vidmem: moved inside vidmem
 ./local/vm/vm.sh ssh $PWD/local/fragchurn.sh    # fragment vidmem like a long session
+./local/vm/vm.sh ssh $PWD/local/compact-test.sh # background compaction lengthens the free run
 ./local/vm/vmtest.sh [all|focus|...]     # build on the host, reload in the guest, nvtest under watchdogs
 sudo ./local/vm/mode.sh host             # back to the 3080 Ti on the host after a reboot
 ```

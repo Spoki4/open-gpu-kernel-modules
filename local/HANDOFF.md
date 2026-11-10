@@ -2210,3 +2210,36 @@ host's IOMMU. Back to the normal guest. guest.sh reload now stops
 user@*.service when something still holds the GPU after SDDM stopped (a
 Plasma session that outlived SDDM kept restarting kwin). #5 needs the host:
 `evict.sh evict` there prints the "copy:" line (launches, submit vs wait).
+
+2026-11-10 16:00, BACKLOG #16 step 3: background compaction.
+vepPolicyStep() (hints mode), in a step where nothing moved and the last
+pressure is VIDMEM_EVICT_QUIET_SEC old, calls vepPlatCompact(budget 32 MB,
+8 MB next to a focused game; target _vidmemCompactRunMB = 1024, knob
+`evict.sh compact MB`, procfs "compact", mode 13); a step that did nothing
+rests 14 s. vepPlatCompact() (vidmem_evict.c): per-chunk used frames from the
+PMA map; frames of allocations <= budget of processes that pass
+_vidmemEvictHintVictimOk(VE_LEVEL_FG_IDLE) and are not compositor-mapped are
+movable, any other used frame makes its chunk fixed; among stretches without
+a fixed chunk that are longer than the current longest free run, a
+two-pointer scan picks the longest window whose used frames fit the budget;
+its allocations are relocated (mode 3) with the window as the range and the
+existing longest run as a second range to keep free (_vidmemRelocateKeep*:
+_vidmemRelocate() allocates in the gaps around both). Lessons from the first
+tries: growing only the run that exists does nothing when a fixed chunk sits
+at both ends; without the keep range the moved pages landed in the existing
+run; a 30 s rest met the test apps' 30 s check every time.
+Kernel log line when a step can do nothing ("compaction: longest free run
+...: <why>"); status shows steps and MB moved. local/compact-test.sh [S] [MB].
+2026-11-10 16:30: destination of a relocation. "Anywhere outside the window"
+(PMA's choice) scattered the desktop's small long-lived buffers over vidmem:
+idle guest 54 free runs / longest 2 GB (was 23 / 8.6 GB), and nvtest fgprio
+then failed ("B not back": the game that fills vidmem found no contiguous
+6 MB and kept evicting its own buffers through MakeContig, the #15/I13
+weakness). _vidmemBestFitRange(): the smallest free run (from the PMA map,
+outside the window and the kept run, aligned to the page size) that holds the
+whole allocation; PMA is given that range; only if no single run fits, the
+gaps around the avoided ranges. With a user reserve the block is avoided too.
+After that nvtest all 15/15, move/contig/compact tests pass. Still true: what
+was relocated while vidmem was full stays mid-vidmem afterwards (idle guest
+longest run 4.4 GB after the test series vs 10.7 GB fresh); compaction only
+works toward its 1 GB target. `vm.sh reload tree` restores the fresh layout.
