@@ -231,6 +231,9 @@ memCreateMemDesc_IMPL
     return status;
 }
 
+
+static NV_STATUS _memRestoreEvicted(Memory *pMemory); // local patch, below
+
 NV_STATUS
 memCreateKernelMapping_IMPL
 (
@@ -242,6 +245,7 @@ memCreateKernelMapping_IMPL
     NV_STATUS status;
 
     NV_CHECK_OK_OR_RETURN(LEVEL_INFO, memIsReady(pMemory, NV_FALSE));
+    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, _memRestoreEvicted(pMemory));
 
     if (pMemory->KernelVAddr == NvP64_NULL)
     {
@@ -765,6 +769,7 @@ memGetByHandle_IMPL
         return NV_ERR_INVALID_OBJECT_HANDLE;
 
     NV_CHECK_OK_OR_RETURN(LEVEL_INFO, memIsReady(*ppMemory, NV_FALSE));
+    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, _memRestoreEvicted(*ppMemory));
 
     return NV_OK;
 }
@@ -796,6 +801,24 @@ memGetByHandleAndGroupedGpu_IMPL
     }
 
     *ppMemory = pMemory;
+    return NV_OK;
+}
+
+//
+// Local patch (mem_mgr/vidmem_evict.c): an allocation moved to sysmem keeps
+// working there. Dups, exports, controls and new GPU mappings (which map the
+// sysmem copy, see memGetMemInterMapParams) do not need it back in vidmem;
+// only paths that use its vidmem pages do: CPU mappings and RM-internal
+// lookups by handle (ctxdma for scanout, channel buffers...).
+//
+NV_STATUS vidmemEvictRestoreOnAccess(Memory *pMemory);
+MEMORY_DESCRIPTOR *vidmemEvictGetSysMemDesc(MEMORY_DESCRIPTOR *pMemDesc);
+
+static NV_STATUS
+_memRestoreEvicted(Memory *pMemory)
+{
+    if ((pMemory->pMemDesc != NULL) && (pMemory->pMemDesc->pLocalEvictState != NULL))
+        return vidmemEvictRestoreOnAccess(pMemory);
     return NV_OK;
 }
 
@@ -1016,6 +1039,11 @@ memGetMemInterMapParams_IMPL
 
     pParams->pSrcGpu = pSrcGpu;
     pParams->hMemoryDevice = hMemoryDevice;
+
+    // Local patch: a moved allocation is mapped where its data is now.
+    if (pSrcMemDesc->pLocalEvictState != NULL)
+        pSrcMemDesc = vidmemEvictGetSysMemDesc(pSrcMemDesc);
+
     pParams->pSrcMemDesc = pSrcMemDesc;
 
     return NV_OK;
@@ -1029,6 +1057,7 @@ memGetMemoryMappingDescriptor_IMPL
 )
 {
     NV_CHECK_OK_OR_RETURN(LEVEL_INFO, memIsReady(pMemory, NV_FALSE));
+    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, _memRestoreEvicted(pMemory));
     *ppMemDesc = pMemory->pMemDesc;
     return NV_OK;
 }

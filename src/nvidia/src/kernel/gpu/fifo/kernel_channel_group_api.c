@@ -55,6 +55,7 @@ kchangrpapiConstruct_IMPL
 )
 {
     NvBool                                  bTsgAllocated       = NV_FALSE;
+    NvBool                                  bRpcAllocated       = NV_FALSE;
     RsResourceRef                          *pResourceRef        = pCallContext->pResourceRef;
     NV_STATUS                               rmStatus;
     OBJVASPACE                             *pVAS                = NULL;
@@ -477,6 +478,7 @@ kchangrpapiConstruct_IMPL
                       "KernelChannelGroupApi alloc RPC to vGpu Host failed\n");
             goto failed;
         }
+        bRpcAllocated = NV_TRUE;
 
         if (IS_VIRTUAL_WITH_FULL_SRIOV(pGpu) || IS_GSP_CLIENT(pGpu))
         {
@@ -558,6 +560,23 @@ failed:
         {
             pRmApi->Free(pRmApi, pParams->hClient,
                          pKernelChannelGroupApi->hKernelGraphicsContext);
+        }
+
+        //
+        // Local patch (BACKLOG #3): GSP already has the channel group when a
+        // later step fails (ctxBufPoolReserve() with vidmem full). A failed
+        // construction is never freed through the resource server, so its
+        // bRpcFree does nothing: free it on GSP here, as kchannelConstruct
+        // does for channels. Before, the group stayed allocated on GSP and
+        // every later process that wanted a channel failed (status 0x63)
+        // until a reboot (2026-11-05: plasmashell, then any GPU app).
+        //
+        if (bRpcAllocated)
+        {
+            NV_STATUS status = NV_OK;   // the macro sets it only when there is no RPC object
+
+            NV_RM_RPC_FREE_ON_ERROR(pGpu, pParams->hClient, pParams->hParent, pParams->hResource);
+            (void)status;
         }
 
         if (pKernelChannelGroup != NULL)

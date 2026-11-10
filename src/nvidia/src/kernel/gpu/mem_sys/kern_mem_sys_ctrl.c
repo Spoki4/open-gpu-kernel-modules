@@ -44,6 +44,9 @@
 #include "platform/sli/sli.h"
 #include "os/os.h"
 
+// Local patch: vidmem user reserve (mem_mgr/video_mem.c).
+NvU64 vidmemUserReserveReportedFree(PMA *pPma, RmClient *pRmClient, NvU64 freeBytes);
+
 NV_STATUS
 kmemsysGetFbInfos_VF(OBJGPU *pGpu, KernelMemorySystem *pKernelMemorySystem, RsClient *pClient, Device *pDevice, NvHandle hObject,
                      NV2080_CTRL_FB_GET_INFO_V2_PARAMS *pParams, FBINFO_BITVECTOR *pFbInfoListIndicesUnset)
@@ -499,6 +502,10 @@ _kmemsysGetFbInfos
             {
                 NvU64 size = memmgrGetHeapFreeBytes(pGpu, pMemoryManager, pKernelMIGManager, pHeap,
                     bIsPmaEnabled, bIsClientMIGMonitor || bIsClientMIGProfiler);
+                // Local patch: keep the vidmem user reserve out of the reported free memory
+                // (and add what hidden processes could give up, see vidmemUserReserveReportedFree).
+                if (bIsPmaEnabled && (pHeap != NULL) && !(bIsClientMIGMonitor || bIsClientMIGProfiler))
+                    size = vidmemUserReserveReportedFree(pHeap->pPmaObject, dynamicCast(pClient, RmClient), size);
                 NV_ASSERT(NvU64_HI32(size >> 10) == 0);
                 data = NvU64_LO32(size >> 10);
                 break;

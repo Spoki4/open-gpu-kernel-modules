@@ -229,6 +229,520 @@ nv_procfs_read_power(
 
 NV_DEFINE_SINGLE_NVRM_PROCFS_FILE(power);
 
+//
+// Local patch: vidmem census. Root writes a PID, then reads the list of that
+// process's vidmem allocations (see rm_vidmem_census()).
+//
+//   echo 1234 > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_census
+//   cat /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_census
+//
+#define NV_VIDMEM_CENSUS_BUF_SIZE (1024 * 1024)
+
+static NvU32 nv_procfs_vidmem_census_pid;
+
+static int
+nv_procfs_read_vidmem_census(
+    struct seq_file *s,
+    void *v
+)
+{
+    nv_state_t *nv = s->private;
+    nvidia_stack_t *sp = NULL;
+    NvU32 pid = READ_ONCE(nv_procfs_vidmem_census_pid);
+    NV_STATUS status;
+    char *buf;
+
+    if (!NV_IS_SUSER())
+    {
+        return -EPERM;
+    }
+
+    if (pid == 0)
+    {
+        seq_printf(s, "write a PID to this file first\n");
+        return 0;
+    }
+
+    buf = kvmalloc(NV_VIDMEM_CENSUS_BUF_SIZE, GFP_KERNEL);
+    if (buf == NULL)
+    {
+        return -ENOMEM;
+    }
+
+    if (nv_kmem_cache_alloc_stack(&sp) != 0)
+    {
+        kvfree(buf);
+        return -ENOMEM;
+    }
+
+    status = rm_vidmem_census(sp, nv, pid, buf, NV_VIDMEM_CENSUS_BUF_SIZE);
+    if (status == NV_OK)
+    {
+        seq_puts(s, buf);
+    }
+    else
+    {
+        seq_printf(s, "census failed: 0x%x\n", status);
+    }
+
+    nv_kmem_cache_free_stack(sp);
+    kvfree(buf);
+    return 0;
+}
+
+static ssize_t
+nv_procfs_write_vidmem_census(
+    struct file *file,
+    const char __user *buf,
+    size_t count,
+    loff_t *pos
+)
+{
+    unsigned int pid;
+    int ret;
+
+    if (!NV_IS_SUSER())
+    {
+        return -EPERM;
+    }
+
+    ret = kstrtouint_from_user(buf, count, 10, &pid);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    WRITE_ONCE(nv_procfs_vidmem_census_pid, pid);
+    return count;
+}
+
+static ssize_t
+nv_procfs_read_lock_vidmem_census(
+    struct file *file,
+    char __user *buf,
+    size_t size,
+    loff_t *ppos
+)
+{
+    int ret = nv_down_read_interruptible(&nv_system_pm_lock);
+
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    size = seq_read(file, buf, size, ppos);
+    up_read(&nv_system_pm_lock);
+    return size;
+}
+
+//
+// Size the seq_file buffer up front: on overflow seq_read() would call the
+// show handler again with a bigger buffer and redo the whole census.
+//
+static int
+nv_procfs_open_vidmem_census(
+    struct inode *inode,
+    struct file *file
+)
+{
+    return single_open_size(file, nv_procfs_read_vidmem_census,
+                            NV_PDE_DATA(inode), NV_VIDMEM_CENSUS_BUF_SIZE + PAGE_SIZE);
+}
+
+static const nv_proc_ops_t nv_procfs_vidmem_census_fops = {
+    NV_PROC_OPS_SET_OWNER()
+    .NV_PROC_OPS_OPEN    = nv_procfs_open_vidmem_census,
+    .NV_PROC_OPS_READ    = nv_procfs_read_lock_vidmem_census,
+    .NV_PROC_OPS_WRITE   = nv_procfs_write_vidmem_census,
+    .NV_PROC_OPS_LSEEK   = seq_lseek,
+    .NV_PROC_OPS_RELEASE = single_release,
+};
+
+//
+// Local patch: move a process's vidmem to sysmem and back (see
+// rm_vidmem_evict()). Root only. The write runs the command, a read returns
+// the result of the last one.
+//
+//   echo "dry 1234"     > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
+//   echo "evict 1234"   > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
+//   echo "restore 1234" > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
+//   echo "status"       > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
+//   echo "auto 0"       > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict  (1: on)
+//   echo "shared 1234"  > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
+//   cat /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
+//
+#define NV_VIDMEM_EVICT_BUF_SIZE (256 * 1024)
+
+static DEFINE_MUTEX(nv_procfs_vidmem_evict_lock);
+static char *nv_procfs_vidmem_evict_result;
+
+static int
+nv_procfs_read_vidmem_evict(
+    struct seq_file *s,
+    void *v
+)
+{
+    if (!NV_IS_SUSER())
+    {
+        return -EPERM;
+    }
+
+    mutex_lock(&nv_procfs_vidmem_evict_lock);
+    if (nv_procfs_vidmem_evict_result != NULL)
+        seq_puts(s, nv_procfs_vidmem_evict_result);
+    else
+        seq_puts(s, "write \"dry|evict|restore PID\" to this file first\n");
+    mutex_unlock(&nv_procfs_vidmem_evict_lock);
+    return 0;
+}
+
+static ssize_t
+nv_procfs_write_vidmem_evict(
+    struct file *file,
+    const char __user *ubuf,
+    size_t count,
+    loff_t *pos
+)
+{
+    nv_state_t *nv = NV_PDE_DATA(file_inode(file));
+    nvidia_stack_t *sp = NULL;
+    char cmd[64];
+    char *arg;
+    unsigned int pid;
+    NvU32 mode;
+    NV_STATUS status;
+    int ret;
+
+    if (!NV_IS_SUSER())
+    {
+        return -EPERM;
+    }
+
+    if ((count == 0) || (count >= sizeof(cmd)))
+    {
+        return -EINVAL;
+    }
+    if (copy_from_user(cmd, ubuf, count))
+    {
+        return -EFAULT;
+    }
+    cmd[count] = '\0';
+
+    strim(cmd);
+    arg = strchr(cmd, ' ');
+    if (arg != NULL)
+        *arg++ = '\0';
+
+    if (strcmp(cmd, "dry") == 0)
+        mode = 0;
+    else if (strcmp(cmd, "evict") == 0)
+        mode = 1;
+    else if (strcmp(cmd, "restore") == 0)
+        mode = 2;
+    else if (strcmp(cmd, "status") == 0)
+        mode = 3;
+    else if (strcmp(cmd, "auto") == 0)
+        mode = 4;
+    else if (strcmp(cmd, "shared") == 0)
+        mode = 5;
+    else if (strcmp(cmd, "trace") == 0)
+        mode = 6;
+    else if (strcmp(cmd, "windows") == 0)
+        mode = 7;
+    else if (strcmp(cmd, "quiesce") == 0)
+        mode = 8;
+    else if (strcmp(cmd, "hot") == 0)
+        mode = 10;
+    else if (strcmp(cmd, "trace-lock") == 0)
+        mode = 11;
+    else
+        return -EINVAL;
+
+    pid = 0;
+    if (mode != 3)
+    {
+        if (arg == NULL)
+            return -EINVAL;
+        ret = kstrtouint(strim(arg), 10, &pid);
+        if ((ret < 0) || ((mode != 4) && (mode != 6) && (mode != 7) && (mode != 8) && (mode != 10) && (mode != 11) && (pid == 0)))
+        {
+            return -EINVAL;
+        }
+    }
+
+    ret = nv_down_read_interruptible(&nv_system_pm_lock);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    mutex_lock(&nv_procfs_vidmem_evict_lock);
+    if (nv_procfs_vidmem_evict_result == NULL)
+    {
+        nv_procfs_vidmem_evict_result = kvmalloc(NV_VIDMEM_EVICT_BUF_SIZE, GFP_KERNEL);
+    }
+    if ((nv_procfs_vidmem_evict_result == NULL) || (nv_kmem_cache_alloc_stack(&sp) != 0))
+    {
+        mutex_unlock(&nv_procfs_vidmem_evict_lock);
+        up_read(&nv_system_pm_lock);
+        return -ENOMEM;
+    }
+
+    status = rm_vidmem_evict(sp, nv, mode, pid, nv_procfs_vidmem_evict_result,
+                             NV_VIDMEM_EVICT_BUF_SIZE);
+    if (status != NV_OK)
+    {
+        snprintf(nv_procfs_vidmem_evict_result, NV_VIDMEM_EVICT_BUF_SIZE,
+                 "%s %u failed: 0x%x\n", cmd, pid, status);
+    }
+
+    nv_kmem_cache_free_stack(sp);
+    mutex_unlock(&nv_procfs_vidmem_evict_lock);
+    up_read(&nv_system_pm_lock);
+
+    return (status == NV_OK) ? count : -EIO;
+}
+
+static int
+nv_procfs_open_vidmem_evict(
+    struct inode *inode,
+    struct file *file
+)
+{
+    return single_open_size(file, nv_procfs_read_vidmem_evict,
+                            NV_PDE_DATA(inode), NV_VIDMEM_EVICT_BUF_SIZE + PAGE_SIZE);
+}
+
+static const nv_proc_ops_t nv_procfs_vidmem_evict_fops = {
+    NV_PROC_OPS_SET_OWNER()
+    .NV_PROC_OPS_OPEN    = nv_procfs_open_vidmem_evict,
+    .NV_PROC_OPS_READ    = seq_read,
+    .NV_PROC_OPS_WRITE   = nv_procfs_write_vidmem_evict,
+    .NV_PROC_OPS_LSEEK   = seq_lseek,
+    .NV_PROC_OPS_RELEASE = single_release,
+};
+
+//
+// Local patch: window state hints for vidmem eviction, written by the
+// compositor (KWin script local/kwin-vram-hints) as the desktop user. What
+// one open() of the file writes is a full snapshot (several write() calls
+// are joined), one "<pid> <state> [g]" per line, state f
+// (foreground: active window), v (visible) or h (hidden: minimized, other
+// desktop, covered); g: the process has a fullscreen window (a game, when
+// it keeps the GPU busy; BACKLOG R4). Writable by everyone; a pid is taken only if it
+// belongs to the writer (or the writer is root). The driver reacts at once
+// in a work item (rm_vidmem_evict mode 9: restore what became visible, make
+// room by moving hidden processes out), so the compositor never waits.
+//
+//   printf '1234 f\n5678 h\n' > /proc/driver/nvidia/vidmem_hints
+//   cat /proc/driver/nvidia/vidmem_hints
+// One file for the system (the table is global); the policy runs for the
+// GPU whose procfs directory was created first.
+//
+#define NV_VIDMEM_HINT_WRITE_MAX 16384
+#define NV_VIDMEM_HINT_MAX_ENTRIES 512
+
+void nv_vidmem_hints_set(const NvU32 *pids, const NvU8 *states, NvU32 count, NvBool bAppend);  // os-interface.c
+void nv_vidmem_trace_hints(const NvU32 *pids, const NvU8 *states, NvU32 count);                // nv-vidmem-trace.c
+NvU32 nv_vidmem_hints_get(NvU32 *pids, NvU8 *states, NvU32 max, NvU32 *pGen);
+
+static nv_state_t *nv_vidmem_hint_nv;
+static atomic_t nv_vidmem_hint_writes = ATOMIC_INIT(0);
+
+static void
+nv_vidmem_hint_work_fn(struct work_struct *work)
+{
+    nvidia_stack_t *sp = NULL;
+    char *buf;
+
+    if ((nv_vidmem_hint_nv == NULL) || (down_read_trylock(&nv_system_pm_lock) == 0))
+        return;
+    buf = kmalloc(512, GFP_KERNEL);
+    if ((buf != NULL) && (nv_kmem_cache_alloc_stack(&sp) == 0))
+    {
+        (void)rm_vidmem_evict(sp, nv_vidmem_hint_nv, 9, 0, buf, 512);
+        nv_kmem_cache_free_stack(sp);
+    }
+    kfree(buf);
+    up_read(&nv_system_pm_lock);
+}
+
+static DECLARE_WORK(nv_vidmem_hint_work, nv_vidmem_hint_work_fn);
+
+static NvBool
+nv_vidmem_hint_pid_allowed(NvU32 pid)
+{
+    struct task_struct *task;
+    NvBool ok = NV_FALSE;
+
+    if (capable(CAP_SYS_ADMIN))
+        return NV_TRUE;
+    rcu_read_lock();
+    task = pid_task(find_pid_ns(pid, &init_pid_ns), PIDTYPE_PID);
+    if (task != NULL)
+        ok = uid_eq(task_uid(task), current_fsuid());
+    rcu_read_unlock();
+    return ok;
+}
+
+static int
+nv_procfs_read_vidmem_hints(
+    struct seq_file *s,
+    void *v
+)
+{
+    NvU32 *pids = kmalloc_array(NV_VIDMEM_HINT_MAX_ENTRIES, sizeof(NvU32), GFP_KERNEL);
+    NvU8 *states = kmalloc(NV_VIDMEM_HINT_MAX_ENTRIES, GFP_KERNEL);
+    NvU32 n, gen, i;
+
+    if ((pids != NULL) && (states != NULL))
+    {
+        n = nv_vidmem_hints_get(pids, states, NV_VIDMEM_HINT_MAX_ENTRIES, &gen);
+        seq_printf(s, "# generation %u, %u entries, %d writes\n", gen, n, atomic_read(&nv_vidmem_hint_writes));
+        for (i = 0; i < n; i++)
+            seq_printf(s, "%u %c%s\n", pids[i], "?hvf"[states[i] & 3], (states[i] & 4) ? " g" : "");
+    }
+    kfree(pids);
+    kfree(states);
+    return 0;
+}
+
+static ssize_t
+nv_procfs_write_vidmem_hints(
+    struct file *file,
+    const char __user *buffer,
+    size_t count,
+    loff_t *pos
+)
+{
+    NvU32 *pids;
+    NvU8 *states;
+    char *text, *line, *cur;
+    NvU32 n = 0;
+
+    if (count > NV_VIDMEM_HINT_WRITE_MAX)
+        return -EINVAL;
+    text = kmalloc(count + 1, GFP_KERNEL);
+    pids = kmalloc_array(NV_VIDMEM_HINT_MAX_ENTRIES, sizeof(NvU32), GFP_KERNEL);
+    states = kmalloc(NV_VIDMEM_HINT_MAX_ENTRIES, GFP_KERNEL);
+    if ((text == NULL) || (pids == NULL) || (states == NULL))
+    {
+        kfree(text);
+        kfree(pids);
+        kfree(states);
+        return -ENOMEM;
+    }
+    if (copy_from_user(text, buffer, count))
+    {
+        kfree(text);
+        kfree(pids);
+        kfree(states);
+        return -EFAULT;
+    }
+    text[count] = '\0';
+
+    cur = text;
+    while (((line = strsep(&cur, "\n")) != NULL) && (n < NV_VIDMEM_HINT_MAX_ENTRIES))
+    {
+        unsigned int pid;
+        char st, flag = 0;
+
+        if (sscanf(line, "%u %c %c", &pid, &st, &flag) < 2)
+            continue;
+        if ((pid == 0) || !nv_vidmem_hint_pid_allowed(pid))
+            continue;
+        switch (st)
+        {
+            case 'f': states[n] = 3; break;
+            case 'v': states[n] = 2; break;
+            case 'h': states[n] = 1; break;
+            default: continue;
+        }
+        if (flag == 'g')
+            states[n] |= 4;
+        pids[n++] = pid;
+    }
+
+    nv_vidmem_hints_set(pids, states, n, *pos != 0);
+    {
+        NvU32 i;
+
+        // The trace keeps the window state alone (0..3), as before.
+        for (i = 0; i < n; i++)
+            states[i] &= 3;
+    }
+    nv_vidmem_trace_hints(pids, states, n);
+    *pos += count;
+    atomic_inc(&nv_vidmem_hint_writes);
+    kfree(text);
+    kfree(pids);
+    kfree(states);
+
+    if (nv_vidmem_hint_nv != NULL)
+        schedule_work(&nv_vidmem_hint_work);
+    return count;
+}
+
+static int
+nv_procfs_open_vidmem_hints(
+    struct inode *inode,
+    struct file *file
+)
+{
+    return single_open(file, nv_procfs_read_vidmem_hints, NV_PDE_DATA(inode));
+}
+
+static const nv_proc_ops_t nv_procfs_vidmem_hints_fops = {
+    NV_PROC_OPS_SET_OWNER()
+    .NV_PROC_OPS_OPEN    = nv_procfs_open_vidmem_hints,
+    .NV_PROC_OPS_READ    = seq_read,
+    .NV_PROC_OPS_WRITE   = nv_procfs_write_vidmem_hints,
+    .NV_PROC_OPS_LSEEK   = seq_lseek,
+    .NV_PROC_OPS_RELEASE = single_release,
+};
+
+//
+// Local patch, readable by everyone (see rm_vidmem_pma_info()):
+//   <free MB> <largest contiguous free MB> <reserve block MB> <block free MB> <block largest free MB>
+// Scanout buffers need one contiguous block; the reserve block is the bottom
+// of vidmem kept for the compositor.
+//
+static int
+nv_procfs_read_vidmem_pma(
+    struct seq_file *s,
+    void *v
+)
+{
+    nv_state_t *nv = s->private;
+    nvidia_stack_t *sp = NULL;
+    NvU64 info[RM_VIDMEM_PMA_INFO_COUNT];
+    NV_STATUS status;
+    int i;
+
+    if (nv_kmem_cache_alloc_stack(&sp) != 0)
+    {
+        return -ENOMEM;
+    }
+
+    status = rm_vidmem_pma_info(sp, nv, info, RM_VIDMEM_PMA_INFO_COUNT);
+    nv_kmem_cache_free_stack(sp);
+
+    if (status != NV_OK)
+    {
+        return -EIO;
+    }
+
+    for (i = 0; i < RM_VIDMEM_PMA_INFO_COUNT; i++)
+    {
+        seq_printf(s, "%s%llu", (i == 0) ? "" : " ", info[i] >> 20);
+    }
+    seq_puts(s, "\n");
+    return 0;
+}
+
+NV_DEFINE_SINGLE_NVRM_PROCFS_FILE(vidmem_pma);
+
 static int
 nv_procfs_read_version(
     struct seq_file *s,
@@ -1380,6 +1894,12 @@ int nv_procfs_init(void)
     if (!entry)
         goto failed;
 
+    // Local patch: written by the desktop user's compositor (see nv_procfs_write_vidmem_hints).
+    entry = proc_create_data("vidmem_hints", S_IFREG | 0666, proc_nvidia,
+                             &nv_procfs_vidmem_hints_fops, NULL);
+    if (!entry)
+        goto failed;
+
     entry = NV_CREATE_PROC_FILE("registry", proc_nvidia, registry, NULL);
     if (!entry)
         goto failed;
@@ -1474,6 +1994,22 @@ int nv_procfs_add_gpu(nv_linux_state_t *nvl)
     if (!entry)
         goto failed;
 
+    entry = NV_CREATE_PROC_FILE("vidmem_census", proc_nvidia_gpu, vidmem_census, nv);
+    if (!entry)
+        goto failed;
+
+    entry = NV_CREATE_PROC_FILE("vidmem_pma", proc_nvidia_gpu, vidmem_pma, nv);
+    if (!entry)
+        goto failed;
+
+    entry = NV_CREATE_PROC_FILE("vidmem_evict", proc_nvidia_gpu, vidmem_evict, nv);
+    if (!entry)
+        goto failed;
+
+    // The policy run for window hints (nv_procfs_write_vidmem_hints) uses this GPU.
+    if (nv_vidmem_hint_nv == NULL)
+        nv_vidmem_hint_nv = nv;
+
     if (IS_EXERCISE_ERROR_FORWARDING_ENABLED())
     {
         entry = NV_CREATE_PROC_FILE("exercise_error_forwarding", proc_nvidia_gpu,
@@ -1519,5 +2055,11 @@ void nv_procfs_remove_gpu(nv_linux_state_t *nvl)
 {
 #if defined(CONFIG_PROC_FS)
     proc_remove(nvl->proc_dir);
+    // The vidmem_hints work item calls into RM with this GPU's nv_state_t.
+    if (nv_vidmem_hint_nv == NV_STATE_PTR(nvl))
+    {
+        nv_vidmem_hint_nv = NULL;
+        cancel_work_sync(&nv_vidmem_hint_work);
+    }
 #endif
 }

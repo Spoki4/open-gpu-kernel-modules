@@ -921,6 +921,20 @@ exit:
 }
 
 
+// Local patch: do all regions start on 2 MB (numFree2mbPages is exact only then)?
+static NvBool
+_pmaRegionsAligned2mb(PMA *pPma)
+{
+    NvU32 i;
+
+    for (i = 0; i < pPma->regSize; i++)
+    {
+        if ((pPma->pRegDescriptors[i] != NULL) && !NV_IS_ALIGNED64(pPma->pRegDescriptors[i]->base, _PMA_2MB))
+            return NV_FALSE;
+    }
+    return NV_TRUE;
+}
+
 NV_STATUS
 _pmaPredictOutOfMemory
 (
@@ -939,7 +953,19 @@ _pmaPredictOutOfMemory
     partialFlag = !!((allocationOptions->flags) & PMA_ALLOCATE_ALLOW_PARTIAL);
     alignment   = allocationOptions->alignment;
 
-    if ((alignFlag && (alignment == _PMA_2MB)) || pageSize == _PMA_2MB)
+    //
+    // Local patch: numFree2mbPages counts 2 MB groups of frames from each
+    // region's base (halves of the 64-bit map words), but 2 MB pages are
+    // placed at physically 2 MB-aligned addresses (the scans align
+    // addrBase up). On a region that does not start on 2 MB (GA102 in the
+    // test VM: region 0 at 0x37c0000) a free aligned 2 MB page straddles two
+    // counted groups: with vidmem fragmented (after stress.sh scanout) the
+    // counter said 15 while 35 aligned 2 MB pages were free in every map,
+    // and an allocation of more 2 MB pages than the counter would have been
+    // refused here without a scan. There the counter is no guide; the scan
+    // decides.
+    //
+    if (((alignFlag && (alignment == _PMA_2MB)) || pageSize == _PMA_2MB) && _pmaRegionsAligned2mb(pPma))
     {
         if (allocationOptions->flags & PMA_ALLOCATE_PROTECTED_REGION)
         {

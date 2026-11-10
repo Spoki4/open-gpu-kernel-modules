@@ -42,6 +42,7 @@
 #include <gpu/bif/kernel_bif.h>
 #include "gpu/disp/kern_disp.h"
 #include "ctrl/ctrl0000/ctrl0000system.h"
+#include "mem_mgr/vidmem_trace.h"
 
 //
 // These values were chosen based on some performance testing data
@@ -80,6 +81,8 @@ typedef struct
     NvU16               priority;
     NvU16               priorityPrev;
     NvU64               timestamp;
+    void               *vmtRa;      // local patch (lock trace): where it was taken
+    NvU64               vmtNs;      //   and when (VMT_NOW)
 } GPULOCK;
 
 //
@@ -658,6 +661,9 @@ _rmGpuLocksAcquire(NvU32 gpuMask, NvU32 flags, NvU32 module, void *ra, NvU32 *pG
     NvU32     loopCount;
     NvU32     ownedMask;
     NvU32     prevMask;
+    NvBool    vmtOn = NV_FALSE;
+    NvU64     vmtWait0 = 0, vmtHolder = ~(NvU64)0;
+    void     *vmtHolderRa = NULL;
 
     bHighIrql = (portSyncExSafeToSleep() == NV_FALSE);
     bCondAcquireCheck = ((flags & GPU_LOCK_FLAGS_COND_ACQUIRE) != 0);
@@ -843,6 +849,20 @@ _rmGpuLocksAcquire(NvU32 gpuMask, NvU32 flags, NvU32 module, void *ra, NvU32 *pG
     if (pSys->getProperty(pSys, PDB_PROP_SYS_RM_LOCK_TIME_COLLECT))
         startWaitTime = portTimeGetUptimeNanoseconds();
 
+    // Local patch: lock trace (mem_mgr/vidmem_trace.h), who holds it now.
+    vmtOn = osVidmemTraceOn(VMT_LOCK);
+    if (vmtOn)
+    {
+        vmtWait0 = VMT_NOW();
+        if (gpuMask != 0)
+        {
+            GPULOCK *pFirst = &rmGpuLockInfo.gpuLocks[portUtilCountTrailingZeros32(gpuMask)];
+
+            vmtHolder   = pFirst->threadId;
+            vmtHolderRa = pFirst->vmtRa;
+        }
+    }
+
     //
     // Now (attempt) to acquire the locks...
     //
@@ -1017,6 +1037,8 @@ per_gpu_lock_acquired:
         pGpuLock->priority = priority;
         pGpuLock->priorityPrev = priorityPrev;
         pGpuLock->timestamp = timestamp;
+        pGpuLock->vmtRa = ra;
+        pGpuLock->vmtNs = VMT_NOW();
 
 next_gpu_instance:
         ;
@@ -1028,6 +1050,18 @@ next_gpu_instance:
         timestamp = portTimeGetUptimeNanoseconds();
 
         portAtomicExAddU64(&rmGpuLockInfo.totalWaitTime, timestamp - startWaitTime);
+    }
+    if ((status == NV_OK) && vmtOn && (gpuMaskLocked != 0))
+    {
+        NvU64 vmtNow = VMT_NOW();
+
+        if (vmtNow - vmtWait0 >= vidmemTraceLockNs)
+        {
+            NvU64 a[VMT_ARGS] = { VMT_LOCK_GPU, 1, vmtNow - vmtWait0, 0, (NvU64)(NvUPtr)ra,
+                                  (vmtHolder != ~(NvU64)0) ? vmtHolder : 0,
+                                  (vmtHolder != ~(NvU64)0) ? (NvU64)(NvUPtr)vmtHolderRa : 0 };
+            osVidmemTrace(VMT_LOCK, 0, a);
+        }
     }
 
     // update gpusLockedMask
@@ -1735,6 +1769,19 @@ _rmGpuLocksRelease(NvU32 gpuMask, NvU32 flags, OBJGPU *pDpcGpu, void *ra)
             NV_ASSERT(pGpuLock->threadId == threadId);
             pGpuLock->bRunning = NV_FALSE;
             pGpuLock->threadId = ~(NvU64)0;
+
+            // Local patch: lock trace (mem_mgr/vidmem_trace.h), long holds.
+            if ((gpuInst != GPU_INST_ALLOC_LOCK) && osVidmemTraceOn(VMT_LOCK))
+            {
+                NvU64 now = VMT_NOW();
+
+                if (now - pGpuLock->vmtNs >= vidmemTraceLockNs)
+                {
+                    NvU64 a[VMT_ARGS] = { VMT_LOCK_GPU, 1, 0, now - pGpuLock->vmtNs,
+                                          (NvU64)(NvUPtr)pGpuLock->vmtRa };
+                    osVidmemTrace(VMT_LOCK, 0, a);
+                }
+            }
 
             portAtomicIncrementS32(&pGpuLock->count);
             NV_ASSERT(pGpuLock->count <= 1);
