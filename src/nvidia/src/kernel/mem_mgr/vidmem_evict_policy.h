@@ -223,9 +223,11 @@ NV_STATUS vepPlatMovePid(OBJGPU *pGpu, NvU32 mode, NvU32 pid, NvU64 *pMovedBytes
 void   vepPlatHotRestore(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count);
 // Free 2 MB chunks and the longest run of them (NV_FALSE: unknown).
 NvBool vepPlatChunkInfo(OBJGPU *pGpu, NvU64 *pFreeChunks, NvU64 *pLongest);
-// Clear a contiguous window of `size` (aligned) for the compositor.
+// Clear a contiguous window of `size` (aligned): for the compositor (forPid
+// 0, VE_LEVEL_COMPOSITOR), or for an allocation of `forPid` from those who
+// may give memory at `level`. forPid's own memory never leaves vidmem for it.
 NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
-                         NvU64 *pMovedMB);
+                         NvU32 forPid, NvU32 level, NvU64 *pMovedMB);
 // Background compaction (BACKLOG #16): lengthen the longest run of free 2 MB
 // chunks by moving up to `budgetMB` of memory next to it (of processes not
 // drawing now, never the foreground) to other vidmem pages. Nothing to do when the run already has `wantMB`.
