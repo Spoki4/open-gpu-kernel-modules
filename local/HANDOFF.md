@@ -2203,3 +2203,10 @@ Next for #16: background compaction when idle; relocating compositor-mapped
 allocations (two-phase like evict); letting the window clearing move (not
 evict) drawing processes too. #5 still open: NVVM_VIOMMU=1 experiment not run
 (needs a guest restart: `vm.sh stop` then `NVVM_VIOMMU=1 vm.sh start`).
+2026-11-10 15:45: NVVM_VIOMMU=1 does boot the guest (DMAR on, the GPU in a
+DMA domain), but the GPU then throws Xid 32 on kwin's channel with the stock
+driver (72 in a minute, SDDM never comes up): not a usable way to imitate the
+host's IOMMU. Back to the normal guest. guest.sh reload now stops
+user@*.service when something still holds the GPU after SDDM stopped (a
+Plasma session that outlived SDDM kept restarting kwin). #5 needs the host:
+`evict.sh evict` there prints the "copy:" line (launches, submit vs wait).
