@@ -201,7 +201,7 @@ sudo ./local/vm/mode.sh vm               # host stops loading nvidia; move a mon
 ./local/vm/vm.sh reload                  # swap the guest's driver (SDDM restarts, autologin)
 ./local/vm/vm.sh install                 # the tree build becomes what the guest boots
 ./local/vm/vm.sh log                     # serial log: oopses survive a hung guest
-./local/vm/vm.sh reset                   # hung guest
+./local/vm/vm.sh reset                   # reboot the guest (--force: hard reset of a dead one, may wedge the GPU until a host reboot)
 ./local/vm/vmtest.sh [all|focus|...]     # build on the host, reload in the guest, nvtest under watchdogs
 sudo ./local/vm/mode.sh host             # back to the 3080 Ti on the host after a reboot
 ```

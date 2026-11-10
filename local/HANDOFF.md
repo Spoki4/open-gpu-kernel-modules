@@ -2154,3 +2154,21 @@ BACKLOG #16: vidmem_frag over a whole `nvtest all`
 not fragment vidmem (longest run 0.5-1.7 GB with 0.8-3 GB free), so the VM
 needs a churn scenario (many processes, mixed sizes, starts and exits
 interleaved, evicts and restores) before compaction can be judged there.
+
+2026-11-10 14:45, vm.sh / win.sh: nothing ends a guest by force on its own
+any more (the user: "second time we catch this"). `stop` powers off from
+inside (ssh, then the root shell on the serial console, then ACPI), waits
+180 s and otherwise leaves the guest running with an error; `reset` is a
+reboot from inside (ssh, else serial console) and fails if the guest answers
+on neither; `kill`, a hard reset and the kill after a failed stop need
+`--force`. vmtest.sh's watchdog calls `vm.sh reset`, so it too no longer
+hard-resets. Tested on a guest without the GPU (`start --no-gpu`): kill
+refused, reset over ssh and over the serial console, stop in 2 s.
+Side damage of the kill at 14:03: the guest's boot entry
+(/boot/loader/entries/nvvm.conf, edited with sed -i a minute earlier, FAT)
+came out empty, systemd-boot offered only the firmware. Recovered without
+root on the image: EFI Internal Shell over the serial console
+(`script -qfc "local/vm/vm.sh console" /dev/null` with the keys piped in),
+`fs0:\vmlinuz-linux-cachyos initrd=... root=PARTUUID=...`, then the entry
+rewritten and synced. After writing to the guest's /boot: `sync`.
+The GPU is still wedged from 14:03: host reboot needed.

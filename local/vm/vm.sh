@@ -7,9 +7,14 @@
 #
 #   ./vm.sh start [--no-gpu]     boot the guest (--no-gpu: without the 3080 Ti,
 #                                to test the VM itself while the host still uses it)
-#   ./vm.sh stop                 ACPI shutdown, killed after 60 s
-#   ./vm.sh reset                hard reset (a hung driver)
-#   ./vm.sh kill                 stop QEMU at once
+#   ./vm.sh stop [--force]       power the guest off from inside (ssh, serial console,
+#                                ACPI); if it stays up it is left running (--force:
+#                                QEMU is killed after 180 s)
+#   ./vm.sh reset [--force]      reboot the guest from inside; --force: hard reset
+#   ./vm.sh kill --force         stop QEMU at once
+#                                Forced ends with the guest's GPU driver running wedge
+#                                the GPU until the host is power cycled: only for a
+#                                guest that is dead anyway.
 #   ./vm.sh status
 #   ./vm.sh input on|off         hand keyboard and mouse to the guest (both Ctrl
 #                                switch between host and guest while on)
@@ -215,20 +220,74 @@ input() {
     esac
 }
 
+# Ending a guest whose GPU driver is running by force (QEMU killed, hard
+# reset) leaves the 3080 Ti wedged until the host is power cycled: GSP stays
+# up and the next driver start fails (2026-11-06, 2026-11-10; HANDOFF). So
+# stop and reset always go through the guest (its poweroff/reboot shuts the
+# driver down): over ssh, then on the serial console (a root shell), then
+# ACPI. Nothing here kills or hard-resets by itself; that takes --force.
+FORCE_HELP="a forced end while the guest's GPU driver runs wedges the GPU until the host is power cycled"
+
+# Run CMD in the guest's root shell on the serial console and wait until the
+# serial log shows PATTERN (root only: the socket is root's).
+serial_cmd() {
+    local cmd=$1 pattern=$2 timeout=$3 from i
+    from=$(stat -c %s "$STATE/serial.log")
+    printf '\n%s\n' "$cmd" | socat -t1 - "UNIX-CONNECT:$RUN/serial.sock" >/dev/null 2>&1 || return 1
+    for i in $(seq "$timeout"); do
+        tail -c +"$((from + 1))" "$STATE/serial.log" | grep -aq "$pattern" && return 0
+        running || return 0
+        sleep 1
+    done
+    return 1
+}
+
 stop() {
-    # From inside first, as the user (root has no key for the guest): a clean
-    # poweroff shuts the GPU driver down. ACPI alone was ignored (2026-11-10,
-    # the guest sat at the SDDM greeter), and the kill that followed left the
-    # 3080 Ti wedged until a host power cycle (GSP still running, see HANDOFF).
     if [[ $EUID -ne 0 ]] && running; then
         ssh_guest 'sudo -n systemctl poweroff' >/dev/null 2>&1 || true
     fi
-    as_root stop
+    as_root stop "$@"
     running || { echo "not running"; return; }
-    qmp '{"execute":"system_powerdown"}' >/dev/null
     local i
-    for i in $(seq 120); do running || { echo "stopped"; return; }; sleep 1; done
-    die "the guest did not shut down in 120 s; not killing it: a kill while its GPU driver runs wedges the GPU until the host is power cycled. Look at ./vm.sh log and ./vm.sh ssh; ./vm.sh kill only if the guest is dead"
+    for i in $(seq 30); do running || { echo "stopped"; return; }; sleep 1; done
+    # ssh did not do it: the serial console, then the ACPI button.
+    serial_cmd 'systemctl poweroff' 'Power down\|reboot: Power' 5 || true
+    qmp '{"execute":"system_powerdown"}' >/dev/null || true
+    for i in $(seq 150); do running || { echo "stopped"; return; }; sleep 1; done
+    if [[ ${1:-} == --force ]]; then
+        echo "no shutdown after 180 s, killing QEMU (--force)"
+        systemctl stop nvvm.service
+        return
+    fi
+    die "the guest did not shut down in 180 s and is left running: $FORCE_HELP. Look at ./vm.sh log and ./vm.sh ssh; ./vm.sh kill --force only if the guest is dead"
+}
+
+# A reboot from inside the guest; --force: a hard reset.
+reset() {
+    if [[ ${1:-} == --force ]]; then
+        as_root reset --force
+        qmp '{"execute":"system_reset"}'
+        return
+    fi
+    running || die "not running"
+    if [[ $EUID -ne 0 ]]; then
+        if ssh_guest 'sudo -n systemctl reboot' >/dev/null 2>&1; then
+            echo "rebooting (./vm.sh wait)"
+            return
+        fi
+    fi
+    as_root reset
+    serial_cmd 'systemctl reboot' 'reboot: Restarting system\|Reached target.*Reboot' 90 ||
+        die "the guest does not answer on ssh or the serial console and is left as it is: $FORCE_HELP. ./vm.sh reset --force only if the guest is dead"
+    echo "rebooting (./vm.sh wait)"
+}
+
+kill_vm() {
+    running || { echo "not running"; return; }
+    [[ ${1:-} == --force ]] ||
+        die "not killing a running guest: $FORCE_HELP. Use ./vm.sh stop; ./vm.sh kill --force only if the guest is dead"
+    as_root kill --force
+    systemctl stop nvvm.service
 }
 
 status() {
@@ -259,9 +318,9 @@ cmd=${1:-}
 shift || true
 case $cmd in
 start) start "$@" ;;
-stop) stop ;;
-reset) as_root reset; qmp '{"execute":"system_reset"}' ;;
-kill) as_root kill; systemctl stop nvvm.service ;;
+stop) stop "$@" ;;
+reset) reset "$@" ;;
+kill) kill_vm "$@" ;;
 status) status ;;
 input) input "$@" ;;
 console)
