@@ -6,7 +6,15 @@
 // size*size*4 bytes with verdict "compressed").
 //
 // Build: ./build.sh tools
-// Usage: compr-test [--size N] [--interval-ms M] [--mode write|hold] [--iterations K]
+// Usage: compr-test [--size N] [--interval-ms M] [--mode write|hold] [--iterations K] [--chunk-mb C]
+//
+//   --noise         hold mode with every pixel different (uploaded once), so the
+//                   memory holds data the GPU cannot compress.
+//   --chunk-mb C    the image is not given a dedicated allocation: it sits at the
+//                   start of a plain C MB vkAllocateMemory block of its memory type,
+//                   the way DXVK/vkd3d suballocate images from 256 MB chunks. The
+//                   driver backs such a block with 64 KB pages (a dedicated image
+//                   gets 2 MB pages), which is the slow case of BACKLOG #5.
 //
 //   write (default) every iteration: full clear (vkCmdClearColorImage, usually a
 //                   fast clear), four rectangle clears inside a render pass
@@ -135,15 +143,17 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
 
 int main(int argc, char **argv)
 {
-    uint32_t size = 2048, interval_ms = 500;
+    uint32_t size = 2048, interval_ms = 500, chunk_mb = 0;
     long iterations = -1;
-    int hold = 0, keep_going = 0;
+    int hold = 0, keep_going = 0, noise = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--size") && i + 1 < argc)
             size = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--interval-ms") && i + 1 < argc)
             interval_ms = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--chunk-mb") && i + 1 < argc)
+            chunk_mb = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--iterations") && i + 1 < argc)
             iterations = strtol(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
@@ -152,6 +162,8 @@ int main(int argc, char **argv)
                 hold = 1;
             else if (strcmp(m, "write"))
                 goto usage;
+        } else if (!strcmp(argv[i], "--noise")) {
+            noise = hold = 1;
         } else if (!strcmp(argv[i], "--keep-going"))
             keep_going = 1;
         else
@@ -212,8 +224,11 @@ int main(int argc, char **argv)
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(dev, img, &req);
     VkMemoryDedicatedAllocateInfo ded = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .image = img };
+    VkDeviceSize alloc_size = req.size;
+    if (chunk_mb && ((VkDeviceSize)chunk_mb << 20) > alloc_size)
+        alloc_size = (VkDeviceSize)chunk_mb << 20;
     VkMemoryAllocateInfo mai = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ded, .allocationSize = req.size,
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = chunk_mb ? NULL : &ded, .allocationSize = alloc_size,
         .memoryTypeIndex = find_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
     };
@@ -256,7 +271,8 @@ int main(int argc, char **argv)
     VkDeviceMemory bufmem[2];
     void *maps[2];
     VkDeviceSize sizes[2] = { rb_size, up_size };
-    VkBufferUsageFlags usages[2] = { VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
+    VkBufferUsageFlags usages[2] = { VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
     for (int i = 0; i < 2; i++) {
         VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sizes[i],
                                    .usage = usages[i], .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
@@ -291,8 +307,9 @@ int main(int argc, char **argv)
     if (!want)
         return 2;
 
-    printf("compr-test pid %d: %ux%u RGBA8 image, %llu KB dedicated allocation, mode %s\n",
-           getpid(), size, size, (unsigned long long)(req.size >> 10), hold ? "hold" : "write");
+    printf("compr-test pid %d: %ux%u RGBA8 image, %llu KB %s allocation, mode %s\n",
+           getpid(), size, size, (unsigned long long)(alloc_size >> 10), chunk_mb ? "chunk" : "dedicated",
+           hold ? "hold" : "write");
     fflush(stdout);
 
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -303,7 +320,12 @@ int main(int argc, char **argv)
         int write = !hold || it == 0;
         VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
 
-        if (write) {
+        if (write && noise) {
+            // Every pixel different: nothing for the GPU to compress.
+            uint32_t *up = maps[0];
+            for (size_t i = 0; i < (size_t)size * size; i++)
+                want[i] = up[i] = mix((uint32_t)i * 2654435761u + 12345);
+        } else if (write) {
             uint32_t *up = maps[1];
             for (uint32_t y = 0; y < BLOCK; y++)
                 for (uint32_t x = 0; x < BLOCK; x++)
@@ -312,7 +334,14 @@ int main(int argc, char **argv)
 
         check(vkResetCommandBuffer(cb, 0), "vkResetCommandBuffer");
         check(vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer");
-        if (write) {
+        if (write && noise) {
+            VkBufferImageCopy upr = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                      .imageExtent = { size, size, 1 } };
+            barrier(cb, img, layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            vkCmdCopyBufferToImage(cb, bufs[0], img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &upr);
+            barrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        } else if (write) {
             VkImageSubresourceRange all = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             VkClearColorValue c = unpack(full_colour(k));
 
@@ -351,7 +380,7 @@ int main(int argc, char **argv)
         check(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
         check(vkResetFences(dev, 1, &fence), "vkResetFences");
 
-        if (write || it == 1)
+        if (!noise && (write || it == 1))
             model(want, size, k);
 
         const uint32_t *got = maps[0];
@@ -378,7 +407,7 @@ int main(int argc, char **argv)
     return failures ? 1 : 0;
 
 usage:
-    fprintf(stderr, "usage: %s [--size N>=1024] [--interval-ms M] [--mode write|hold] [--iterations K] [--keep-going]\n",
+    fprintf(stderr, "usage: %s [--size N>=1024] [--interval-ms M] [--mode write|hold] [--iterations K] [--chunk-mb C] [--noise] [--keep-going]\n",
             argv[0]);
     return 2;
 }
