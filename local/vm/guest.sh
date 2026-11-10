@@ -11,7 +11,7 @@
 #   sudo ./guest.sh install stock   remove it again
 #   ./guest.sh status
 #
-# A build that hangs the guest: ./vm.sh reset on the host, the guest comes back
+# A build that hangs the guest: ./vm.sh reset on the host (--force if it is dead; that can wedge the GPU), the guest comes back
 # with the installed build.
 set -euo pipefail
 

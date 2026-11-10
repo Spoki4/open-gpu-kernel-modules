@@ -169,14 +169,26 @@ EOF
 }
 
 stop() {
-    as_root stop
+    as_root stop "$@"
     running || { echo "not running"; return; }
     # Windows ignores the ACPI button here (seen twice): shut down from inside first.
     timeout 20 "${SSH[@]}" 'shutdown /s /t 0' </dev/null 2>/dev/null || true
     qmp '{"execute":"system_powerdown"}' >/dev/null
     local i
     for i in $(seq 180); do running || { echo "stopped"; return; }; sleep 1; done
-    echo "no shutdown after 180 s, killing QEMU"
+    # Killing QEMU while the guest's GPU driver runs wedges the 3080 Ti until
+    # the host is power cycled (vm.sh, 2026-11-10): only when asked.
+    if [[ ${1:-} == --force ]]; then
+        echo "no shutdown after 180 s, killing QEMU (--force)"
+        systemctl stop nvwin.service
+        return
+    fi
+    die "Windows did not shut down in 180 s and is left running (a kill can wedge the GPU until a host power cycle); ./vm.sh win kill --force only if it is dead"
+}
+
+kill_vm() {
+    running || { echo "not running"; return; }
+    [[ ${1:-} == --force ]] || die "not killing a running guest (that can wedge the GPU until a host power cycle): ./vm.sh win stop, or kill --force if it is dead"
     systemctl stop nvwin.service
 }
 
@@ -236,8 +248,8 @@ shift || true
 case $cmd in
 create) create "$@" ;;
 start) launch ;;
-stop) stop ;;
-kill) as_root kill; systemctl stop nvwin.service ;;
+stop) stop "$@" ;;
+kill) as_root kill "$@"; kill_vm "$@" ;;
 destroy) as_root destroy; running && die "running: stop it first"; rm -f "$STATE/disk.img" "$STATE/OVMF_VARS.4m.fd"; echo "removed $STATE/disk.img" ;;
 status)
     if running; then echo "running since $(systemctl show -p ActiveEnterTimestamp --value nvwin.service)"; else echo "not running"; fi
@@ -259,8 +271,8 @@ _root)
     case $sub in
     _launch) launch "$@" ;;
     create) create "$@" ;;
-    stop) stop ;;
-    kill) systemctl stop nvwin.service ;;
+    stop) stop "$@" ;;
+    kill) kill_vm "$@" ;;
     destroy) running && die "running: stop it first"; rm -f "$STATE/disk.img" "$STATE/OVMF_VARS.4m.fd"; echo "removed $STATE/disk.img" ;;
     input) input "$@" ;;
     qmp) qmp "$1" ;;
