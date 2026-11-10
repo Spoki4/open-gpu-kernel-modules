@@ -2097,3 +2097,14 @@ words (checked equal to the bit loop on 20k random maps). nvtrace.py report
 has a "Fragmentation" section and perfetto counters. Host build needs
 LD=ld.lld IGNORE_CC_MISMATCH=1 (CachyOS kernel built with clang), as
 vmtest.sh does.
+
+2026-11-10 13:30: the host was updated before the reboot (kernel 7.3.3,
+nvidia-utils / linux-cachyos-nvidia-open 620.70.06). Our 615 modules live
+in /usr/lib/modules/7.3.1-1-cachyos/updates/nvidia-local only, so in host
+mode the 7.3.3 kernel loads the stock 620.70.06 from extramodules (no
+reserve, no eviction, no vidmem_hints; the KWin script and gamerec find no
+procfs files). The guest is still pinned at 7.3.1 / 615.78.08. vmtest.sh now
+builds in the guest (vm.sh build) when the host has no headers for the guest
+kernel. #16 step 1 passed nvtest all 15/15 there (vmtest-2026-11-10_131303)
+plus a guest trace during comproom (local/trace-logs/fragchk-132411):
+vidmem_frag every ~10 s and after each batch, scan 22-30 us.
