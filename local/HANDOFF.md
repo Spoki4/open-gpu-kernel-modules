@@ -1687,7 +1687,7 @@ user installs on the host.
     (~64 MB) for context buffers. 12:23:28 the next alloc on the same client
     as 11:48:14 (0xc1d00033) failed with 0x63 NV_ERR_STATE_IN_USE: the
     leaked handle of item 3.
-14. **gamerec: no MangoHud log for CoD** although the overlay was on (the
+14. (dropped by the user 10.11) **gamerec: no MangoHud log for CoD** although the overlay was on (the
     screenshot shows it): the game runs under its own wine in
     ~/Games/Call of Duty Modern Warfare 4/, which loads MangoHud with its
     own config, not ~/.config/MangoHud/gamerec.conf. Find that launcher's
@@ -2122,3 +2122,35 @@ lifted, pins put back): kernel 7.3.3, nvidia-utils 620.70.06. nvtest all
 15/15 PASS on the port (vmtest-2026-11-10_133003), no NVRM errors.
 vidmem_frag and the status line work on 620 too. Work continues on
 local/vidmem-620.
+
+2026-11-10 afternoon (VM, driver 620.70.06). BACKLOG #5: the slow case does
+not reproduce in the guest. `compr-test --chunk-mb 256` (new: the image sits
+in a plain 256 MB vkAllocateMemory block, as DXVK does) gives exactly the
+host's slow kind, 256 MB kind 0x8 on 64 KB pages, and it moves at ~19 GB/s
+both ways (14 ms, 4200 CE launches of 64 KB, 3.4 us each), with a cleared
+image or with noise (`--noise`), content intact. `local/compr-speed.sh` runs
+the comparison; evict.sh evict/restore now print "copy: N launches, ms
+submitting, ms waiting" (counters in ce_utils.c, uncommitted). So neither the
+PTE kind nor the content is the cause; the host differs in something else.
+Candidate: the host maps sysmem for the GPU through the IOMMU (DMA-FQ; 64 KB
+chunks for 64 KB-page allocations), the guest's memory is one pinned block.
+`NVVM_VIOMMU=1 vm.sh start` (new) gives the guest an emulated VT-d
+(intel_iommu=on is now in the guest's boot entry; the GPU goes in without its
+audio function, QEMU refuses two functions of one host group behind a vIOMMU)
+to test that: NOT RUN YET. If it confirms: 2 MB sysmem chunks for 64 KB-page
+allocations too (_vidmemEvictBegin, `chunk`).
+The first try killed the GPU for the session: `vm.sh stop` got no ACPI
+shutdown in 60 s and stopped QEMU with the driver running, which leaves GSP's
+WPR2 up (same as 2026-11-06; guest then hangs in OVMF, with NVVM_ROMBAR=0 the
+driver fails RmInitAdapter). Needs a host power cycle. vm.sh stop now powers
+the guest off over ssh first and never kills QEMU by itself.
+BACKLOG #6 (uncommitted, simulator only): hidden processes come back by
+themselves only once the window they made room for has left the focus and
+they would have fitted for VIDMEM_EVICT_HIDDEN_BACK_SEC (300 s) since;
+scenario hidden-cycle.scn; replays 20261107_234433: 104 -> 49 moves,
+20261109_173525: 191 -> 142. Needs `nvtest all` in the VM before the commit.
+BACKLOG #16: vidmem_frag over a whole `nvtest all`
+(local/trace-logs/frag-all-134619): the synthetic tests on a fresh guest do
+not fragment vidmem (longest run 0.5-1.7 GB with 0.8-3 GB free), so the VM
+needs a churn scenario (many processes, mixed sizes, starts and exits
+interleaved, evicts and restores) before compaction can be judged there.

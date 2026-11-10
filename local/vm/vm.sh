@@ -64,7 +64,7 @@ GUEST_USER=spoki4
 die() { echo "vm.sh: $*" >&2; exit 1; }
 # The NVVM_* settings survive sudo thanks to SETENV in the sudoers rule.
 as_root() {
-    [[ $EUID -eq 0 ]] || exec sudo -n --preserve-env=NVVM_MEM,NVVM_ISOLATE,NVVM_INPUT,NVVM_STATE,NVVM_ROMBAR \
+    [[ $EUID -eq 0 ]] || exec sudo -n --preserve-env=NVVM_MEM,NVVM_ISOLATE,NVVM_INPUT,NVVM_STATE,NVVM_ROMBAR,NVVM_VIOMMU \
         "$HERE/vm.sh" "$@"
 }
 running() { systemctl is-active -q nvvm.service; }
@@ -144,14 +144,25 @@ start() {
         -device virtio-rng-pci
         -nodefaults -display none -vga none
     )
+    # NVVM_VIOMMU=1: the guest gets an IOMMU of its own (emulated VT-d; the guest
+    # boots with intel_iommu=on), so the GPU's DMA to guest memory is mapped
+    # piece by piece as the guest driver maps it, the way it is on the host
+    # (DMA-FQ), not as one pinned block (BACKLOG #5). Slower to boot.
+    if [[ ${NVVM_VIOMMU:-0} == 1 ]]; then
+        args+=(-device intel-iommu,caching-mode=on,intremap=off)
+    fi
     if [[ $gpu == 1 ]]; then
         bind_vfio "$GPU"
         bind_vfio "$GPU_AUDIO"
         args+=(
             -device pcie-root-port,id=rp1,chassis=1,slot=1
             -device "vfio-pci,host=$GPU,bus=rp1,addr=00.0,multifunction=on${NVVM_ROMBAR:+,rombar=$NVVM_ROMBAR}"
-            -device "vfio-pci,host=$GPU_AUDIO,bus=rp1,addr=00.1"
         )
+        # Behind a guest IOMMU every function is an address space of its own, and
+        # QEMU refuses two of one host group ("group 13 used in multiple
+        # address spaces"): the GPU goes in without its audio function.
+        [[ ${NVVM_VIOMMU:-0} == 1 ]] ||
+            args+=(-device "vfio-pci,host=$GPU_AUDIO,bus=rp1,addr=00.1")
     fi
 
     rm -f "$RUN/virtiofs.sock"
@@ -205,13 +216,19 @@ input() {
 }
 
 stop() {
+    # From inside first, as the user (root has no key for the guest): a clean
+    # poweroff shuts the GPU driver down. ACPI alone was ignored (2026-11-10,
+    # the guest sat at the SDDM greeter), and the kill that followed left the
+    # 3080 Ti wedged until a host power cycle (GSP still running, see HANDOFF).
+    if [[ $EUID -ne 0 ]] && running; then
+        ssh_guest 'sudo -n systemctl poweroff' >/dev/null 2>&1 || true
+    fi
     as_root stop
     running || { echo "not running"; return; }
     qmp '{"execute":"system_powerdown"}' >/dev/null
     local i
-    for i in $(seq 60); do running || { echo "stopped"; return; }; sleep 1; done
-    echo "no shutdown after 60 s, killing QEMU"
-    systemctl stop nvvm.service
+    for i in $(seq 120); do running || { echo "stopped"; return; }; sleep 1; done
+    die "the guest did not shut down in 120 s; not killing it: a kill while its GPU driver runs wedges the GPU until the host is power cycled. Look at ./vm.sh log and ./vm.sh ssh; ./vm.sh kill only if the guest is dead"
 }
 
 status() {
