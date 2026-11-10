@@ -827,14 +827,35 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
     {
         VIDMEM_EVICT_ACTIVITY *pAct;
         NvU64 needMB = pProcs[i].evictedBytes >> 20, budgetMB, moved = 0;
+        NvU64 contigMB = NV_MIN(pProcs[i].evictedContigBytes >> 20, needMB);
+        NvBool bWindow = NV_FALSE;
 
         if ((pProcs[i].evictedBytes == 0) || (VE_HINT_STATE(pProcs[i].hint) != VE_HINT_FG))
             continue;
         pAct = _vidmemActivityFind(pProcs[i].pid, NV_TRUE);
         _vidmemEvictWhy = VMT_WHY_ROOM;
-        // Room for all of it plus the low mark if others can give it.
-        avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + VIDMEM_EVICT_HINT_LOW_MB,
+        //
+        // Room for all of it plus the low mark if others can give it. Not for
+        // its contiguous buffers: free bytes are no place for them (host,
+        // 2026-11-10 20:45: 379 MB of the game on the other monitor moved out
+        // for Chrome's 130 MB buffers, which then did not fit: "restore failed
+        // 4"). They get a window cleared, one a step, by moving what is in it
+        // to other vidmem pages first (BACKLOG #15).
+        //
+        avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB - contigMB + VIDMEM_EVICT_HINT_LOW_MB,
                                      pProcs[i].pid, VE_LEVEL_FG_RESTORE, "foreground again");
+        if ((contigMB != 0) &&
+            ((pAct->contigFailNs == 0) || (VE_AGO_NS(nowNs, pAct->contigFailNs) >= 10 * 1000000000ULL)))
+        {
+            NvU64 windowMB = 0;
+
+            _vidmemEvictWhy = VMT_WHY_ALLOC;
+            bWindow = vepPlatMakeContig(pGpu, pProcs, count, pProcs[i].evictedContigMax,
+                                        pProcs[i].evictedContigAlign, pProcs[i].pid, VE_LEVEL_FG_RESTORE,
+                                        &windowMB);
+            pAct->contigFailNs = bWindow ? 0 : nowNs;
+            avail = vepPlatAvailMB(pGpu);
+        }
         //
         // Down to a small margin: a game that fills vidmem must get all of
         // it back (nvtest fgprio: the game wants exactly what is there). The
@@ -854,7 +875,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
             budgetMB = (avail > VIDMEM_EVICT_RESTORE_MARGIN_MB) ? avail - VIDMEM_EVICT_RESTORE_MARGIN_MB : 0;
         budgetMB = NV_MIN(budgetMB, _vidmemEvictFgRestoreCapMB(pAct, nowNs));
         // Nothing fitted last time and there is no more room now: no new try.
-        if ((pAct->restoreStuckMB != 0) && (avail <= pAct->restoreStuckMB))
+        if ((pAct->restoreStuckMB != 0) && (avail <= pAct->restoreStuckMB) && !bWindow)
             budgetMB = 0;
         if (budgetMB < VIDMEM_EVICT_MIN_RESTORE_MB)
         {

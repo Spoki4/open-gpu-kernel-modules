@@ -5,7 +5,7 @@
 //
 // Build: ./build.sh tools (no gbm.h needed; links libgbm.so.1 directly).
 // Usage: gbm-hog [--node PATH] [--size WxH] [--scanout] [--linear] [--dumb]
-//                [--max N] [--floor-mb N] [--hold S]
+//                [--max N] [--churn N] [--floor-mb N] [--hold S]
 //
 //   --node PATH   DRM node (default: the NVIDIA render node; --dumb defaults
 //                 to the NVIDIA primary node, dumb buffers need it)
@@ -14,6 +14,9 @@
 //   --linear      GBM_BO_USE_LINEAR
 //   --dumb        DRM_IOCTL_MODE_CREATE_DUMB instead of GBM
 //   --max N       stop after N buffers (default 400)
+//   --churn N     then N times: one more buffer, the oldest one freed (a page
+//                 that remakes its big buffer, BACKLOG #15: Chrome asked for a
+//                 contiguous 130 MB up to 30 times a second); GBM only
 //
 // It also stops when 5 buffers in a row did not take vidmem: nvidia-drm has
 // fallen back to sysmem (NO_SCANOUT only), and going on would fill system RAM.
@@ -81,7 +84,7 @@ static long reserve_mb_from_params(void)
 int main(int argc, char **argv)
 {
     const char *node = NULL;
-    unsigned w = 3840, h = 2160, max = 400, hold = 10;
+    unsigned w = 3840, h = 2160, max = 400, hold = 10, churn = 0, churned = 0;
     unsigned long floor_mb = 150;
     uint32_t flags = GBM_BO_USE_RENDERING;
     int dumb = 0, force = 0;
@@ -100,6 +103,8 @@ int main(int argc, char **argv)
             dumb = 1;
         else if (!strcmp(argv[i], "--max") && i + 1 < argc)
             max = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--churn") && i + 1 < argc)
+            churn = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--floor-mb") && i + 1 < argc)
             floor_mb = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--hold") && i + 1 < argc)
@@ -195,15 +200,29 @@ int main(int argc, char **argv)
             fflush(stdout);
         }
     }
+    // The page remaking its buffer: the new one first, then the old one goes.
+    if (!dumb && count == max && count != 0) {
+        for (; churned < churn; churned++) {
+            struct gbm_bo *bo = gbm_bo_create(gbm, w, h, GBM_FORMAT_ARGB8888, flags);
+            if (!bo) {
+                err = errno;
+                why = "churn-denied";
+                break;
+            }
+            gbm_bo_destroy(bos[churned % count]);
+            bos[churned % count] = bo;
+            usleep(30000);
+        }
+    }
     long end_free = real_free_mb();
     if (end_free < min_free)
         min_free = end_free;
 
     printf("stopped after %u buffers: %s%s%s\n", count, why, err ? ", " : "", err ? strerror(err) : "");
     printf("RESULT mode=%s scanout=%d linear=%d reserve_mb=%ld start_free_mb=%ld end_free_mb=%ld "
-           "min_free_mb=%ld used_mb=%ld count=%u stop=%s guard=%d\n",
+           "min_free_mb=%ld used_mb=%ld count=%u churned=%u stop=%s guard=%d\n",
            dumb ? "dumb" : "gbm", !!(flags & GBM_BO_USE_SCANOUT), !!(flags & GBM_BO_USE_LINEAR),
-           reserve, start_free, end_free, min_free, start_free - end_free, count, why, guard);
+           reserve, start_free, end_free, min_free, start_free - end_free, count, churned, why, guard);
     printf("holding for %u s...\n", hold);
     fflush(stdout);
     sleep(hold);
@@ -219,6 +238,6 @@ int main(int argc, char **argv)
 
 usage:
     fprintf(stderr, "usage: %s [--node PATH] [--size WxH] [--scanout] [--linear] [--dumb] "
-                    "[--max N] [--floor-mb N] [--hold S]\n", argv[0]);
+                    "[--max N] [--churn N] [--floor-mb N] [--hold S]\n", argv[0]);
     return 2;
 }

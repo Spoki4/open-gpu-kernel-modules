@@ -174,6 +174,16 @@ static NvU32 _vidmemEvictTrace;
 // ghostty on the 4K@120 second monitor evicted, the game dropped below 1 fps).
 //
 static NvU32 _vidmemEvictWindows;
+//
+// Window buffers (what the compositor maps too) may still move to other
+// vidmem pages (BACKLOG #16: with a game on screen they were 459 MB that
+// compaction could not touch, and a window cleared for a contiguous buffer
+// had to avoid them): the compositor's channels are stopped for the copy, as
+// when such a buffer is moved out, but nobody draws from sysmem afterwards.
+// evict.sh moveshared on|off; _vidmemCheckForMove: the check is for such a move.
+//
+static NvU32  _vidmemMoveShared = 1;
+static NvBool _vidmemCheckForMove;
 
 //
 // "quiesce N": how a process's channels are stopped before its memory moves
@@ -605,7 +615,7 @@ _vidmemEvictHolderOne
         }
         else if ((pRmClient != NULL) && _vidmemEvictIsCompositor(pRmClient))
         {
-            if (!_vidmemEvictWindows)
+            if (!_vidmemEvictWindows && !(_vidmemCheckForMove && _vidmemMoveShared))
                 return "window-buffer";
             bCompositor = NV_TRUE;
         }
@@ -2481,7 +2491,9 @@ _vidmemEvictPidLocked
             }
             else
             {
+                _vidmemCheckForMove = (mode == 3);
                 reason = _vidmemEvictCheck(pGpu, pRef, pid, pRefs, &numRefs);
+                _vidmemCheckForMove = NV_FALSE;
                 if (reason != NULL)
                 {
                     // Not counted: other holders of buffers handled elsewhere.
@@ -2546,16 +2558,19 @@ _vidmemEvictPidLocked
 
                 if (mode == 3)
                 {
-                    // What the compositor maps too stays where it is (its channels are not stopped here).
-                    if (_vidmemEvictHasCompositor(pRefs, numRefs) ||
-                        ((_vidmemRelocateMaxBytes != 0) && (bytes > _vidmemRelocateMaxBytes)))
+                    if ((_vidmemRelocateMaxBytes != 0) && (bytes > _vidmemRelocateMaxBytes))
                     {
                         skipped++;
                         skippedBytes += bytes;
                         continue;
                     }
-                    status = _vidmemRelocate(pGpu, pMemDesc, pRefs, numRefs,
-                                             _vidmemEvictRangeLo, _vidmemEvictRangeHi);
+                    // What the compositor maps too: in phase 2, with its channels stopped.
+                    status = NV_OK;
+                    if (_vidmemEvictHasCompositor(pRefs, numRefs))
+                        bPending = NV_TRUE;
+                    else
+                        status = _vidmemRelocate(pGpu, pMemDesc, pRefs, numRefs,
+                                                 _vidmemEvictRangeLo, _vidmemEvictRangeHi);
                 }
                 else
                 {
@@ -2583,10 +2598,10 @@ _vidmemEvictPidLocked
                     numPending++;
                     continue;
                 }
-                // No room to defer: undo phase 1.
+                // No room to defer: undo phase 1 (a move has done nothing yet).
                 if (mode == 1)
                     _vidmemEvictAbort(pGpu, pMemDesc, pState, pRefs, numRefs);
-                else
+                else if (mode == 2)
                     _vidmemRestoreAbort(pGpu, pMemDesc, pRefs, numRefs);
                 status = NV_ERR_NO_MEMORY;
             }
@@ -2635,13 +2650,18 @@ _vidmemEvictPidLocked
             {
                 if (mode == 1)
                     _vidmemEvictAbort(pGpu, pP->pMemDesc, pP->pState, pP->pRefs, pP->numRefs);
-                else
+                else if (mode == 2)
                     _vidmemRestoreAbort(pGpu, pP->pMemDesc, pP->pRefs, pP->numRefs);
                 st = status;
             }
             else if (mode == 1)
             {
                 st = _vidmemEvictCommit(pGpu, pP->pMemDesc, pP->pState, pP->pRefs, pP->numRefs);
+            }
+            else if (mode == 3)
+            {
+                st = _vidmemRelocate(pGpu, pP->pMemDesc, pP->pRefs, pP->numRefs,
+                                     _vidmemEvictRangeLo, _vidmemEvictRangeHi);
             }
             else
             {
@@ -3301,6 +3321,15 @@ vepPlatGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
             if (pMemory->pMemDesc->pLocalEvictState != NULL)
             {
                 pProc->evictedBytes += bytes;
+                if ((pMemory->pMemDesc->pPmaAllocInfo != NULL) && pMemory->pMemDesc->pPmaAllocInfo->bContig)
+                {
+                    pProc->evictedContigBytes += bytes;
+                    if (bytes > pProc->evictedContigMax)
+                    {
+                        pProc->evictedContigMax   = bytes;
+                        pProc->evictedContigAlign = pMemory->pMemDesc->pLocalEvictState->restoreAlign;
+                    }
+                }
                 continue;
             }
             pProc->vidmemBytes += bytes;
@@ -3923,21 +3952,25 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
             {
                 Memory *pMemory = dynamicCast(iter.pResourceRef->pResource, Memory);
                 NvU32   numRefs = 0;
+                NvBool  bRefused;
 
                 if ((pMemory == NULL) || (pMemory->pMemDesc == NULL) ||
                     (iter.pResourceRef->externalClassId != NV01_MEMORY_LOCAL_USER) ||
-                    (pMemory->pMemDesc->pLocalEvictState != NULL) ||
-                    (_vidmemEvictCheck(pGpu, iter.pResourceRef, pProcs[i].pid, pRefs, &numRefs) != NULL))
+                    (pMemory->pMemDesc->pLocalEvictState != NULL))
+                    continue;
+                // As a move inside vidmem sees it: that comes first (window buffers too).
+                _vidmemCheckForMove = NV_TRUE;
+                bRefused = (_vidmemEvictCheck(pGpu, iter.pResourceRef, pProcs[i].pid, pRefs, &numRefs) != NULL);
+                _vidmemCheckForMove = NV_FALSE;
+                if (bRefused)
                     continue;
                 //
                 // Its own: only what can go to free pages elsewhere in vidmem
                 // (not a contiguous buffer: the window is cleared because no
-                // free run of that size is left, and not what the compositor
-                // maps: _vidmemRelocate() leaves that).
+                // free run of that size is left).
                 //
                 if (bSelf && ((pMemory->pMemDesc->pPmaAllocInfo == NULL) ||
-                              pMemory->pMemDesc->pPmaAllocInfo->bContig ||
-                              _vidmemEvictHasCompositor(pRefs, numRefs)))
+                              pMemory->pMemDesc->pPmaAllocInfo->bContig))
                     continue;
                 (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pMovable, base, frames);
                 if (bHeavy)
@@ -4134,7 +4167,7 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budge
             {
                 Memory *pMemory = dynamicCast(iter.pResourceRef->pResource, Memory);
                 NvU32   numRefs = 0;
-
+                NvBool  bRefused;
                 NvU64   bytes;
 
                 if ((pMemory == NULL) || (pMemory->pMemDesc == NULL) ||
@@ -4154,17 +4187,19 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budge
                     _vidmemCompactSeen[VC_BIG] += bytes;
                     continue;
                 }
-                if (_vidmemEvictCheck(pGpu, iter.pResourceRef, pProcs[i].pid, pRefs, &numRefs) != NULL)
+                _vidmemCheckForMove = NV_TRUE;
+                bRefused = (_vidmemEvictCheck(pGpu, iter.pResourceRef, pProcs[i].pid, pRefs, &numRefs) != NULL);
+                _vidmemCheckForMove = NV_FALSE;
+                if (bRefused)
                 {
                     _vidmemCompactSeen[VC_REFUSED] += bytes;
                     continue;
                 }
+                // Movable too (the compositor pauses for the copy); counted apart.
                 if (_vidmemEvictHasCompositor(pRefs, numRefs))
-                {
                     _vidmemCompactSeen[VC_SHARED] += bytes;
-                    continue;
-                }
-                _vidmemCompactSeen[VC_MOVABLE] += bytes;
+                else
+                    _vidmemCompactSeen[VC_MOVABLE] += bytes;
                 (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pMovable, base, frames);
             }
         }
@@ -4585,7 +4620,7 @@ _vidmemEvictPrintBlock(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
                      "background compaction: keeps a free run of %u MB, %u steps, %llu MB moved\n",
                      _vidmemContigInVidmemMB, _vidmemCompactRunMB, _vidmemCompactSteps, _vidmemCompactMovedMB);
         EVICT_PRINTF("compaction saw (MB): in use %llu; movable %llu; compositor %llu, foreground %llu, "
-                     "shared with the compositor %llu, bigger than a step %llu, refused %llu\n",
+                     "movable with a pause of the compositor %llu, bigger than a step %llu, refused %llu\n",
                      _vidmemCompactSeenUsed >> 20, _vidmemCompactSeen[VC_MOVABLE] >> 20,
                      _vidmemCompactSeen[VC_DESKTOP] >> 20, _vidmemCompactSeen[VC_FG] >> 20,
                      _vidmemCompactSeen[VC_SHARED] >> 20, _vidmemCompactSeen[VC_BIG] >> 20,
@@ -4835,7 +4870,14 @@ vidmemEvictProcess
         return status;
 
     // 12: move inside vidmem (BACKLOG #16), mode 3 of _vidmemEvictPidLocked().
-    if (mode == 13)
+    if (mode == 14)
+    {
+        _vidmemMoveShared = (arg != 0);
+        EVICT_PRINTF("window buffers %s inside vidmem\n", _vidmemMoveShared ? "move" : "do not move");
+        NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: window buffers %s inside vidmem\n",
+                  _vidmemMoveShared ? "move" : "do not move");
+    }
+    else if (mode == 13)
     {
         _vidmemCompactRunMB = arg;
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: background compaction keeps a free run of %u MB\n", arg);

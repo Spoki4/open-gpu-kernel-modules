@@ -72,6 +72,7 @@ typedef struct
     NvU64 lastStuckLogNs; // monotonic ns of the last "foreground, only N MB free" line
     NvU64 fgSinceNs;      // monotonic ns since when a hint says foreground without a break (0: not)
     NvU64 restoreStuckMB; // free MB when a restore of it last moved nothing (0: not stuck)
+    NvU64 contigFailNs;   // monotonic ns when no window could be cleared for its contiguous buffer (0: not)
     NvU32 outForPid;      // the foreground when the policy last moved it out (0: there was none)
     NvU64 roomSinceNs;    // monotonic ns since when it would fit back with room to spare (0: it would not)
 } VIDMEM_EVICT_ACTIVITY;
@@ -84,6 +85,9 @@ typedef struct
     NvU64 vidmemBytes;    // owned, in vidmem
     NvU64 evictedBytes;   // owned, moved to sysmem
     NvU64 eligibleBytes;  // could be moved now
+    NvU64 evictedContigBytes; // of evictedBytes: contiguous buffers (need a free run to come back)
+    NvU64 evictedContigMax;   // the biggest of them, and the alignment it comes back with
+    NvU64 evictedContigAlign;
     NvBool bNever;
     NvU32 hint;           // VE_HINT_*, | VE_HINT_INHERITED (from an ancestor's windows)
 } VIDMEM_EVICT_PROC;

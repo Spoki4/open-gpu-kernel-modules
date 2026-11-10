@@ -206,6 +206,8 @@ sudo ./local/vm/mode.sh vm               # host stops loading nvidia; move a mon
 ./local/vm/vm.sh ssh $PWD/local/contig-test.sh  # contiguous buffers in fragmented vidmem: moved inside vidmem
 ./local/vm/vm.sh ssh $PWD/local/fragchurn.sh    # fragment vidmem like a long session
 ./local/vm/vm.sh ssh $PWD/local/compact-test.sh # background compaction lengthens the free run
+./local/vm/vm.sh ssh $PWD/local/contigloop-test.sh # a focused app remaking a contiguous buffer: no clearing loop (BACKLOG #15)
+./local/vm/fulltest.sh                          # all of the above + nvtest all + the Plasma session + a game, one verdict
 ./local/vm/vmtest.sh [all|focus|...]     # build on the host, reload in the guest, nvtest under watchdogs
 sudo ./local/vm/mode.sh host             # back to the 3080 Ti on the host after a reboot
 ```
