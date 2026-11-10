@@ -547,6 +547,20 @@ _vidmemEvictHintPickVictim(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU32 exceptP
     return pPick;
 }
 
+// The process whose window is in focus (0: none).
+static NvU32
+_vidmemEvictFgPid(VIDMEM_EVICT_PROC *pProcs, NvU32 count)
+{
+    NvU32 i;
+
+    for (i = 0; i < count; i++)
+    {
+        if (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG)
+            return pProcs[i].pid;
+    }
+    return 0;
+}
+
 // Margin on top of what is missing, per victim (the compositor asks for less).
 static NvU64 _vidmemEvictVictimMarginMB = 64;
 
@@ -594,6 +608,16 @@ _vidmemEvictHintFree(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
         pPick->evictedBytes += moved;
         if (VE_HINT_STATE(pPick->hint) == VE_HINT_VISIBLE)
             _vidmemActivityFind(pPick->pid, NV_TRUE)->evictedForFgNs = osGetMonotonicTimeNs();
+        if (moved != 0)
+        {
+            VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(pPick->pid, NV_TRUE);
+
+            // Who was in focus: it stays out while that one is (step 3, BACKLOG #6).
+            pAct->outForPid   = _vidmemEvictFgPid(pProcs, count);
+            if (pAct->outForPid == pPick->pid)
+                pAct->outForPid = 0;
+            pAct->roomSinceNs = 0;
+        }
         avail = vepPlatAvailMB(pGpu);
     }
     return avail;
@@ -985,23 +1009,48 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
 
     //
     // 3. Plenty free for a while: bring hidden processes back too, so they
-    // are ready when shown (one per step, as without hints).
+    // are ready when shown (one per step, as without hints). They are in no
+    // hurry: shown, they come back at once (steps 1, 1a), and drawing while
+    // hidden, through 1b. So not while the window they made room for is
+    // still in focus, and only after they would have fitted, with what the
+    // foreground keeps, for VIDMEM_EVICT_HIDDEN_BACK_SEC without a break
+    // (BACKLOG #6, host 2026-11-08: the focused window grew and wanted its
+    // headroom, Battle.net, Claude and Steam went out, 37-81 s later it
+    // shrank, after 30 quiet seconds they came back, and at its next growth
+    // went out again: 1.8 GB of copies a round, two 0.75 s freezes with it).
     //
-    if ((_vidmemEvictBytes != 0) &&
-        ((VE_AGO_NS(nowNs, _vidmemLastPressureNs)) >= (VIDMEM_EVICT_QUIET_SEC * 1000000000ULL)))
     {
-        for (i = 0; i < count; i++)
+        NvU32  fgPid  = _vidmemEvictFgPid(pProcs, count);
+        NvBool bQuiet = (VE_AGO_NS(nowNs, _vidmemLastPressureNs)) >= (VIDMEM_EVICT_QUIET_SEC * 1000000000ULL);
+        NvBool bMoved = NV_FALSE;
+
+        for (i = 0; (i < count) && (_vidmemEvictBytes != 0); i++)
         {
+            VIDMEM_EVICT_ACTIVITY *pAct;
             NvU64 needMB = pProcs[i].evictedBytes >> 20;
 
-            if ((pProcs[i].evictedBytes == 0) || pProcs[i].bNever || (keepMB == VIDMEM_EVICT_KEEP_BLOCKED) ||
+            if ((pProcs[i].evictedBytes == 0) || pProcs[i].bNever)
+                continue;
+            pAct = _vidmemActivityFind(pProcs[i].pid, NV_TRUE);
+            // The wait starts when that window leaves the focus: a look at another one is not the end of the game.
+            if ((keepMB == VIDMEM_EVICT_KEEP_BLOCKED) ||
+                ((pAct->outForPid != 0) && (pAct->outForPid == fgPid)) ||
                 (avail < needMB + NV_MAX((NvU64)_vidmemHighMB, keepMB)))
+            {
+                pAct->roomSinceNs = 0;
+                continue;
+            }
+            if (pAct->roomSinceNs == 0)
+                pAct->roomSinceNs = nowNs;
+            if (bMoved || !bQuiet ||
+                (VE_AGO_NS(nowNs, pAct->roomSinceNs) < VIDMEM_EVICT_HIDDEN_BACK_SEC * 1000000000ULL))
                 continue;
             NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: plenty free (%llu MB), restoring %s (pid %u, %llu MB)\n",
                       avail, pProcs[i].name, pProcs[i].pid, needMB);
             _vidmemEvictWhy = VMT_WHY_IDLE_BACK;
             (void)_veMove(pGpu, 2, pProcs[i].pid, NULL);
-            break;
+            pAct->outForPid = 0;
+            bMoved = NV_TRUE;
         }
     }
 }

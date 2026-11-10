@@ -26,6 +26,8 @@
 #define VIDMEM_EVICT_TICK_SEC       2
 #define VIDMEM_EVICT_IDLE_SEC       10
 #define VIDMEM_EVICT_QUIET_SEC      30
+// A hidden process comes back by itself only after it would have fitted for this long.
+#define VIDMEM_EVICT_HIDDEN_BACK_SEC 300
 #define VIDMEM_EVICT_HYST_MB        512
 #define VIDMEM_EVICT_MAX_PROCS      128
 #define VIDMEM_EVICT_MAX_PER_TICK   2
@@ -60,6 +62,8 @@ typedef struct
     NvU64 lastStuckLogNs; // monotonic ns of the last "foreground, only N MB free" line
     NvU64 fgSinceNs;      // monotonic ns since when a hint says foreground without a break (0: not)
     NvU64 restoreStuckMB; // free MB when a restore of it last moved nothing (0: not stuck)
+    NvU32 outForPid;      // the foreground when the policy last moved it out (0: there was none)
+    NvU64 roomSinceNs;    // monotonic ns since when it would fit back with room to spare (0: it would not)
 } VIDMEM_EVICT_ACTIVITY;
 
 typedef struct

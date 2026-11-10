@@ -784,6 +784,9 @@ ceutilsMemset_IMPL
 //
 #define CEUTILS_MERGE_MAX_BYTES (256ULL << 20)
 
+// Local patch: where a memcopy's time goes (vidmem eviction prints it, BACKLOG #5).
+NvU64 g_ceutilsCopyLaunches, g_ceutilsCopySubmitNs, g_ceutilsCopyWaitNs;
+
 static NvU64
 _ceutilsContigRun
 (
@@ -889,9 +892,11 @@ ceutilsMemcopy_IMPL
     bDstContig = memdescGetContiguity(pDstMemDesc, dstAddrTranslation);
 
     copyLength = length;
+    NvU64 statT0 = osGetMonotonicTimeNs(), statT1;
 
     do
     {
+        g_ceutilsCopyLaunches++;
         //
         // This algorithm finds the maximum contig region from both src and dst
         // for each copy and iterate until we submitted the whole range to CE
@@ -927,6 +932,8 @@ ceutilsMemcopy_IMPL
         srcOffset  += copySizeContig;
         dstOffset  += copySizeContig;
     } while (copyLength != 0);
+    statT1 = osGetMonotonicTimeNs();
+    g_ceutilsCopySubmitNs += statT1 - statT0;
 
     if (pParams->flags & NV0050_CTRL_MEMSET_FLAGS_ASYNC)
     {
@@ -937,6 +944,7 @@ ceutilsMemcopy_IMPL
     {
         // Check semaProgress and then timeout
         status = channelWaitForFinishPayload(pChannel, channelPbInfo.payload);
+        g_ceutilsCopyWaitNs += osGetMonotonicTimeNs() - statT1;
         if (status == NV_OK)
         {
             NV_PRINTF(LEVEL_INFO, "Work was done from RM PoV lastSubmitted = 0x%x\n", channelPbInfo.payload);

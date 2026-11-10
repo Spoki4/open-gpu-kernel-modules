@@ -1908,6 +1908,7 @@ typedef struct
 #define VIDMEM_EVICT_MAX_PENDING 256
 
 NvU64 *vidmemPmaUsedMap(PMA *pPma, NvU64 *pBase, NvU64 *pFrames, NvU64 *pLargestFree); // video_mem.c
+extern NvU64 g_ceutilsCopyLaunches, g_ceutilsCopySubmitNs, g_ceutilsCopyWaitNs;             // ce_utils.c
 
 //
 // How fragmented free vidmem is (BACKLOG #16): the PMA region user
@@ -2058,6 +2059,8 @@ _vidmemEvictPidLocked
     NV_STATUS              status;
     VIDMEM_FRAG            fragBefore;
     NvBool                 bFrag = NV_FALSE;
+    NvU64                  ceLaunches0 = g_ceutilsCopyLaunches, ceSubmit0 = g_ceutilsCopySubmitNs;
+    NvU64                  ceWait0 = g_ceutilsCopyWaitNs;
 
     //
     // The device lock is enough on this single-GPU path: vidmemConstruct()
@@ -2388,6 +2391,9 @@ _vidmemEvictPidLocked
                  _vidmemEvictPhaseNs[VE_PH_QUIESCE] / 1000000, _vidmemEvictPhaseNs[VE_PH_SYSALLOC] / 1000000,
                  _vidmemEvictPhaseNs[VE_PH_COPY] / 1000000, _vidmemEvictPhaseNs[VE_PH_REMAP] / 1000000,
                  _vidmemEvictPhaseNs[VE_PH_PMA] / 1000000, _vidmemEvictPhaseNs[VE_PH_SYSFREE] / 1000000);
+    EVICT_PRINTF("copy: %llu launches, %llu ms submitting, %llu ms waiting for the last one\n",
+                 g_ceutilsCopyLaunches - ceLaunches0, (g_ceutilsCopySubmitNs - ceSubmit0) / 1000000,
+                 (g_ceutilsCopyWaitNs - ceWait0) / 1000000);
     EVICT_PRINTF("total evicted now: %u allocs %llu MB\n", _vidmemEvictAllocs, _vidmemEvictBytes >> 20);
 
     if ((mode != 0) && ((moved != 0) || (failed != 0)) && osVidmemTraceOn(VMT_MOVE))
