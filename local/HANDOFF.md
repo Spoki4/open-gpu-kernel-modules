@@ -4,6 +4,11 @@ Context for a new Claude Code session that continues this work from another
 machine (MacBook) over SSH. Written 2026-11-01 at the end of the first session.
 The user writes in Russian; answer in Russian.
 
+> 10.11 19:55: последний коммит (уплотнение двигает всех, кроме фокуса и
+> композитора) в VM проверен только частично: `nvtest all` не прогонялся,
+> один необъяснённый Xid 109 у игры (BACKLOG #16, последний «Ход»). На хост
+> не ставить, пока не проверено. VM выключена, пользователь играет на хосте.
+
 ## Test VM — the current way to test (CachyOS host, set up 2026-11-04)
 
 Read this first. The PC now boots CachyOS (kernel 7.3.1-1-cachyos, stock
