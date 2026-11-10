@@ -1568,7 +1568,7 @@ it in sync: add new problems there too, move statuses as work goes.
 Its section «Решения для автономной работы (06.11)» holds the user's answers
 for the unattended fix run (commit per task, revert on failure, decide by
 "focused window responsiveness first" and log it, plus per-task choices for
-#10 #7 #13 #3 R #5 #6 #1 #14); read it before taking a task.
+#10 #7 #13 #3 R #5 #6 #1); read it before taking a task.
 
 Asked by the user ("записать, что надо исправить"). None of it is done.
 Driver changes go through the VM first (local/vm/vm.sh, nvtest), then the
