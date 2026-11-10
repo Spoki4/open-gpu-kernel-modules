@@ -2243,3 +2243,24 @@ After that nvtest all 15/15, move/contig/compact tests pass. Still true: what
 was relocated while vidmem was full stays mid-vidmem afterwards (idle guest
 longest run 4.4 GB after the test series vs 10.7 GB fresh); compaction only
 works toward its 1 GB target. `vm.sh reload tree` restores the fresh layout.
+
+2026-11-10 17:45. BACKLOG #5 root cause (commit 30b0c392): ceutilsMemcopy
+called _ceutilsContigRun() for every launch; with one side contiguous for
+long and the other in 64 KB pieces every launch walked up to 64K page
+entries (O(n^2)). Now the run end is remembered (srcRunEnd/dstRunEnd).
+Reproduced on a real game in the guest, not on synthetic apps: Steam in the
+guest's KDE session (start it over ssh with XDG_RUNTIME_DIR, WAYLAND_DISPLAY,
+DISPLAY from `pgrep -a Xwayland`, XAUTHORITY=/run/user/1000/xauth_*;
+`steam -applaunch 3132990` = Black Myth Wukong Benchmark Tool, sits in its
+menu with 2.2 GB). local/game-moves.sh PID (allocations by kind/page size,
+evict/restore/move timings), local/game-seq.sh PID OP... (ops in a given
+order). Before: move 410 ms / 4.2 GB/s, evict after a move 3.9-9 GB/s, 50 us
+per launch in "submitting"; after: 16-27 GB/s. Host check on WoW pending.
+Session run under nvtrace (local/trace-logs/session-171619 before the fix,
+session2-172104 after: game, contig/compact/fragchurn with the game running,
+nvtest all): 459 move batches, none under 6 GB/s, Xid 0. Findings for #16:
+compaction does nothing next to a focused game (8 MB budget < buffer sizes);
+the layout stays fragmented after load (idle desktop with Steam: 88 runs,
+longest 1.2 GB of 10.6 free) and nvtest focus + comproom fail on such a
+layout (pass after `reload tree`). A manual move right after a policy restore
+is traced with why=restore (the reason global is not reset): cosmetic.
