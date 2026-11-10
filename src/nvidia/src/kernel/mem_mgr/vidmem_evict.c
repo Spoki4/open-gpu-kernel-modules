@@ -372,7 +372,7 @@ _vidmemEvictAddHolderMaps
             (pVas == NULL))
             return "map-vas";
 
-        pInfo = intermapGetDmaMapping(pVirtualMemory, pMapping->dmaOffset, NV_U32_MAX);
+        pInfo = intermapGetDmaMapping(pVirtualMemory, pMapping->dmaOffset);
         if (pInfo == NULL)
             return "map-info";
 
@@ -380,12 +380,10 @@ _vidmemEvictAddHolderMaps
         {
             if (vaspaceGetFlags(pVas) & (VASPACE_FLAGS_BAR | VASPACE_FLAGS_FLA))
                 return "map-bar-fla";
-            if (pInfo->pNext != NULL)
-                return "map-info";
             if ((pInfo->pMemDesc == NULL) || (pInfo->pMemDesc->_pParentDescriptor != pMemDesc) ||
                 (pInfo->pMemDesc->childDescriptorCnt != 0) || (pInfo->pMemDesc->RefCount != 1))
                 return "map-memdesc";
-            if ((pInfo->KernelVAddr[0] != NULL) || (pInfo->FbApertureLen[0] != 0) ||
+            if ((pInfo->KernelVAddr != NULL) || (pInfo->FbApertureLen != 0) ||
                 pInfo->bP2P || (pInfo->aperture != GMMU_APERTURE_VIDEO) ||
                 (pInfo->pBar1P2PVirtMemDesc != NULL) || (pInfo->pBar1P2PPhysMemDesc != NULL) ||
                 (DRF_VAL(OS46, _FLAGS, _P2P_ENABLE, pInfo->Flags) != NVOS46_FLAGS_P2P_ENABLE_NONE) ||
