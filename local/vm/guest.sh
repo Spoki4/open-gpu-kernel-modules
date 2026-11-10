@@ -78,6 +78,14 @@ reload() {
     local holders
     holders=$(gpu_holders)
     if [[ -n $holders ]]; then
+        # A Plasma session that outlived SDDM restarts its kwin as soon as it
+        # is killed (systemd --user), and the module never comes free
+        # (2026-11-10). Its user manager goes first; ssh sessions stay.
+        systemctl stop 'user@*.service' 2>/dev/null || true
+        sleep 1
+        holders=$(gpu_holders)
+    fi
+    if [[ -n $holders ]]; then
         # shellcheck disable=SC2086
         kill $holders 2>/dev/null || true
         sleep 2
