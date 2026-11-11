@@ -299,11 +299,12 @@ title_of() { NVT_INSTANCE=$1 "$HERE/nvt-session.sh" title 2>/dev/null | grep '^N
 
 # wait_ram PID [T0]: seconds from T0 (default now) until PID has nothing in
 # sysmem (timeout 10 s), or "timeout".
+# LEFT_MB (default 0): this much may stay in sysmem and it still counts as back.
 wait_ram() {
-    local pid=$1 t0=${2:-$(date +%s.%N)} r
+    local pid=$1 t0=${2:-$(date +%s.%N)} left=${3:-0} r
     while :; do
         r=$(ram_of "$pid")
-        [[ ${r:-0} == 0 ]] && { awk -v a="$(date +%s.%N)" -v b="$t0" 'BEGIN { printf "%.3f\n", a - b }'; return 0; }
+        [[ ${r:-0} -le $left ]] && { awk -v a="$(date +%s.%N)" -v b="$t0" 'BEGIN { printf "%.3f\n", a - b }'; return 0; }
         awk -v a="$(date +%s.%N)" -v b="$t0" 'BEGIN { exit !(a - b > 10) }' && { echo timeout; return 1; }
         sleep 0.05
     done
@@ -435,9 +436,16 @@ fgprio_test() {
         note "cycle $i click A: A back in ${lat} s; B (visible, drawing) ram $(ram_of "$gB") MB, $(title_of b | grep -o 'fps=[0-9]*')"
         t=$(date +%s.%N)
         $S win activate "$mB"
-        lat=$(wait_ram "$gB" "$t") || fail "cycle $i: B not back within 10 s"
+        #
+        # B fills vidmem to the last MB, and its memory is 6 MB contiguous
+        # buffers: one or two of them may find no three free 2 MB chunks in a
+        # row when it comes back and stay in sysmem (2 runs of 8 on the RTX
+        # 5000, 2026-11-11, on 67deb430 and on the current build alike;
+        # BACKLOG I15). Up to 16 MB left is "back"; the note says how much.
+        #
+        lat=$(wait_ram "$gB" "$t" 16) || fail "cycle $i: B not back within 10 s"
         sleep 2
-        note "cycle $i click B: B back in ${lat} s; $(title_of b | grep -o 'fps=[0-9]*'); A ram $(ram_of "$gA") MB"
+        note "cycle $i click B: B back in ${lat} s, $(ram_of "$gB") MB left in sysmem; $(title_of b | grep -o 'fps=[0-9]*'); A ram $(ram_of "$gA") MB"
     done
     for i in a b; do
         t=$(title_of $i)

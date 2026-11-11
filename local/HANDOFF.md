@@ -84,6 +84,16 @@ before either, never touch the other instance of the project.
   run, open in BACKLOG #15. A regression of the foreground restore was found
   and fixed this way (compare a suspect scenario on `~/old-67deb430` by
   insmod of its .ko: that is how to tell a regression from the machine).
+- 2026-11-11 14:40: the machine was deleted at the user's word (about three
+  hours, $0.60 an hour); region GRA9 and the ssh key `claude-agent` stay in
+  the project. To have one again (ask first): create the instance (flavor
+  rtx5000-28 or a10-45, image Ubuntu 26.04, the key), add the ssh alias,
+  rsync the tree, then `local/cloud/setup.sh` (build deps, modules, the
+  NVIDIA .run), install the modules as below and reboot (nouveau must be
+  gone before the .run's userspace installs: `--silent --no-kernel-modules`),
+  `local/cloud/setup-desktop.sh` (KWin, Chrome), groups render, video, adm,
+  systemd-journal for the user. `run-final.sh` is the whole run, `run-ab.sh`
+  the comparison of a scenario between two builds. About 15 minutes.
 - Tree in `~/open-gpu-kernel-modules` (rsync from here), build with plain
   `make modules -j4` (gcc kernel, no LD=ld.lld), userspace from the NVIDIA
   .run of the same release (`--no-kernel-modules`).
