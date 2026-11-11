@@ -45,6 +45,29 @@ The user writes in Russian; answer in Russian.
 > `local/momc-probe.sh`); это не проверка, ответ yes/no в строке PASS.
 > Этапов двенадцать.
 
+## Cloud test machine (OVH, set up 2026-11-11) — a second place to test
+
+So that tests run while the user plays on the host GPU. The user decided it
+and gave the access (`ovhcloud login`, CLI in `~/.local/bin/ovhcloud`,
+official release 0.16.0); creating and deleting machines costs money: ask
+before either, never touch the other instance of the project.
+- The project's and the machines' names and ids are not written here (this
+  repository is public): they are in the agent's memory note
+  `ovh-cloud-test-machine`. Region GRA9 (enabled for this), instance
+  `nv-vidmem-test`, flavor rtx5000-28 (4 vCPU, 28 GB, 400 GB), $0.60 an hour by the catalog,
+  **billed until deleted**. ssh: `ssh ovh-gpu` (user ubuntu, key
+  id_ed25519_claude_agent, sudo without a password). Ubuntu 26.04, kernel 7.0,
+  BIOS boot.
+- The GPU is a whole Quadro RTX 5000 (TU104GL, 16 GB, Turing) by PCI
+  passthrough, all four functions; nouveau showed five DP connectors, so KMS
+  heads exist (no monitor attached). Not the host's generation: a clean run
+  here does not replace a short run on the 3080 Ti before a host install.
+- A10 (Ampere, the chip of the 3080 Ti) was out of stock on 2026-11-11; it is
+  the better card when it comes back (a10-45, GRA11/GRA9).
+- Tree in `~/open-gpu-kernel-modules` (rsync from here), build with plain
+  `make modules -j4` (gcc kernel, no LD=ld.lld), userspace from the NVIDIA
+  .run of the same release (`--no-kernel-modules`).
+
 ## Test VM — the current way to test (CachyOS host, set up 2026-11-04)
 
 Read this first. The PC now boots CachyOS (kernel 7.3.1-1-cachyos, stock
