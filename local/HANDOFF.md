@@ -74,6 +74,16 @@ before either, never touch the other instance of the project.
   through fulltest.sh, which drives the local VM. Reload after a rebuild:
   copy the .ko to updates/nvidia-local, rmmod nvidia_drm nvidia_modeset
   nvidia_uvm nvidia, modprobe them back (nothing holds the GPU there).
+- 2026-11-11 13:20: `nvtest all` runs there too (headless KWin on the NVIDIA
+  GPU + google-chrome; `export NVT_CHROME_FLAGS="--enable-unsafe-webgpu
+  --enable-features=Vulkan" NVTEST_FORCE=1`, user ubuntu is in render, video,
+  adm, systemd-journal). Final build 6a147076: 13 of 15, the six memory
+  tests 6 of 6. `active` fails there on any build (the witness stalls for
+  seconds while an app draws from sysmem: the card/VM, checked against
+  67deb430 built in `~/old-67deb430`); `fgprio-idle` failed once in a full
+  run, open in BACKLOG #15. A regression of the foreground restore was found
+  and fixed this way (compare a suspect scenario on `~/old-67deb430` by
+  insmod of its .ko: that is how to tell a regression from the machine).
 - Tree in `~/open-gpu-kernel-modules` (rsync from here), build with plain
   `make modules -j4` (gcc kernel, no LD=ld.lld), userspace from the NVIDIA
   .run of the same release (`--no-kernel-modules`).
