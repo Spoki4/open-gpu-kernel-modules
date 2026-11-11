@@ -4,6 +4,14 @@ Context for a new Claude Code session that continues this work from another
 machine (MacBook) over SSH. Written 2026-11-01 at the end of the first session.
 The user writes in Russian; answer in Russian.
 
+> 11.11 15:20: пользователь решил ставить сборку HEAD на хост вечером 11.11
+> без прогона в VM на 3080 Ti («проверим в бою»). Проверено только на
+> облачной RTX 5000 (ниже, «Cloud test machine»). Ни разу не исполнялся на
+> карте перенос буферов, общих с композитором (`moveshared`, этап desktop):
+> при зависаниях рабочего стола первым делом `sudo local/evict.sh moveshared
+> off`, затем `compactfg off`; откат — `sudo local/rollback.sh` и
+> перезагрузка. Модули в kernel-open собраны из 8f186b82 (после него
+> менялись только тесты и документы). Запись ниже от 10.11 устарела.
 > 10.11 19:55: последний коммит (уплотнение двигает всех, кроме фокуса и
 > композитора) в VM проверен только частично: `nvtest all` не прогонялся,
 > один необъяснённый Xid 109 у игры (BACKLOG #16, последний «Ход»). На хост
