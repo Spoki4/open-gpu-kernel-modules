@@ -641,7 +641,6 @@ static NvU64 _vidmemMovableHiddenBytes = NV_U64_MAX, _vidmemMovableFgIdleBytes =
              _vidmemMovableFgAllocBytes = NV_U64_MAX;
 // What the foreground itself could give for its own allocation (0: a game, or nothing; BACKLOG #7).
 static NvU64 _vidmemMovableFgOwnBytes = NV_U64_MAX;
-static NvU64 _vidmemMovableWalkNs;    // when the sums above were counted
 
 //
 // The foreground's allocation fits nowhere and nobody is left to give: an
@@ -688,7 +687,6 @@ _vidmemEvictUpdateReclaimable(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 nowN
     _vidmemMovableHiddenBytes = sum;
     _vidmemMovableFgIdleBytes = sumFgIdle;
     _vidmemMovableFgAllocBytes = sumFg;
-    _vidmemMovableWalkNs = nowNs;
     _vidmemMovableFgOwnBytes = 0;
     for (i = 0; i < count; i++)
     {
@@ -1475,13 +1473,14 @@ _veMakeRoomAllowed(NvU32 pid, NvBool bContig)
                                 VE_LEVEL_FG_ALLOC : VE_LEVEL_HIDDEN) &&
         !((VE_HINT_STATE(_vidmemHint(pid, NULL)) == VE_HINT_FG) && _vidmemFgOwnEnabled &&
           //
-          // Its own memory as of the last walk, or that walk is old: an app
-          // that took its memory within one policy step had none then, and
-          // was turned away (fgown-test on the RTX 5000, 2026-11-11: 288 MB
-          // in 2 ms, then a denial). Not for a game: it gives nothing here.
+          // Its own memory is counted at a walk, and an app that took it since
+          // the last one had none then: it was turned away (fgown-test on the
+          // RTX 5000, 2026-11-11: 288 MB in 2 ms, then a denial; with "a walk
+          // older than 250 ms" it passed or failed by how long the app took to
+          // start). So a foreground that is not a game always gets its walk;
+          // a fruitless one keeps the next away for a second (above).
           //
-          ((_vidmemMovableFgOwnBytes >= (4ULL << 20)) ||
-           (!_vidmemFgIsGame && (VE_AGO_NS(nowNs, _vidmemMovableWalkNs) >= 250000000ULL)))))
+          ((_vidmemMovableFgOwnBytes >= (4ULL << 20)) || !_vidmemFgIsGame)))
         return NV_FALSE;
     return NV_TRUE;
 }

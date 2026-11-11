@@ -64,6 +64,16 @@ before either, never touch the other instance of the project.
   here does not replace a short run on the 3080 Ti before a host install.
 - A10 (Ampere, the chip of the 3080 Ti) was out of stock on 2026-11-11; it is
   the better card when it comes back (a10-45, GRA11/GRA9).
+- 2026-11-11, first runs of the unverified builds on a GPU happened here
+  (final build 11af746b + the fgown gate fix): move, contig, contigloop,
+  compact, compact fg, fgown PASS, no Xid; four driver bugs and most of the
+  blind-written test setups were fixed on the way (BACKLOG #7, #15, #16
+  «Ход» 11.11 12:30). Not run here: nvtest all, the desktop and game stages
+  (no compositor session yet; KMS has four DP connectors, no monitor).
+  Tests run directly over ssh (`~/runtests.sh`, log `~/tests.log`), not
+  through fulltest.sh, which drives the local VM. Reload after a rebuild:
+  copy the .ko to updates/nvidia-local, rmmod nvidia_drm nvidia_modeset
+  nvidia_uvm nvidia, modprobe them back (nothing holds the GPU there).
 - Tree in `~/open-gpu-kernel-modules` (rsync from here), build with plain
   `make modules -j4` (gcc kernel, no LD=ld.lld), userspace from the NVIDIA
   .run of the same release (`--no-kernel-modules`).

@@ -6,9 +6,9 @@
 # kwin_wayland) asks for 256 MB scanout buffers, which are contiguous. Checks:
 # it gets them, the survivors' memory stays in vidmem and intact. Run in the
 # test VM guest with nobody logged in. Ends with CONTIGTEST PASS|FAIL.
-#   ./contig-test.sh [BUFFERS=8]
+#   ./contig-test.sh [BUFFERS]     default: two more than fit the longest free run
 cd "$(dirname "$0")" || exit 1
-bufs=${1:-8}
+bufs=${1:-}
 T=$(mktemp -d /tmp/contig-test.XXXX)
 T0=$(date '+%F %T')
 fails=0
@@ -40,6 +40,10 @@ echo "holes:    $(frag)"
 # all (the cloud one) gets them here: the survivors are hidden.
 H=/proc/driver/nvidia/vidmem_hints
 if [[ ! -s $H ]]; then printf '%s h\n' "${keep[@]}" >"$H"; ownhints=1; sleep 2; fi
+# Two more buffers than the longest free run takes, or no window has to be cleared
+# (the control run on the RTX 5000, 2026-11-11: a 2254 MB run took all eight).
+lrun=$(sudo -n ./evict.sh status | grep '^fragmentation' | grep -o 'longest [0-9]*' | cut -d' ' -f2)
+[[ -n $bufs ]] || bufs=$(( ${lrun:-1536} / 256 + 2 ))
 before=$(sudo -n ./evict.sh status | grep -o 'windows cleared.*: [0-9]* MB' | grep -o '[0-9]* MB$' | cut -d' ' -f1)
 cp ./gbm-hog "$T/kwin_wayland"
 "$T/kwin_wayland" --force --scanout --size 8192x8192 --max "$bufs" --floor-mb 64 --hold 6 >"$T/comp.log" 2>&1 &
