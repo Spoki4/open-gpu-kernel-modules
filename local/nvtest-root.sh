@@ -70,7 +70,7 @@ seat0_sessions() {
 gpu_holders() {
     local nodes=(/dev/nvidia*)
     local p
-    for p in /dev/dri/by-path/pci-0000:01:00.0-card /dev/dri/by-path/pci-0000:01:00.0-render; do
+    for p in /dev/dri/by-path/pci-*-card /dev/dri/by-path/pci-*-render; do
         [[ -e $p ]] && nodes+=("$(readlink -f "$p")")
     done
     fuser "${nodes[@]}" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un || true

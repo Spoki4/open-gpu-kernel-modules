@@ -61,8 +61,31 @@ struct drm_mode_create_dumb {
 };
 #define DRM_IOCTL_MODE_CREATE_DUMB _IOWR('d', 0xB2, struct drm_mode_create_dumb)
 
-#define NV_RENDER "/dev/dri/by-path/pci-0000:01:00.0-render"
-#define NV_CARD   "/dev/dri/by-path/pci-0000:01:00.0-card"
+// The NVIDIA GPU's DRM node: the first card or render node whose PCI vendor is
+// 10de (the host and its test VM have it at 01:00.0, the cloud machine at 00:06.0).
+static const char *nv_node(int card)
+{
+    static char path[64];
+    char sys[96], vendor[16];
+    int i, n = card ? 0 : 128;
+
+    for (i = n; i < n + 16; i++) {
+        FILE *f;
+
+        snprintf(sys, sizeof(sys), "/sys/class/drm/%s%d/device/vendor", card ? "card" : "renderD", i);
+        f = fopen(sys, "r");
+        if (!f)
+            continue;
+        vendor[0] = 0;
+        if (fgets(vendor, sizeof(vendor), f) && !strncmp(vendor, "0x10de", 6)) {
+            fclose(f);
+            snprintf(path, sizeof(path), "/dev/dri/%s%d", card ? "card" : "renderD", i);
+            return path;
+        }
+        fclose(f);
+    }
+    return card ? "/dev/dri/card0" : "/dev/dri/renderD128";
+}
 
 static long reserve_mb_from_params(void)
 {
@@ -115,7 +138,7 @@ int main(int argc, char **argv)
             goto usage;
     }
     if (!node)
-        node = dumb ? NV_CARD : NV_RENDER;
+        node = nv_node(dumb);
 
     long reserve = reserve_mb_from_params();
     if (reserve <= 0 && !force) {
