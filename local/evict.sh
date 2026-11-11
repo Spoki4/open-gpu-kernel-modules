@@ -24,8 +24,9 @@
 #                                               # memory goes to sysmem (BACKLOG #7; default on)
 #   sudo ./evict.sh compactfg on|off            # background compaction also moves the memory of the
 #                                               # window in focus, 32 MB a step (default on)
-#   sudo ./evict.sh hot     on|off              # access counters: evicted allocations in use
-#                                               # come back one by one (experiment)
+#   sudo ./evict.sh hot     on|off|momc         # access counters: evicted allocations in use
+#                                               # come back one by one (experiment); momc: also
+#                                               # count accesses to vidmem (a probe, momc-probe.sh)
 #   sudo ./evict.sh quiesce 0..4                # how channels are stopped (experiment, see
 #                                               # _vidmemEvictQuiesce in vidmem_evict.c)
 set -euo pipefail
@@ -42,7 +43,7 @@ case $mode in
         ;;
     hot)
         [[ $# -eq 2 ]] || usage
-        case $2 in on|1) cmd="hot 1" ;; off|0) cmd="hot 0" ;; *) usage ;; esac
+        case $2 in on|1) cmd="hot 1" ;; off|0) cmd="hot 0" ;; momc|2) cmd="hot 2" ;; *) usage ;; esac
         ;;
     auto|trace|windows|moveshared|fgown|compactfg)
         [[ $# -eq 2 ]] || usage

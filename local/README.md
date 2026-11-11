@@ -208,6 +208,7 @@ sudo ./local/vm/mode.sh vm               # host stops loading nvidia; move a mon
 ./local/vm/vm.sh ssh $PWD/local/compact-test.sh # background compaction lengthens the free run
 ./local/vm/vm.sh ssh $PWD/local/contigloop-test.sh # a focused app remaking a contiguous buffer: no clearing loop (BACKLOG #15)
 ./local/vm/vm.sh ssh $PWD/local/compact-test.sh 120 4096 fg  # compaction out of the focused window's memory (evict.sh compactfg on|off)
+./local/vm/vm.sh ssh $PWD/local/momc-probe.sh   # a probe: do access counters report accesses to vidmem (BACKLOG I5)
 ./local/vm/vm.sh ssh $PWD/local/fgown-test.sh   # the focused app gets an allocation nobody can make room for (BACKLOG #7)
 ./local/vm/fulltest.sh                          # all of the above + nvtest all + the Plasma session + a game, one verdict
 ./local/vm/vmtest.sh [all|focus|...]     # build on the host, reload in the guest, nvtest under watchdogs

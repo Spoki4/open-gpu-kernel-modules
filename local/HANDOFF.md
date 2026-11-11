@@ -40,6 +40,10 @@ The user writes in Russian; answer in Russian.
 > пользователя; `evict.sh compactfg on|off`, этап compactfg в прогоне —
 > этапов стало одиннадцать). Если игра в фокусе подёргивается раз в
 > секунду-две на тихой системе — первым делом `compactfg off`.
+> 11.11 11:50: последним этапом прогона добавлена проба momcprobe (I5:
+> сообщают ли счётчики об обращениях к видеопамяти, `evict.sh hot momc`,
+> `local/momc-probe.sh`); это не проверка, ответ yes/no в строке PASS.
+> Этапов двенадцать.
 
 ## Test VM — the current way to test (CachyOS host, set up 2026-11-04)
 
