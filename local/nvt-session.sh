@@ -11,6 +11,8 @@
 #                                     (NVT_OUTPUTS=2 at start: two virtual monitors)
 #                                     every window of PID (a KWin script over DBus)
 #   ./nvt-session.sh stop             Chrome and the compositor
+# NVT_CHROME_FLAGS: more flags for Chrome (a stock Chrome on NVIDIA has no WebGPU adapter
+# without --enable-unsafe-webgpu --enable-features=Vulkan; the PC's and the VM's have it set up).
 # NVT_INSTANCE=b runs a second Chrome (own profile and DevTools port);
 # start/title/gpu-pid/stop-chrome act on that instance.
 #
@@ -43,12 +45,15 @@ own_bus() {
     DBUS_SESSION_BUS_ADDRESS=$(sed -n 1p "$BUS_FILE")
 }
 
-# AMD nodes (everything that is not the NVIDIA GPU at 01:00.0).
+# The nodes of every other GPU (the AMD iGPU on the PC, the emulated card on the cloud
+# machine): everything whose PCI vendor is not NVIDIA's.
 hide_args() {
-    local n
-    for n in /dev/dri/by-path/*; do
-        [[ $n == *0000:01:00.0* ]] && continue
-        printf -- '--bind /dev/null %s ' "$(readlink -f "$n")"
+    local n dev
+    for n in /dev/dri/card* /dev/dri/renderD*; do
+        [[ -e $n ]] || continue
+        dev=/sys/class/drm/${n##*/}/device/vendor
+        [[ $(cat "$dev" 2>/dev/null) == 0x10de ]] && continue
+        printf -- '--bind /dev/null %s ' "$n"
     done
 }
 
@@ -83,7 +88,7 @@ start() {
     [[ -z $(chrome_pids) ]] || { echo "nvt-session: test Chrome already running" >&2; exit 1; }
     WAYLAND_DISPLAY=$SOCK "$CHROME_BIN" --ozone-platform=wayland --user-data-dir="$PROFILE" \
         --password-store=basic --no-first-run --no-default-browser-check --disable-background-networking \
-        --remote-debugging-port=$PORT --new-window "$@" >"$LOG/chrome-$INST.log" 2>&1 &
+        --remote-debugging-port=$PORT ${NVT_CHROME_FLAGS:-} --new-window "$@" >"$LOG/chrome-$INST.log" 2>&1 &
     local i
     for i in $(seq 1 100); do curl -s "http://127.0.0.1:$PORT/json/version" >/dev/null && break; sleep 0.1; done
     echo "started: kwin $(pgrep -f -- "kwin_wayland --virtual --socket $SOCK" | head -1), chrome $(chrome_pids | head -1)"

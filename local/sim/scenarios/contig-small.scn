@@ -1,0 +1,37 @@
+# BACKLOG #15, a regression found on the first GPU run (nvtest fgprio on the
+# RTX 5000, 2026-11-11): a Chrome whose WebGL memory is hundreds of 6 MB
+# contiguous buffers. Counted as "buffers that need a window", they came back
+# 256 MB a step (11 s instead of 0.7 s) and the last ones never. Only buffers
+# of 32 MB or more wait for a window; these come back as any other memory.
+cap 11000
+set longest 64
+proc 1614 kwin_wayland old
+proc 2617 chrome old chunk=16
+proc 12557 game old chunk=64
+
+act 1614 0 4
+mark the browser alone, focused: 1.2 GB in 6 MB contiguous buffers
+hint 2617 f
+act 2617 0 20
+alloc 2617 1200 n=200 contig
+at 6
+
+mark the game takes the focus and nearly all of vidmem: the browser, hidden, pays
+hint 2617 h
+hint 12557 f
+act 12557 0 30
+act 2617 30 0
+target 12557 10850 0.75 spread=20
+at 40
+expect evicted 2617 >= 800
+
+mark back to the browser, the game stays visible on the other monitor
+hint 12557 v
+hint 2617 f
+act 2617 0 20
+step
+step
+expect evicted 2617 <= 64        # back within two steps, not 256 MB a step
+at 60
+expect evicted 2617 == 0
+expect windows 2617 == 0         # no window for small buffers

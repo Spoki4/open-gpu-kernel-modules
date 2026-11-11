@@ -545,8 +545,8 @@ game() {
     begin game
     "$HERE/nvt-session.sh" stop >/dev/null 2>&1 || true
     local idle1 idle2 bg g free want H=/proc/driver/nvidia/vidmem_hints
-    start nvt-idle-a --mb 1024 --idle --verify-s 20 || { finish game; return 1; }; idle1=$LAST
-    start nvt-idle-b --mb 768 --idle --verify-s 20 || { finish game; return 1; }; idle2=$LAST
+    start nvt-idle-a --mb 1024 --idle --verify-s 23 || { finish game; return 1; }; idle1=$LAST
+    start nvt-idle-b --mb 768 --idle --verify-s 23 || { finish game; return 1; }; idle2=$LAST
     start nvt-bg-a --mb 256 --fps 30 --read-mb 64 --gfx --write || { finish game; return 1; }; bg=$LAST
     # Window hints as KWin would write them: this shell (so the game, its
     # child) in the foreground, the idle apps hidden, the drawing one visible.
