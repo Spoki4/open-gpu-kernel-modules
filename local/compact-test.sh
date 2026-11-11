@@ -25,15 +25,19 @@ pids=()
 trap 'sudo -n ./evict.sh compact "${old:-1024}" >/dev/null; sudo -n ./evict.sh compactfg on >/dev/null; [[ -z $fg ]] || : >"$H" 2>/dev/null; kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null; rm -rf "$T"' EXIT
 sudo -n ./evict.sh compact 0 >/dev/null
 names=(nvt-idle-a nvt-idle-b nvt-bg-a nvt-bg-b nvt-bg-c nvt-bg-d)
-for i in $(seq 0 11); do
+# As many apps as the card takes, twelve on 12 GB: the same ~2 GB left free at the
+# end on a bigger card, or the contiguous requests just fit there.
+free0=$(sudo -n ./evict.sh status | grep '^fragmentation' | grep -o 'free [0-9]*' | cut -d' ' -f2)
+napps=$(( (${free0:-11700} - 2100) / 800 / 2 * 2 )); (( napps >= 12 )) || napps=12
+for i in $(seq 0 $((napps - 1))); do
     ./"${names[i % 6]}" --mb 800 --chunk-mb 16 --idle --verify-s 30 --floor-mb 512 >"$T/p$i.log" 2>&1 &
     pids+=($!)
 done
-for i in $(seq 0 11); do
+for i in $(seq 0 $((napps - 1))); do
     for _ in $(seq 150); do grep -q '^START' "$T/p$i.log" && break; sleep 0.2; done
 done
 keep=()
-for i in $(seq 0 11); do
+for i in $(seq 0 $((napps - 1))); do
     if (( i % 2 )); then kill "${pids[i]}"; wait "${pids[i]}" 2>/dev/null; else keep+=("${pids[i]}"); fi
 done
 sleep 1
@@ -69,12 +73,12 @@ echo "  longest free run $l0 -> $l1 MB; survivors in sysmem: $ram MB"
 (( ram == 0 )) || fail "$ram MB of the survivors went to sysmem"
 sleep 3
 for p in "${keep[@]}"; do kill -INT "$p"; done
-for i in 0 2 4 6 8 10; do
+for i in $(seq 0 2 $((napps - 1))); do
     wait "${pids[i]}"; rc=$?
     (( rc == 0 )) || fail "app $i exit $rc: $(grep -m1 -E '^ERROR|^RESULT' "$T/p$i.log")"
 done
 pids=()
-echo "  survivors: $(grep -h '^RESULT' "$T"/p{0,2,4,6,8,10}.log | grep -o 'verifies=[0-9]* errors=[0-9]*' | tr '\n' ';')"
+echo "  survivors: $(for i in $(seq 0 2 $((napps - 1))); do grep -h '^RESULT' "$T/p$i.log"; done | grep -o 'verifies=[0-9]* errors=[0-9]*' | tr '\n' ';')"
 sudo journalctl -k --since "$T0" --no-pager | grep -E 'Xid|BUG:|Oops|general protection|not remade|move copy failed|[Aa]ssert' | tail -5
 sudo journalctl -k --since "$T0" --no-pager | grep -qE 'Xid|BUG:|Oops|general protection|not remade|move copy failed' && fail "kernel log"
 (( fails == 0 )) && echo "COMPACTTEST PASS" || echo "COMPACTTEST FAIL $fails"

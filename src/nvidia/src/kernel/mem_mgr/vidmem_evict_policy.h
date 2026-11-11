@@ -205,7 +205,8 @@ NvBool vepHeadroomRun(OBJGPU *pGpu);
 #define VEP_HAS_HEADROOM_RUN 1
 NvBool vepMakeRoomCompositorRun(OBJGPU *pGpu, NvU64 size, NvBool bContig, NvU64 align,
                                 NvU64 *pWantMB, NvU64 *pAvail, NvU64 *pMovedMB);
-NvU32  vepMakeRoomPlaceLevel(NvU32 pid);
+const char *vepMakeRoomDeniedWhy(NvU32 pid);
+NvU32  vepMakeRoomPlaceLevel(NvU32 pid, NvBool bContig);
 NvU32  vepMakeRoomContextsLevel(NvU32 pid);
 NvBool vepMakeRoomPlaceRun(OBJGPU *pGpu, NvU32 pid, NvU64 size, NvBool bContig, NvU64 align, NvU32 level,
                            NvU64 *pWantMB, NvU64 *pAvail, NvU64 *pMovedMB);
