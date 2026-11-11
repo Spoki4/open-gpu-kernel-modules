@@ -9,8 +9,11 @@ The user writes in Russian; answer in Russian.
 > облачной RTX 5000 (ниже, «Cloud test machine»). Ни разу не исполнялся на
 > карте перенос буферов, общих с композитором (`moveshared`, этап desktop):
 > при зависаниях рабочего стола первым делом `sudo local/evict.sh moveshared
-> off`, затем `compactfg off`; откат — `sudo local/rollback.sh` и
-> перезагрузка. Модули в kernel-open собраны из 8f186b82 (после него
+> off`, затем `compactfg off`. Установка на хост (CachyOS) — `sudo
+> local/vm/guest.sh install` и перезагрузка, откат — `sudo local/vm/guest.sh
+> install stock` и перезагрузка; `local/install.sh` и `local/rollback.sh` —
+> для Ubuntu, здесь не работают (11.11 я по ошибке дал их пользователю).
+> `moveshared` пользователь решил оставить включённым. Модули в kernel-open собраны из 8f186b82 (после него
 > менялись только тесты и документы). Запись ниже от 10.11 устарела.
 > 10.11 19:55: последний коммит (уплотнение двигает всех, кроме фокуса и
 > композитора) в VM проверен только частично: `nvtest all` не прогонялся,
