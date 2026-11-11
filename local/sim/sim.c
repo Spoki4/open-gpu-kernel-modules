@@ -242,7 +242,7 @@ NvU32 vepPlatGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs
             else if (p->a[k].where == W_EVICT)
             {
                 q->evictedBytes += p->a[k].kb << 10;
-                if (p->a[k].contig)
+                if (p->a[k].contig && ((p->a[k].kb << 10) >= VIDMEM_EVICT_CONTIG_WINDOW_BYTES))
                 {
                     q->evictedContigBytes += p->a[k].kb << 10;
                     q->evictedContigMax    = NV_MAX(q->evictedContigMax, p->a[k].kb << 10);

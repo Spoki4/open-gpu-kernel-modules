@@ -77,6 +77,17 @@ typedef struct
     NvU64 roomSinceNs;    // monotonic ns since when it would fit back with room to spare (0: it would not)
 } VIDMEM_EVICT_ACTIVITY;
 
+//
+// A contiguous buffer this big comes back through a cleared window, one a
+// step; smaller ones as any other memory, room for them is made at once.
+// Without the limit every contiguous buffer counted: a Chrome whose WebGL
+// memory is 6 MB contiguous buffers (1.3 GB of them) got room for 256 MB a
+// step and came back in 11 s instead of 0.7 s, its last 30 MB never (nvtest
+// fgprio on the RTX 5000, 2026-11-11; the host's Chrome buffers that looped
+// were 130-192 MB, BACKLOG #15).
+//
+#define VIDMEM_EVICT_CONTIG_WINDOW_BYTES (32ULL << 20)
+
 typedef struct
 {
     NvU32 pid;
@@ -85,7 +96,7 @@ typedef struct
     NvU64 vidmemBytes;    // owned, in vidmem
     NvU64 evictedBytes;   // owned, moved to sysmem
     NvU64 eligibleBytes;  // could be moved now
-    NvU64 evictedContigBytes; // of evictedBytes: contiguous buffers (need a free run to come back)
+    NvU64 evictedContigBytes; // of evictedBytes: contiguous buffers of VIDMEM_EVICT_CONTIG_WINDOW_BYTES or more
     NvU64 evictedContigMax;   // the biggest of them, and the alignment it comes back with
     NvU64 evictedContigAlign;
     NvBool bNever;

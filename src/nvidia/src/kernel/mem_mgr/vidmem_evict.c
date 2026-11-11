@@ -3407,7 +3407,8 @@ vepPlatGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
             if (pMemory->pMemDesc->pLocalEvictState != NULL)
             {
                 pProc->evictedBytes += bytes;
-                if ((pMemory->pMemDesc->pPmaAllocInfo != NULL) && pMemory->pMemDesc->pPmaAllocInfo->bContig)
+                if ((pMemory->pMemDesc->pPmaAllocInfo != NULL) && pMemory->pMemDesc->pPmaAllocInfo->bContig &&
+                    (bytes >= VIDMEM_EVICT_CONTIG_WINDOW_BYTES))
                 {
                     pProc->evictedContigBytes += bytes;
                     if (bytes > pProc->evictedContigMax)
