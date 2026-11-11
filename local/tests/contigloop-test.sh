@@ -1,5 +1,5 @@
 #!/bin/bash
-# BACKLOG #15: a focused app that remakes a big contiguous buffer over and
+# problem #15: a focused app that remakes a big contiguous buffer over and
 # over (Chrome on the host: 130 MB up to 30 times a second) in fragmented
 # vidmem. Each request used to clear the window its own previous buffer sat
 # in: that buffer went to sysmem (165 clearings in two hours on the host), and
@@ -19,18 +19,18 @@ T=$(mktemp -d /tmp/contigloop-test.XXXX)
 T0=$(date '+%F %T')
 fails=0
 fail() { echo "  FAIL: $*"; fails=$((fails + 1)); }
-st() { sudo -n ./evict.sh status; }
+st() { sudo -n ../evict.sh status; }
 frag() { st | grep '^fragmentation' | sed 's/^fragmentation: //'; }
 klog() { sudo journalctl -k --since "$T0" --no-pager; }
 pids=()
 # No background compaction meanwhile: in the 12 s the survivors wait to count as idle it
 # gathers the free run the test needs to be short (2026-11-11: 222 -> 442 MB).
 oldrun=$(st | grep -o 'keeps a free run of [0-9]*' | grep -o '[0-9]*$')
-sudo -n ./evict.sh compact 0 >/dev/null
-trap 'sudo -n ./evict.sh compact "${oldrun:-1024}" >/dev/null; kill "${pids[@]}" ${hog:-} 2>/dev/null; wait 2>/dev/null; : >"$H" 2>/dev/null; rm -rf "$T"' EXIT
+sudo -n ../evict.sh compact 0 >/dev/null
+trap 'sudo -n ../evict.sh compact "${oldrun:-1024}" >/dev/null; kill "${pids[@]}" ${hog:-} 2>/dev/null; wait 2>/dev/null; : >"$H" 2>/dev/null; rm -rf "$T"' EXIT
 names=(nvt-idle-a nvt-idle-b nvt-bg-a nvt-bg-b nvt-bg-c nvt-bg-d)
 # As many apps as the card takes.
-free0=$(sudo -n ./evict.sh status | grep '^fragmentation' | grep -o 'free [0-9]*' | cut -d' ' -f2)
+free0=$(sudo -n ../evict.sh status | grep '^fragmentation' | grep -o 'free [0-9]*' | cut -d' ' -f2)
 # All of it here (down to a floor of 128 MB): a free tail would take the app's 128 MB
 # buffers with no window to clear (first run on a GPU, 2026-11-11: 2.3 GB tail, 0 clearings).
 napps=$(( (${free0:-11700} / 800 + 2) / 2 * 2 )); (( napps >= 12 )) || napps=12

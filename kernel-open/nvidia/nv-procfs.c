@@ -366,7 +366,7 @@ static const nv_proc_ops_t nv_procfs_vidmem_census_fops = {
 //
 //   echo "dry 1234"     > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
 //   echo "evict 1234"   > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
-//   echo "move 1234" > ... (to other vidmem pages, BACKLOG #16)
+//   echo "move 1234" > ... (to other vidmem pages, problem #16)
 //   echo "restore 1234" > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
 //   echo "status"       > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict
 //   echo "auto 0"       > /proc/driver/nvidia/gpus/0000:01:00.0/vidmem_evict  (1: on)
@@ -541,7 +541,7 @@ static const nv_proc_ops_t nv_procfs_vidmem_evict_fops = {
 // are joined), one "<pid> <state> [g]" per line, state f
 // (foreground: active window), v (visible) or h (hidden: minimized, other
 // desktop, covered); g: the process has a fullscreen window (a game, when
-// it keeps the GPU busy; BACKLOG R4). Writable by everyone; a pid is taken only if it
+// it keeps the GPU busy; rule R4). Writable by everyone; a pid is taken only if it
 // belongs to the writer (or the writer is root). The driver reacts at once
 // in a work item (rm_vidmem_evict mode 9: restore what became visible, make
 // room by moving hidden processes out), so the compositor never waits.

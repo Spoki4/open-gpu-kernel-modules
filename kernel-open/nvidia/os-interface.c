@@ -943,7 +943,7 @@ static NvU32 nv_vidmem_hint_lookup(NvU32 pid)
 // started by a launcher, not a helper process of the same app); bit 10: that
 // process has a fullscreen window ("g"); bit 11: `pid` was started by
 // Steam's game launcher (an ancestor named "reaper": every Steam game, native
-// or Proton, runs under it). BACKLOG R4.
+// or Proton, runs under it); rule R4.
 // *pGen: snapshot generation (0: no snapshot was ever written, hints are off).
 //
 #define NV_VIDMEM_HINT_LAUNCHER_DEPTH 16

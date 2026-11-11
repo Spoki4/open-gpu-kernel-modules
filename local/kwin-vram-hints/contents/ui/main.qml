@@ -11,7 +11,7 @@
 // takes it for a game when it keeps the GPU busy). The driver applies a
 // state to the process's children too (browser GPU processes).
 //
-// The foreground is the active window when it shows (BACKLOG R4: with CoD
+// The foreground is the active window when it shows (rule R4: with CoD
 // fullscreen on one monitor and the user in Chrome on the other, the game
 // used to stay the foreground). An unmanaged (override-redirect) window
 // covering a screen is a fullscreen X11 game: shown, covering what is below,

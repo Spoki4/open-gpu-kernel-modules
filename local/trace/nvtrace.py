@@ -731,7 +731,7 @@ def build_report(d, gap_ms, top):
 
 
 def frag_report(frags, t0, w):
-    """BACKLOG #16: how fragmented free vidmem is over time and what moves did to it."""
+    """problem #16: how fragmented free vidmem is over time and what moves did to it."""
     if not frags:
         return
     ticks = [e["f"] for e in frags if e["f"].get("at") == "tick"]

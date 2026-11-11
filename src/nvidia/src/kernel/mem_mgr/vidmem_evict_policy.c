@@ -48,7 +48,7 @@ static const char * const _vidmemEvictNeverNames[] =
 #define VIDMEM_EVICT_NEW_PROC_SEC     30
 #define VIDMEM_EVICT_AFTER_ACCESS_SEC 60
 
-// Moves made by the policy (a second client walk in a step only if any, BACKLOG #1).
+// Moves made by the policy (a second client walk in a step only if any, problem #1).
 static NvU32 _vidmemPolicyMoves;
 
 static NV_STATUS
@@ -60,7 +60,7 @@ _veMove(OBJGPU *pGpu, NvU32 mode, NvU32 pid, NvU64 *pMovedBytes)
 
 //
 // The per-process totals of the last policy step's walk, for the driver's
-// trace of the same step (one walk instead of two, BACKLOG #1).
+// trace of the same step (one walk instead of two, problem #1).
 //
 static VIDMEM_EVICT_PROC _vidmemLastProcs[VIDMEM_EVICT_MAX_PROCS];
 static NvU32             _vidmemLastProcsCount;
@@ -318,14 +318,14 @@ _vidmemEvictGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
 }
 
 //
-// The previous foreground (BACKLOG R, the user's choice 2026-11-06: the
+// The previous foreground (rules R, the user's choice 2026-11-06: the
 // focused window and the one before it are kept, so alt-tab back and forth is
 // instant): focused last among the processes not focused now, give or take
 // the second the policy needs to see a whole app (browser and GPU process)
 // in one walk.
 //
 NvU64 _vidmemPrevFgNs;
-// The foreground is a game (as of the last policy step; BACKLOG I7).
+// The foreground is a game (as of the last policy step; idea I7).
 static NvBool _vidmemFgIsGame;
 
 static NvBool
@@ -336,7 +336,7 @@ _vidmemEvictIsPrevFg(VIDMEM_EVICT_PROC *p, VIDMEM_EVICT_ACTIVITY *pAct)
 }
 
 //
-// A game (BACKLOG R, the user's choice: a fullscreen window that keeps the GPU
+// A game (rules R, the user's choice: a fullscreen window that keeps the GPU
 // busy, or anything started by Steam or GameMode); without those hints from
 // the KWin script, a process holding >= 1 GB as before.
 //
@@ -461,7 +461,7 @@ _vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs, NvU
         case VE_HINT_VISIBLE:
             // Drawing: only to bring back the foreground's own memory, or
             // for what an allocation of it needs (a game on the other
-            // monitor gives the focused WebGPU page its few MB, BACKLOG #7;
+            // monitor gives the focused WebGPU page its few MB, problem #7;
             // a video gives the focused game what nobody else has, R5).
             if ((level == VE_LEVEL_FG_RESTORE) || (level == VE_LEVEL_FG_ALLOC))
                 return NV_TRUE;
@@ -503,7 +503,7 @@ _vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs, NvU
 // out it draws from sysmem over PCIe), then windowless idle ones, then
 // visible idle and visible drawing ones (only the foreground may take
 // those). Within a class: the one focused longest ago (never focused first;
-// BACKLOG R3, the order in which the user activated windows), then the one
+// rule R3, the order in which the user activated windows), then the one
 // hidden longest, then the biggest.
 //
 static VIDMEM_EVICT_PROC *
@@ -616,7 +616,7 @@ _vidmemEvictHintFree(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
         {
             VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(pPick->pid, NV_TRUE);
 
-            // Who was in focus: it stays out while that one is (step 3, BACKLOG #6).
+            // Who was in focus: it stays out while that one is (step 3, problem #6).
             pAct->outForPid   = _vidmemEvictFgPid(pProcs, count);
             if (pAct->outForPid == pPick->pid)
                 pAct->outForPid = 0;
@@ -636,20 +636,20 @@ _vidmemEvictHintFree(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
 //
 NvU64 _vidmemReclaimableBytes;      // for visible processes: hidden/windowless ones
 NvU64 _vidmemReclaimableFgBytes;    // for the foreground: + visible ones (FG_ALLOC)
-// What could move per level at the last walk, without the margin (BACKLOG #8).
+// What could move per level at the last walk, without the margin (problem #8).
 static NvU64 _vidmemMovableHiddenBytes = NV_U64_MAX, _vidmemMovableFgIdleBytes = NV_U64_MAX,
              _vidmemMovableFgAllocBytes = NV_U64_MAX;
-// What the foreground itself could give for its own allocation (0: a game, or nothing; BACKLOG #7).
+// What the foreground itself could give for its own allocation (0: a game, or nothing; problem #7).
 static NvU64 _vidmemMovableFgOwnBytes = NV_U64_MAX;
 
 //
 // The foreground's allocation fits nowhere and nobody is left to give: an
 // app that is not a game gets it anyway, and as much of its own older memory
-// goes to sysmem instead (BACKLOG #7, the user's choice 2026-11-06: "memory
+// goes to sysmem instead (problem #7, the user's choice 2026-11-06: "memory
 // in sysmem for the focused window rather than a denial"; a WebGPU page
 // denied next to a game died). A game is turned away as before: its engine
 // places by its budget and falls back by itself (vkd3d), and a move inside
-// its allocation is a stall of its frame (BACKLOG #5). Registry-less knob for
+// its allocation is a stall of its frame (problem #5). Registry-less knob for
 // tests: evict.sh fgown on|off.
 //
 NvU32 _vidmemFgOwnEnabled = 1;
@@ -676,7 +676,7 @@ _vidmemEvictUpdateReclaimable(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 nowN
         if (_vidmemEvictHintVictimOk(&pProcs[i], 0, nowNs, VE_LEVEL_FG_IDLE))
             sumFgIdle += pProcs[i].eligibleBytes;
         // The foreground is told what an allocation of it can take, a game
-        // on the other monitor included (FG_ALLOC, BACKLOG #7): a WebGPU page
+        // on the other monitor included (FG_ALLOC, problem #7): a WebGPU page
         // focused next to a game that fills vidmem saw no room in its budget
         // and stopped (nvtest focus).
         if (_vidmemEvictHintVictimOk(&pProcs[i], 0, nowNs, VE_LEVEL_FG_ALLOC))
@@ -698,7 +698,7 @@ _vidmemEvictUpdateReclaimable(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 nowN
 //
 // Could anybody be moved out for `level` at all (as of the last step or
 // make-room)? An allocation that finds nothing to move must not walk every
-// client and every allocation under the locks again (BACKLOG #8: 4-11 ms per
+// client and every allocation under the locks again (problem #8: 4-11 ms per
 // allocation of the game near its limit, each one coming back empty).
 //
 static NvBool
@@ -728,7 +728,7 @@ vepReclaimableFor(NvU32 pid)
 
 //
 // Free memory a restore of anyone but the foreground must leave behind
-// (BACKLOG #6, #9): nothing comes back while the foreground still has memory
+// (problems #6, #9): nothing comes back while the foreground still has memory
 // in sysmem, and while the foreground is a game (>= 1 GB) it keeps its
 // headroom (RmVidmemFgHeadroomMB), so its next allocations do not move the
 // same apps out again (Claude and Bottles came back every 30-60 s next to
@@ -777,7 +777,7 @@ _vidmemEvictKeepForFgMB(VIDMEM_EVICT_PROC *pProcs, NvU32 count)
     return VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HYST_MB;
 }
 
-// MB that could be moved out for `level`, `exceptPid` aside (BACKLOG #11).
+// MB that could be moved out for `level`, `exceptPid` aside (problem #11).
 static NvU64
 _vidmemEvictFreeableMB(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU32 exceptPid, NvU32 level, NvU64 nowNs)
 {
@@ -806,7 +806,7 @@ static NvU64 _vidmemLastKeepMB = VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HY
 //
 // A hot evicted allocation of `pid` (access counters, I5): how much must stay
 // free after it comes back (MB), or NV_U64_MAX for not now. The same rules as
-// for whole processes (BACKLOG #6, #9): the foreground's own always; others
+// for whole processes (problems #6, #9): the foreground's own always; others
 // not while the foreground has memory in sysmem, not within the hold after
 // they were moved out for it, and only leaving the game its headroom
 // (nvtest fgprio-anim with counters on: a visible app's 6 MB buffer came back
@@ -834,7 +834,7 @@ vepHotRestoreKeepMB(NvU32 pid)
 // game on the other monitor moved out for Chrome's 130 MB buffers, which then
 // did not fit: "restore failed 4"). A window is cleared for the biggest one,
 // one a step, by moving what is in it to other vidmem pages first, from those
-// who may give at `level` (BACKLOG #15, I11). After a failure no new try for
+// who may give at `level` (problem #15, I11). After a failure no new try for
 // 10 s. NV_TRUE: a window is there.
 //
 static NvBool
@@ -864,7 +864,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
     //
     // 1. The foreground gets its memory back now; others (hidden ones first,
     // visible ones still drawing if need be) make room. What fits comes back
-    // even when not all of it does (BACKLOG #10: CoD's 1 GB waited in sysmem
+    // even when not all of it does (problem #10: CoD's 1 GB waited in sysmem
     // for 8 minutes while the game filled every MB that came free with new
     // data, 1353 failed all-or-nothing restores, 12-16 GB/s of PCIe, a third
     // of the fps), the rest at the next steps as room appears.
@@ -914,7 +914,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
             budgetMB = 0;
         if (budgetMB < VIDMEM_EVICT_MIN_RESTORE_MB)
         {
-            // Said once a minute, not every step (BACKLOG #11).
+            // Said once a minute, not every step (problem #11).
             if ((pAct->lastStuckLogNs == 0) ||
                 (VE_AGO_NS(nowNs, pAct->lastStuckLogNs) >= 60 * 1000000000ULL))
             {
@@ -968,7 +968,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
         avail = vepPlatAvailMB(pGpu);
         if (avail < needMB + keepMB)
         {
-            // Nobody moves unless that makes it fit (BACKLOG #11).
+            // Nobody moves unless that makes it fit (problem #11).
             if (avail + _vidmemEvictFreeableMB(pProcs, count, pProcs[i].pid, VE_LEVEL_HIDDEN, nowNs) <
                 needMB + keepMB)
                 continue;
@@ -991,7 +991,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
     // 1b. A process moved out that draws steadily again comes back: from
     // sysmem it would load PCIe and GR for everyone. After the foreground,
     // which the user is working with, and with what it keeps free; one moved
-    // out for the foreground also waits out the hold (BACKLOG #9: ghostty
+    // out for the foreground also waits out the hold (problem #9: ghostty
     // came back through here in the step it was moved out in). A visible one
     // gets room made by idle hidden processes; a hidden one (minimized, behind
     // the game) only takes memory that is free anyway: it is slowed down, not
@@ -1077,7 +1077,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
     // hidden, through 1b. So not while the window they made room for is
     // still in focus, and only after they would have fitted, with what the
     // foreground keeps, for VIDMEM_EVICT_HIDDEN_BACK_SEC without a break
-    // (BACKLOG #6, host 2026-11-08: the focused window grew and wanted its
+    // (problem #6, host 2026-11-08: the focused window grew and wanted its
     // headroom, Battle.net, Claude and Steam went out, 37-81 s later it
     // shrank, after 30 quiet seconds they came back, and at its next growth
     // went out again: 1.8 GB of copies a round, two 0.75 s freezes with it).
@@ -1181,7 +1181,7 @@ vepPolicyStep(OBJGPU *pGpu)
         _vidmemEvictPolicyHints(pGpu, pProcs, count, nowNs);
         //
         // A quiet step (nothing moved, no pressure lately): compact a little
-        // (BACKLOG #16), so a contiguous request finds its window instead of
+        // (problem #16), so a contiguous request finds its window instead of
         // waiting for one to be cleared.
         //
         if (_vidmemCompactRunSeenMB != _vidmemCompactRunMB)
@@ -1401,7 +1401,7 @@ vepBackgroundCushion(NvU32 pid, const char *name)
         return 0;
     //
     // A game in the foreground: the background is kept off its headroom too
-    // (BACKLOG I7, as WDDM shrinks the budgets of background processes
+    // (idea I7, as WDDM shrinks the budgets of background processes
     // first): a hidden app's new allocations go to sysmem while less than the
     // game's headroom is free, instead of taking memory the game's next
     // allocation would then have to move out again.
@@ -1449,7 +1449,7 @@ vepMakeRoomAllowed(NvU32 pid)
 //
 // bContig: a contiguous request that found no place. A window for it is also
 // cleared by moves inside vidmem of processes that may not be moved out (the
-// ones that draw, BACKLOG #16), so "nobody to move out as of the last walk"
+// ones that draw, problem #16), so "nobody to move out as of the last walk"
 // does not turn it away (contigloop-test on the RTX 5000, 2026-11-11: the
 // second 224 MB buffer of the focused app was denied with 7 GB free in pieces,
 // the hidden apps around it checking their memory every 2 s, "drawing").
@@ -1505,7 +1505,7 @@ vepMakeRoomRun(OBJGPU *pGpu, NvU32 pid, NvU64 size, NvU64 headroomMB, const char
     //
     // Some headroom, so the next allocations do not each come here. The
     // foreground waits only for what this allocation needs plus a margin;
-    // its headroom follows in the background (vepHeadroomRun(), BACKLOG #5).
+    // its headroom follows in the background (vepHeadroomRun(), problem #5).
     //
     if (bFg && (_vidmemFgHeadroomMB != 0))
         headroomMB = NV_MIN(headroomMB, (NvU64)VIDMEM_EVICT_RESTORE_MARGIN_MB);
@@ -1517,7 +1517,7 @@ vepMakeRoomRun(OBJGPU *pGpu, NvU32 pid, NvU64 size, NvU64 headroomMB, const char
     // The foreground's allocation still does not fit: visible processes that
     // draw (a game on the other monitor, a video) and the previous foreground
     // give exactly what it needs plus a margin, nothing for headroom
-    // (BACKLOG #7: the WebGPU page focused next to CoD was denied and died;
+    // (problem #7: the WebGPU page focused next to CoD was denied and died;
     // R5: the focused game wins over a video, as the last resort).
     //
     if (bFg && (avail <= (size >> 20)))
@@ -1561,7 +1561,7 @@ vepMakeRoomRun(OBJGPU *pGpu, NvU32 pid, NvU64 size, NvU64 headroomMB, const char
 
 //
 // The foreground's headroom is refilled in the background, not inside its
-// allocation (BACKLOG #5: WoW froze for 0.9 s while 290 MB of Battle.net
+// allocation (problem #5: WoW froze for 0.9 s while 290 MB of Battle.net
 // were copied out within one of its allocations that fitted anyway). The
 // allocation path only asks (vepHeadroomRequest()); the driver then runs
 // vepHeadroomRun() from a work item, again and again until the headroom is
@@ -1641,7 +1641,7 @@ vepKeepFgHeadroomWanted(OBJGPU *pGpu, NvU32 pid, NvU64 size)
 // compositor (kwin_wayland, Xwayland, a kernel thread) hidden and idle ones
 // first and the foreground last (VE_LEVEL_COMPOSITOR); for the foreground
 // what an allocation of it may take (VE_LEVEL_FG_ALLOC: a game on the other
-// monitor included, BACKLOG #7); for a visible process hidden ones. For a
+// monitor included, problem #7); for a visible process hidden ones. For a
 // contiguous one clear a window (vepPlatMakeContig()). The caller tries
 // again. API lock RW, GPU lock held. *pWantMB, *pAvail, *pMovedMB: for the
 // log and the trace.
@@ -1673,7 +1673,7 @@ _vidmemEvictMakeChunks(OBJGPU *pGpu, NvU64 size, NvBool bContig, NvU64 align, Nv
 
         //
         // Allocations on 2 MB pages first (each MB moved frees chunks;
-        // BACKLOG #12: 284 MB of the focused game moved in 531 ms for kwin's
+        // problem #12: 284 MB of the focused game moved in 531 ms for kwin's
         // 32 MB), per victim, in the usual victim order. At most 4 rounds.
         //
         NvBool bBig = NV_TRUE;
@@ -1689,8 +1689,8 @@ _vidmemEvictMakeChunks(OBJGPU *pGpu, NvU64 size, NvBool bContig, NvU64 align, Nv
             //
             // Each round asks for twice what the last one did: whole chunks
             // come from 2 MB-page allocations, and once a victim has none left
-            // the bytes it gives sit in 64 KB pieces between others (stress.sh
-            // scanout churn-8x16: 213 MB moved in 4 rounds of "what is
+            // the bytes it gives sit in 64 KB pieces between others (a scanout
+            // stress run, churn of 8 buffers: 213 MB moved in 4 rounds of "what is
             // missing" for a 32 MB buffer, still short of 16 free chunks).
             //
             avail = _vidmemEvictHintFree(pGpu, pProcs, count, avail + ((wantMB - 2 * freeChunks) << round),
@@ -1728,7 +1728,7 @@ vepMakeRoomCompositorRun(OBJGPU *pGpu, NvU64 size, NvBool bContig, NvU64 align,
                          NvU64 *pWantMB, NvU64 *pAvail, NvU64 *pMovedMB)
 {
     //
-    // Only what it asked for plus a little (BACKLOG #12, the user's choice):
+    // Only what it asked for plus a little (problem #12, the user's choice):
     // kwin's buffers come one at a time, a margin of 16 MB does not move
     // a game for buffers nobody asked for.
     //
@@ -1764,7 +1764,7 @@ vepMakeRoomPlaceLevel(NvU32 pid, NvBool bContig)
 }
 
 //
-// Context buffers of a new channel (ctxBufPoolReserve(), BACKLOG #13) found
+// Context buffers of a new channel (ctxBufPoolReserve(), problem #13) found
 // no room: the level to make it at for the process creating the channel
 // (~0: none). Any process may ask (a windowless portal too); only hidden
 // ones give for it, and for the foreground what its allocations may take.

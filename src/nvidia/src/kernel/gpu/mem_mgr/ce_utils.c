@@ -784,7 +784,7 @@ ceutilsMemset_IMPL
 //
 #define CEUTILS_MERGE_MAX_BYTES (256ULL << 20)
 
-// Local patch: where a memcopy's time goes (vidmem eviction prints it, BACKLOG #5).
+// Local patch: where a memcopy's time goes (vidmem eviction prints it, problem #5).
 NvU64 g_ceutilsCopyLaunches, g_ceutilsCopySubmitNs, g_ceutilsCopyWaitNs;
 
 static NvU64
@@ -914,7 +914,7 @@ ceutilsMemcopy_IMPL
         // Walked again for every piece, a long run on one side cut into
         // small pieces by the other side cost a walk of up to 64K entries
         // per piece: 256 MB of contiguous vidmem going to 64 KB sysmem
-        // chunks took 4096 pieces of ~140 us (BACKLOG #5: 0.45 GB/s for
+        // chunks took 4096 pieces of ~140 us (problem #5: 0.45 GB/s for
         // WoW's and Battle.net's DXVK blocks, 2026-11-08..10).
         //
         if (!bSrcContig && (srcOffset >= srcRunEnd))

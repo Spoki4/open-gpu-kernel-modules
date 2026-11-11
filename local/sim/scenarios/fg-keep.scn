@@ -1,4 +1,4 @@
-# BACKLOG #6 and #9: apps moved out for the focused game stay out while the
+# problems #6 and #9: apps moved out for the focused game stay out while the
 # game is near its limit (they used to come back every 30-60 s next to WoW and
 # go out again at the game's next allocation, a 30-40 ms frame each time; and
 # ghostty came back in the very step it was moved out in). They come back at

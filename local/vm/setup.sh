@@ -4,7 +4,7 @@
 #
 #   sudo ./setup.sh
 #
-#   1. /etc/sudoers.d/nvidia-local-vm: spoki4 may run vm.sh as root without a
+#   1. /etc/sudoers.d/nvidia-local-vm: you may run vm.sh as root without a
 #      password (SETENV for its NVVM_* settings). Like the other rules, the
 #      script lives in your home and is writable by you: whoever can edit it
 #      is root.
@@ -15,7 +15,7 @@ set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-USER_NAME=${SUDO_USER:-spoki4}
+USER_NAME=${SUDO_USER:?run with sudo from your own account}
 RULE=/etc/sudoers.d/nvidia-local-vm
 
 echo "== 1. sudoers rule $RULE"

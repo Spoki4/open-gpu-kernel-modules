@@ -1,4 +1,4 @@
-# BACKLOG I7: while a game is focused, the background is kept off the game's
+# idea I7: while a game is focused, the background is kept off the game's
 # headroom (as WDDM shrinks the budgets of background processes first). A
 # hidden app that loads 600 MB next to the game gets them in sysmem from the
 # start, instead of taking the free memory the game streams into and being

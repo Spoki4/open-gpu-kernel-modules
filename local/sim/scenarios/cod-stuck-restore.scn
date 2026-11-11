@@ -1,4 +1,4 @@
-# Was: BACKLOG #10 (the focused game's memory stays in sysmem), #9 (out and back in one step)
+# Was: problem #10 (the focused game's memory stays in sysmem), #9 (out and back in one step)
 #
 # CoD (pid 1684253) on monitor 1, Chrome/Claude/ghostty on monitor 2. At
 # 11:50-11:57 the user works on monitor 2 and ~1 GB of CoD moves out; from

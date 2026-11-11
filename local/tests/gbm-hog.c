@@ -15,7 +15,7 @@
 //   --dumb        DRM_IOCTL_MODE_CREATE_DUMB instead of GBM
 //   --max N       stop after N buffers (default 400)
 //   --churn N     then N times: one more buffer, the oldest one freed (a page
-//                 that remakes its big buffer, BACKLOG #15: Chrome asked for a
+//                 that remakes its big buffer, problem #15: Chrome asked for a
 //                 contiguous 130 MB up to 30 times a second); GBM only
 //
 // It also stops when 5 buffers in a row did not take vidmem: nvidia-drm has

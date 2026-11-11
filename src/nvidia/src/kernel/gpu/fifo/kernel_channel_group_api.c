@@ -563,7 +563,7 @@ failed:
         }
 
         //
-        // Local patch (BACKLOG #3): GSP already has the channel group when a
+        // Local patch (problem #3): GSP already has the channel group when a
         // later step fails (ctxBufPoolReserve() with vidmem full). A failed
         // construction is never freed through the resource server, so its
         // bRpcFree does nothing: free it on GSP here, as kchannelConstruct

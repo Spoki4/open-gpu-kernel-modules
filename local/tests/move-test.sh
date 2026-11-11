@@ -1,5 +1,5 @@
 #!/bin/bash
-# BACKLOG #16: evict.sh move (vidmem -> other vidmem pages, no sysmem) keeps
+# problem #16: evict.sh move (vidmem -> other vidmem pages, no sysmem) keeps
 # the content: a rendering nvt-game that rewrites what it reads, an idle one,
 # and compr-test images (compressible kind on 2 MB and on 64 KB pages, a
 # cleared image and noise) are moved CYCLES times each and checked. Run in the
@@ -14,7 +14,7 @@ fail() { echo "  FAIL: $*"; fails=$((fails + 1)); }
 moves() { # PID -> prints the last summary, fails on anything not moved
     local pid=$1 i out
     for i in $(seq "$cycles"); do
-        out=$(sudo -n ./evict.sh move "$pid" 2>&1)
+        out=$(sudo -n ../evict.sh move "$pid" 2>&1)
         grep -q 'summary: moved [1-9]' <<<"$out" || { fail "move $i: $(grep -E 'summary|failed' <<<"$out" | head -2)"; return; }
         grep -q 'failed 0 ' <<<"$out" || fail "move $i: $(grep -E 'summary|failed 0x' <<<"$out" | head -3)"
         sleep 0.3
@@ -38,7 +38,7 @@ compr() { # ARGS...
     local pid=$! n
     for _ in $(seq 100); do grep -q '^OK 1' "$T/compr.log" && break; sleep 0.2; done
     echo "== compr-test $*: $(head -1 "$T/compr.log")"
-    sudo -n ./evict.sh dry $pid 2>&1 | awk '$2 > 60000 && /KB kind/' | head -2 | sed 's/^/  /'
+    sudo -n ../evict.sh dry $pid 2>&1 | awk '$2 > 60000 && /KB kind/' | head -2 | sed 's/^/  /'
     n=$(grep -c '^OK' "$T/compr.log")
     moves $pid
     # Two more checks: the first may have begun before the last move.
@@ -59,6 +59,6 @@ compr --chunk-mb 128 --noise
 echo "kernel:"
 sudo journalctl -k --since "$T0" --no-pager | grep -E 'Xid|BUG:|Oops|WARNING|general protection|not remade|move copy failed|[Aa]ssert|NV_ERR' | tail -10
 sudo journalctl -k --since "$T0" --no-pager | grep -qE 'Xid|BUG:|Oops|general protection|not remade|move copy failed|[Aa]ssert' && fail "kernel log"
-sudo -n ./evict.sh status | grep '^fragmentation'
+sudo -n ../evict.sh status | grep '^fragmentation'
 rm -rf "$T"
 (( fails == 0 )) && echo "MOVETEST PASS" || echo "MOVETEST FAIL $fails"

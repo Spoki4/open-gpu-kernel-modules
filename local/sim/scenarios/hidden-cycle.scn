@@ -1,4 +1,4 @@
-# BACKLOG #6, host 2026-11-08 (recording 20261107_234433): the focused window
+# problem #6, host 2026-11-08 (recording 20261107_234433): the focused window
 # grew and wanted its headroom, the hidden Battle.net, Claude and Steam
 # (~900 MB) went out; 37-81 s later it gave the memory back, 4 GB were free,
 # and after 30 quiet seconds they all came back, to go out again at its next

@@ -176,7 +176,7 @@ static NvU32 _vidmemEvictTrace;
 static NvU32 _vidmemEvictWindows;
 //
 // Window buffers (what the compositor maps too) may still move to other
-// vidmem pages (BACKLOG #16: with a game on screen they were 459 MB that
+// vidmem pages (problem #16: with a game on screen they were 459 MB that
 // compaction could not touch, and a window cleared for a contiguous buffer
 // had to avoid them): the compositor's channels are stopped for the copy, as
 // when such a buffer is moved out, but nobody draws from sysmem afterwards.
@@ -187,7 +187,7 @@ static NvU32  _vidmemMoveShared = 1;
 static NvU32  _vidmemCompactFg = 1;
 static NvBool _vidmemCheckForMove;
 //
-// The same for a buffer another application holds too (BACKLOG I10; it was
+// The same for a buffer another application holds too (idea I10; it was
 // "shared-other-app", never moved): for a move inside vidmem that
 // application's channels stop in phase 2 with the compositor's. Never the
 // window in focus (its frames come first), and never out to sysmem: the
@@ -459,7 +459,7 @@ _vidmemEvictAddHolderMaps
 //
 // Holders of shared allocations (DupCount > 1: window buffers kwin also
 // holds, browser buffers held by two processes), indexed once per client
-// walk (BACKLOG #1). Without it every shared allocation looked for its other
+// walk (problem #1). Without it every shared allocation looked for its other
 // holders by walking every client and every resource again: a policy step
 // took ~20 ms under the RM locks on the desktop (Chrome WebGPU and kwin lost
 // 2-4 frames every 2 s). Built by vepPlatGatherProcs() and
@@ -1826,7 +1826,7 @@ _vidmemBestFitRange(PMA *pPma, NvU64 bytes, NvU64 align, NvU64 aLo, NvU64 aHi, N
 
 //
 // Move an allocation to other vidmem pages without the detour through sysmem
-// (BACKLOG #16: compaction, and room for contiguous requests without taking
+// (problem #16: compaction, and room for contiguous requests without taking
 // the memory out of vidmem). Channels of the owner disabled, no mapping of
 // the compositor (the caller skips those). New pages outside [avoidLo,
 // avoidHi) when that is given (the window being cleared), one CE copy from
@@ -2252,7 +2252,7 @@ NvU64 *vidmemPmaUsedMap(PMA *pPma, NvU64 *pBase, NvU64 *pFrames, NvU64 *pLargest
 extern NvU64 g_ceutilsCopyLaunches, g_ceutilsCopySubmitNs, g_ceutilsCopyWaitNs;             // ce_utils.c
 
 //
-// How fragmented free vidmem is (BACKLOG #16): the PMA region user
+// How fragmented free vidmem is (problem #16): the PMA region user
 // allocations come from, in 2 MB chunks (physically aligned). A chunk is free
 // when all its frames are; a run is free chunks in a row, what a contiguous
 // or 2 MB-page allocation can use. Free frames in chunks partly in use are
@@ -2425,7 +2425,7 @@ _vidmemEvictPidLocked
     pChannels->vmtOffNs = 0;
     pCompChannels->vmtOffNs = 0;
     portMemSet(_vidmemEvictPhaseNs, 0, sizeof(_vidmemEvictPhaseNs));
-    // Fragmentation before the batch (VMT_FRAG after it, BACKLOG #16).
+    // Fragmentation before the batch (VMT_FRAG after it, problem #16).
     bFrag = (mode != 0) && osVidmemTraceOn(VMT_FRAG) && _vidmemFragStats(pGpu, &fragBefore);
 
     EVICT_PRINTF("%s pid %u\n", (mode == 0) ? "dry" : VE_MODE_NAME(mode), pid);
@@ -2523,7 +2523,7 @@ _vidmemEvictPidLocked
 
                 //
                 // Partial restore (the foreground's memory when not all of it
-                // fits, BACKLOG #10): no more than the budget, counting
+                // fits, problem #10): no more than the budget, counting
                 // deferred ones; an allocation that does not fit in what is
                 // left is skipped, a smaller one after it may still fit.
                 //
@@ -2601,7 +2601,7 @@ _vidmemEvictPidLocked
                 // Making 2 MB chunks free (the compositor, a placement): only
                 // allocations on 2 MB pages free whole chunks; one on 64 KB
                 // pages may leave every chunk it touched still in use
-                // (BACKLOG #12: 284 MB of the game moved for kwin's 32 MB).
+                // (problem #12: 284 MB of the game moved for kwin's 32 MB).
                 //
                 if (_vidmemEvictBigPagesOnly &&
                     ((pMemDesc->pPmaAllocInfo == NULL) || (pMemDesc->pPmaAllocInfo->pageSize < (2ULL << 20))))
@@ -2683,7 +2683,7 @@ _vidmemEvictPidLocked
                 {
                     static NvU32 moveFailLogged;
 
-                    // Why a move inside vidmem did not happen (BACKLOG #15: "failed 1" said nothing).
+                    // Why a move inside vidmem did not happen (problem #15: "failed 1" said nothing).
                     if ((moveFailLogged++ < 8) || ((moveFailLogged % 64) == 0))
                         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: move of %llu KB%s of pid %u inside vidmem failed: 0x%x\n",
                                   bytes >> 10,
@@ -2823,13 +2823,13 @@ free_mem:
 // Interrupts stay disabled; the buffer is polled every policy step.
 // Knob "hot 0|1" (default 0 until verified on the bench).
 //
-// "hot 2" (2026-11-11, a probe, BACKLOG I5): the second kind of counters too
+// "hot 2" (2026-11-11, a probe, idea I5): the second kind of counters too
 // (MOMC, same class). Evicting cold memory first needs to know what is in
 // use while it is still in vidmem; MIMC says that only of what already is
 // in sysmem. Whether MOMC counts a channel's accesses to vidmem on this GPU
 // under GSP is not known (nvidia-uvm does not use it): with 2 the entries are
 // only counted apart (in a channel but outside evicted allocations, by entry
-// type and aperture), nothing acts on them. local/momc-probe.sh compares.
+// type and aperture), nothing acts on them. local/tests/momc-probe.sh compares.
 // ---------------------------------------------------------------------------
 
 #define VIDMEM_HOT_THRESHOLD     256
@@ -3065,7 +3065,7 @@ _vidmemHotPoll(OBJGPU *pGpu)
             _vidmemHot.apVid++;
         //
         // A virtual address (GVA) entry: its aperture field says nothing
-        // (always 0 here, BACKLOG I5, 2026-11-07: 28665 entries from a
+        // (always 0 here, idea I5, 2026-11-07: 28665 entries from a
         // process reading its evicted memory, all "aperture 0"); whether the
         // VA lies in an evicted allocation is what the lookup tells. A
         // physical one counts only when it points at sysmem.
@@ -3587,7 +3587,7 @@ _vidmemEvictPolicyTick(OBJGPU *pGpu, NvU32 trigger)
         a[9] = trigger;
         osVidmemTrace(VMT_TICK, 0, a);
     }
-    // Every 5th timer step (10 s): how fragmented free vidmem is (BACKLOG #16).
+    // Every 5th timer step (10 s): how fragmented free vidmem is (problem #16).
     if ((trigger == 0) && ((_vidmemFragTicks++ % 5) == 0) && osVidmemTraceOn(VMT_FRAG))
         _vidmemFragTrace(pGpu, 0, 0, 0, NULL);
 }
@@ -3713,7 +3713,7 @@ vidmemEvictBackgroundCushion(RmClient *pRmClient)
 //
 //
 // The foreground's headroom refill (vepHeadroomRun()) runs here, a piece per
-// work item: the locks are free between pieces (BACKLOG #5).
+// work item: the locks are free between pieces (problem #5).
 //
 static volatile NvU32 _vidmemHeadroomQueued;
 
@@ -3769,7 +3769,7 @@ vidmemEvictKeepFgHeadroom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
     if ((pRmClient == NULL) || _vidmemEvictIsBusyThread() ||
         !vepKeepFgHeadroomWanted(pGpu, pRmClient->ProcID, size))
         return;
-    // In the background, not inside this allocation (BACKLOG #5).
+    // In the background, not inside this allocation (problem #5).
     if (vepHeadroomRequest(pRmClient->ProcID))
         _vidmemHeadroomQueue(pGpu);
 }
@@ -3859,7 +3859,7 @@ _vidmemEvictFreeChunks(const NvU64 *pUsed, NvU64 base, NvU64 frames, NvU64 *pFre
 // frames to move (in use and movable, pMovable), NV_U64_MAX if every window
 // holds a frame that cannot be freed. *pStart (optional) gets its first chunk.
 // pCost is scratch space for `chunks` entries. A frame in pHeavy (optional:
-// memory of a process that is drawing in a window the user sees, BACKLOG
+// memory of a process that is drawing in a window the user sees, problem
 // #15) counts VIDMEM_EVICT_HEAVY_COST times: a window over hidden programs
 // is taken before a smaller one over the game on the other monitor.
 //
@@ -3967,11 +3967,11 @@ static NvU64 _vidmemContigInVidmemMB;   // moved inside vidmem by window clearin
 // memory is moved only inside vidmem, and only what is not contiguous: on
 // the host its previous 130 MB buffer went to sysmem for each new one, up to
 // 30 times a second, and came back as "the foreground's memory" at the cost
-// of the game's (BACKLOG #15, 165 clearings in two hours).
+// of the game's (problem #15, 165 clearings in two hours).
 // Those who may not be moved out at `level` but whose memory compaction may
 // move (_vidmemCompactVictim(): anyone but the focus and the compositor)
 // still give for a window, by a move to other vidmem pages only: it stays in
-// vidmem, the price is a pause for the copy (BACKLOG #16).
+// vidmem, the price is a pause for the copy (problem #16).
 //
 static NvBool _vidmemCompactVictim(VIDMEM_EVICT_PROC *p, NvBool bFgToo);
 
@@ -4079,7 +4079,7 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     {
         static NvU32 noneLogged;
 
-        // A page asking 30 times a second (BACKLOG #15): the first few, then one in 64.
+        // A page asking 30 times a second (problem #15): the first few, then one in 64.
         if ((noneLogged++ < 8) || ((noneLogged % 64) == 0))
             NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: contiguous: no %llu MB window aligned to %llu KB can be cleared for pid %u (longest free %llu MB)\n",
                       need * 2, align >> 10, forPid, longest * 2);
@@ -4105,7 +4105,7 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
             !_vidmemPidHasInRange(pProcs[i].pid))
             continue;
         //
-        // To other vidmem pages first (BACKLOG #16, #15: Chrome's contiguous
+        // To other vidmem pages first (problems #16, #15: Chrome's contiguous
         // buffers pushed the game's memory out to sysmem, which then ran from
         // there until a restore); to sysmem what is left in the window: what
         // the compositor maps too, or when no vidmem outside it is free.
@@ -4140,7 +4140,7 @@ done:
 }
 
 //
-// Background compaction (BACKLOG #16), one step: the window of 2 MB chunks
+// Background compaction (problem #16), one step: the window of 2 MB chunks
 // that `budgetMB` of moving makes the longest free run, holding only memory
 // that may move (_vidmemCompactVictim(): never the foreground's), is cleared
 // to vidmem pages outside it. Allocations bigger than the budget count as fixed: moving one
@@ -4474,7 +4474,7 @@ vidmemEvictMakeRoomCompositor(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvB
 
 //
 // An allocation of an ordinary process found no place in PMA although the
-// free memory looked enough (64 KB holes, 2 MB pages; BACKLOG #7: the WebGPU
+// free memory looked enough (64 KB holes, 2 MB pages; problem #7: the WebGPU
 // page focused next to a game got some buffers and then none). The
 // foreground and visible processes get whole chunks made free, as the
 // compositor; the caller tries once more. Same locking as the compositor's.
@@ -4548,7 +4548,7 @@ vidmemEvictMakeRoomPlace(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvBool b
 
 //
 // Context buffers of a new channel found no room (ctxBufPoolReserve(),
-// BACKLOG #13): make whole chunks free for `size` as for an allocation of
+// problem #13): make whole chunks free for `size` as for an allocation of
 // `pid`, the process creating the channel. Needs the API lock for writing
 // (channel allocations hold it); takes the GPU lock if not held.
 //
@@ -5009,7 +5009,7 @@ vidmemEvictProcess
     if (status != NV_OK)
         return status;
 
-    // 12: move inside vidmem (BACKLOG #16), mode 3 of _vidmemEvictPidLocked().
+    // 12: move inside vidmem (problem #16), mode 3 of _vidmemEvictPidLocked().
     if (mode == 16)
     {
         _vidmemCompactFg = (arg != 0);

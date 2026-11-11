@@ -1,4 +1,4 @@
-# BACKLOG #7, the other half: a focused game that finds no room is turned
+# problem #7, the other half: a focused game that finds no room is turned
 # away as before (nobody's memory moves inside its allocation; vkd3d and GL
 # drivers place by the budget and fall back by themselves).
 cap 4000

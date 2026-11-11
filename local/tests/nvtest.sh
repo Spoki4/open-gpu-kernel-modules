@@ -1,6 +1,5 @@
 #!/bin/bash
-# Unattended test bench for vidmem eviction (user half; the root half is
-# nvtest-root.sh). Every scenario runs synthetic processes only (nvt-game
+# Unattended test bench for vidmem eviction. Every scenario runs synthetic processes only (nvt-game
 # under different names, compr-test), checks their memory content, the kernel
 # log and timing, and ends with one line
 #   NVTEST <scenario> PASS|FAIL <reasons>
@@ -31,7 +30,7 @@
 #                                    (evict.sh quiesce 0..4, NVTEST_MODES="0 2" to pick)
 #   ./nvtest.sh fgback               the focused game's memory moved out while only part of
 #                                    it fits: that part back within seconds, the rest once
-#                                    there is room, its content intact (BACKLOG #10)
+#                                    there is room, its content intact (problem #10)
 #   ./nvtest.sh focus                two monitors: clicking a window on monitor 2 makes it
 #                                    the foreground, not the fullscreen game on monitor 1;
 #                                    a WebGPU page it opens gets memory from the game (R4, #7)
@@ -57,13 +56,13 @@ set -euo pipefail
 trap '"$(dirname -- "${BASH_SOURCE[0]}")/nvt-session.sh" stop >/dev/null 2>&1 || true; pkill -P $$ >/dev/null 2>&1 || true' EXIT
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-EVICT="sudo -n $HERE/evict.sh"
-LOGROOT=${LOGROOT:-$HERE/stress-logs/nvtest-$(date +%F_%H%M%S)}
+EVICT="sudo -n $HERE/../evict.sh"
+LOGROOT=${LOGROOT:-$HERE/../stress-logs/nvtest-$(date +%F_%H%M%S)}
 # Kernel log lines that fail any scenario.
 BAD_K_RE='Xid|NVRM: .*([^a-zA-Z]fault|FAULT)|GPU has fallen off|RmInitAdapter failed|BUG:|WARNING:'
 
 die() { echo "nvtest.sh: $*" >&2; exit 2; }
-[[ -x $HERE/nvt-game && -x $HERE/compr-test ]] || die "tools missing, run ./build.sh tools"
+[[ -x $HERE/nvt-game && -x $HERE/compr-test ]] || die "tools missing, run ../build.sh tools"
 ls /proc/driver/nvidia/gpus/*/vidmem_evict >/dev/null 2>&1 || die "patched module with vidmem_evict not loaded"
 
 seat0_busy() {
@@ -414,7 +413,7 @@ fgprio_test() {
     else
         #
         # Drawing: it gives memory only as the last resort, when the focused
-        # game finds nothing else (BACKLOG R5, the user's choice "the game
+        # game finds nothing else (rule R5, the user's choice "the game
         # comes first"; here B wants all of vidmem, so A gives). It must go
         # on drawing, correctly, from sysmem meanwhile (2026-11-02 13:15:
         # CoD at 1 fps was a drawing Chrome moved out for the game's
@@ -441,7 +440,7 @@ fgprio_test() {
         # buffers: one or two of them may find no three free 2 MB chunks in a
         # row when it comes back and stay in sysmem (2 runs of 8 on the RTX
         # 5000, 2026-11-11, on 67deb430 and on the current build alike;
-        # BACKLOG I15). Up to 16 MB left is "back"; the note says how much.
+        # idea I15). Up to 16 MB left is "back"; the note says how much.
         #
         lat=$(wait_ram "$gB" "$t" 16) || fail "cycle $i: B not back within 10 s"
         sleep 2
@@ -590,7 +589,7 @@ game() {
 }
 
 mkdir -p "$LOGROOT"
-# Partial restore of the foreground (BACKLOG #10, CoD 2026-11-06: 1 GB of the
+# Partial restore of the foreground (problem #10, CoD 2026-11-06: 1 GB of the
 # focused game waited in sysmem for 8 minutes, all-or-nothing). The game's
 # memory is moved out while only part of it fits again: that part must come
 # back within seconds, in pieces, the rest as soon as there is room, and the
@@ -642,7 +641,7 @@ fgback_test() {
     finish fgback
 }
 
-# The focused window comes first (BACKLOG R4, #7): a fullscreen "game" Chrome
+# The focused window comes first (rule R4, #7): a fullscreen "game" Chrome
 # B on monitor 1 fills vidmem; the user clicks Chrome A on monitor 2. A is
 # the foreground now and B only visible (the KWin script used to keep the
 # fullscreen game the foreground); a WebGPU page A opens then gets its memory
@@ -712,7 +711,7 @@ focus_test() {
     finish focus
 }
 
-# GPU mappings made and dropped while the driver moves the memory (BACKLOG
+# GPU mappings made and dropped while the driver moves the memory (problem
 # #4: "can't update VA space", each time 1-6 s after an app was moved out
 # and back at once). A Chrome page that deletes and remakes a texture every
 # frame (same picture) is moved out and back every 0.3-1 s for a minute;
@@ -743,13 +742,13 @@ vaflip_test() {
     finish vaflip
 }
 
-# The compositor's buffers with vidmem full (BACKLOG #12: for kwin's 32 MB the
+# The compositor's buffers with vidmem full (problem #12: for kwin's 32 MB the
 # driver moved 284 MB of the focused game in 531 ms). A visible game drawing
 # and a hidden idle app fill vidmem; a process named kwin_wayland (the
 # compositor by name: exempt, room made for it) then allocates 32 MB buffers
 # beyond what is free: the hidden app gives, about what each buffer needs,
 # and the drawing game keeps its memory. (GBM scanout buffers go through
-# nvkms, outside this path: BACKLOG I12.)
+# nvkms, outside this path: idea I12.)
 comproom_test() {
     if seat0_busy && [[ ${NVTEST_FORCE:-0} != 1 ]]; then
         echo "NVTEST comproom SKIP somebody is logged in on seat0" | tee -a "$LOGROOT/summary.txt"
@@ -791,7 +790,7 @@ comproom_test() {
     finish comproom
 }
 
-# New channels with vidmem nearly full (BACKLOG #13: xdg-desktop-portal-kde
+# New channels with vidmem nearly full (problem #13: xdg-desktop-portal-kde
 # died when its channel's context buffers found no room; #3: a failed channel
 # group stayed allocated on GSP and every later process failed until a
 # reboot). Memory that cannot move (a process named like the login screen)

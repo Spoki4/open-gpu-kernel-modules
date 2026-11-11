@@ -68,10 +68,10 @@ fi
 
 say "nvtest ${args[*]}"
 local/watchdog.sh --stall 600 --max 5400 --watch local/stress-logs --ignore dmon.log --ignore 'vmtest-*' \
-    --on-kill "timeout 60 '$ROOT/local/vm/vm.sh' ssh 'cd $ROOT/local && ./nvt-session.sh stop; pkill -f '\''[n]vt-'\'' ; true' \
+    --on-kill "timeout 60 '$ROOT/local/vm/vm.sh' ssh 'cd $ROOT/local/tests && ./nvt-session.sh stop; pkill -f '\''[n]vt-'\'' ; true' \
                || '$ROOT/local/vm/vm.sh' reset" -- \
-    local/vm/vm.sh ssh "T0=\$(date '+%F %T'); cd '$ROOT/local' && NVTEST_FORCE=1 ./watchdog.sh --stall 480 --max 5000 \
-        --watch stress-logs --ignore dmon.log --on-kill './nvt-session.sh stop' -- ./nvtest.sh ${args[*]}; \
+    local/vm/vm.sh ssh "T0=\$(date '+%F %T'); cd '$ROOT/local/tests' && NVTEST_FORCE=1 ../watchdog.sh --stall 480 --max 5000 \
+        --watch ../stress-logs --ignore dmon.log --on-kill './nvt-session.sh stop' -- ./nvtest.sh ${args[*]}; \
         echo; echo 'kernel:'; sudo journalctl -k --since \"\$T0\" --no-pager | grep -E 'Xid|BUG:|Oops|general protection|kernel panic|can.t update VA|[Aa]ssert|failed [1-9]|NV_ERR' | tail -20" \
     2>&1 | grep --line-buffered -v '^Pseudo-terminal' >>"$log"
 rc=${PIPESTATUS[0]}
