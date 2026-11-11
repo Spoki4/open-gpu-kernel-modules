@@ -183,6 +183,8 @@ static NvU32 _vidmemEvictWindows;
 // evict.sh moveshared on|off; _vidmemCheckForMove: the check is for such a move.
 //
 static NvU32  _vidmemMoveShared = 1;
+// Background compaction also moves the memory of the window in focus (evict.sh compactfg).
+static NvU32  _vidmemCompactFg = 1;
 static NvBool _vidmemCheckForMove;
 //
 // The same for a buffer another application holds too (BACKLOG I10; it was
@@ -3948,7 +3950,7 @@ static NvU64 _vidmemContigInVidmemMB;   // moved inside vidmem by window clearin
 // still give for a window, by a move to other vidmem pages only: it stays in
 // vidmem, the price is a pause for the copy (BACKLOG #16).
 //
-static NvBool _vidmemCompactVictim(VIDMEM_EVICT_PROC *p);
+static NvBool _vidmemCompactVictim(VIDMEM_EVICT_PROC *p, NvBool bFgToo);
 
 static NvBool
 _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
@@ -4007,7 +4009,7 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
         // Moved inside vidmem only: itself, and those not to be moved out at this level.
         NvBool     bMoveOnly = bSelf || !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, level);
 
-        if (bMoveOnly && !bSelf && !_vidmemCompactVictim(&pProcs[i]))
+        if (bMoveOnly && !bSelf && !_vidmemCompactVictim(&pProcs[i], NV_FALSE))
             continue;
         for (ppClient = serverutilGetFirstClientUnderLock(); ppClient != NULL;
              ppClient = serverutilGetNextClientUnderLock(ppClient))
@@ -4076,7 +4078,7 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
         NvBool bSelf = (forPid != 0) && (pProcs[i].pid == forPid);
         NvBool bMoveOnly = bSelf || !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, level);
 
-        if ((bMoveOnly && !bSelf && !_vidmemCompactVictim(&pProcs[i])) ||
+        if ((bMoveOnly && !bSelf && !_vidmemCompactVictim(&pProcs[i], NV_FALSE)) ||
             !_vidmemPidHasInRange(pProcs[i].pid))
             continue;
         //
@@ -4127,16 +4129,25 @@ static NvU64 _vidmemCompactMovedMB;
 // Whose memory compaction may move. Not the rules of moving out
 // (_vidmemEvictHintVictimOk()): the memory stays in vidmem, nobody renders
 // from sysmem afterwards; the price is a pause of the owner's channels for
-// the copy, a few ms a step. So: anyone but the window in focus (its frames
-// come first) and the compositor with its X server (their pause is everyone's
-// pause). With only the idle ones movable, a desktop with a game on screen
-// had 31 MB movable of 3.9 GB in use and compaction stood still
-// (2026-11-10: game 2186 MB "drawing", plasmashell 370 MB "never").
+// the copy, a few ms a step. So: anyone but the compositor with its X server
+// (their pause is everyone's pause). With only the idle ones movable, a
+// desktop with a game on screen had 31 MB movable of 3.9 GB in use and
+// compaction stood still (2026-11-10: game 2186 MB "drawing", plasmashell
+// 370 MB "never").
+// The window in focus: for background compaction only (bFgToo), a step of
+// VIDMEM_EVICT_COMPACT_STEP_MB at most, on quiet policy steps, until the free
+// run is long enough (the user, 2026-11-11: the game is the biggest owner,
+// without it the holes between its buffers stay for as long as it is played;
+// evict.sh compactfg off for the old rule). Never for a window cleared for
+// somebody else's contiguous request: that move has no size limit (640 MB of
+// WoW in 1.52 s, 2026-11-10).
 //
 static NvBool
-_vidmemCompactVictim(VIDMEM_EVICT_PROC *p)
+_vidmemCompactVictim(VIDMEM_EVICT_PROC *p, NvBool bFgToo)
 {
-    if ((VE_HINT_STATE(p->hint) == VE_HINT_FG) || (p->vidmemBytes == 0))
+    if (p->vidmemBytes == 0)
+        return NV_FALSE;
+    if ((VE_HINT_STATE(p->hint) == VE_HINT_FG) && !(bFgToo && _vidmemCompactFg))
         return NV_FALSE;
     return (portStringCompare(p->name, VIDMEM_EVICT_COMPOSITOR, NV_PROC_NAME_MAX_LENGTH) != 0) &&
            (portStringCompare(p->name, "Xwayland", NV_PROC_NAME_MAX_LENGTH) != 0);
@@ -4212,15 +4223,15 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budge
 
     //
     // What could move: allocations no bigger than the budget, of everyone
-    // but the foreground and the compositor (the move pauses the owner for
-    // the copy, the memory stays in vidmem).
+    // but the compositor (the move pauses the owner for the copy, the memory
+    // stays in vidmem).
     //
     portMemSet(_vidmemCompactSeen, 0, sizeof(_vidmemCompactSeen));
     _vidmemCompactSeenUsed = _vidmemFramesUsed(pUsed, 0, frames) << PMA_PAGE_SHIFT;
     for (i = 0; i < count; i++)
     {
         RmClient **ppClient;
-        NvBool     bVictim = _vidmemCompactVictim(&pProcs[i]);
+        NvBool     bVictim = _vidmemCompactVictim(&pProcs[i], NV_TRUE);
         NvU32      cat = (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) ? VC_FG : VC_DESKTOP;
 
         if (bVictim)
@@ -4344,7 +4355,7 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budge
     {
         NvU64 moved = 0;
 
-        if (!_vidmemCompactVictim(&pProcs[i]) || !_vidmemPidHasInRange(pProcs[i].pid))
+        if (!_vidmemCompactVictim(&pProcs[i], NV_TRUE) || !_vidmemPidHasInRange(pProcs[i].pid))
             continue;
         (void)_vidmemEvictPidLocked(pGpu, 3, pProcs[i].pid, NULL, 0, NULL, &moved);
         movedMB += moved >> 20;
@@ -4688,8 +4699,9 @@ _vidmemEvictPrintBlock(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
                      largest >> 20, _vidmemBgCushionMB, _vidmemCompRooms, _vidmemCompRoomFails,
                      _vidmemCompRoomMovedMB, _vidmemCompRoomMaxNs / 1000);
         EVICT_PRINTF("windows cleared for contiguous allocations: %llu MB moved inside vidmem; "
-                     "background compaction: keeps a free run of %u MB, %u steps, %llu MB moved\n",
-                     _vidmemContigInVidmemMB, _vidmemCompactRunMB, _vidmemCompactSteps, _vidmemCompactMovedMB);
+                     "background compaction: keeps a free run of %u MB, %u steps, %llu MB moved%s\n",
+                     _vidmemContigInVidmemMB, _vidmemCompactRunMB, _vidmemCompactSteps, _vidmemCompactMovedMB,
+                     _vidmemCompactFg ? "" : "; not the window in focus");
         EVICT_PRINTF("compaction saw (MB): in use %llu; movable %llu; compositor %llu, foreground %llu, "
                      "movable with a pause of the compositor %llu, bigger than a step %llu, refused %llu\n",
                      _vidmemCompactSeenUsed >> 20, _vidmemCompactSeen[VC_MOVABLE] >> 20,
@@ -4941,7 +4953,13 @@ vidmemEvictProcess
         return status;
 
     // 12: move inside vidmem (BACKLOG #16), mode 3 of _vidmemEvictPidLocked().
-    if (mode == 15)
+    if (mode == 16)
+    {
+        _vidmemCompactFg = (arg != 0);
+        EVICT_PRINTF("background compaction %s the memory of the window in focus\n",
+                     _vidmemCompactFg ? "moves" : "does not move");
+    }
+    else if (mode == 15)
     {
         _vidmemFgOwnEnabled = (arg != 0);
         EVICT_PRINTF("the foreground's own memory for its allocation: %s\n", _vidmemFgOwnEnabled ? "on" : "off");
