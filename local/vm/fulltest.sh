@@ -24,6 +24,8 @@
 #   game         the game from Steam (game-start.sh) under fragchurn with moves and the
 #                contiguous loop: it keeps running, no Xid (#16: bdb7f072 was never
 #                checked whole). SKIP when Steam is not logged in (the user does that).
+#   momcprobe    momc-probe.sh       a probe, not a check: do access counters report accesses
+#                                    to vidmem (I5)? The answer is in the PASS line
 # Not here: pressing "start benchmark" in the game (input is the user's), see
 # BACKLOG #16.
 #
@@ -159,6 +161,8 @@ if (( game )); then
         pkill -f '[b]1_benchmark' ; sleep 3; (steam -shutdown >/dev/null 2>&1 &) ; sleep 8
         if [[ \$alive == 1 && \$bad == 0 ]]; then echo GAME PASS; else echo GAME FAIL; fi"
 fi
+# Last: counters nobody has run on this GPU; whatever they do, the checks are over.
+stage momcprobe 120 300 'MOMCPROBE PASS' "./momc-probe.sh"
 
 say; say "== summary"
 failed=() ran=0

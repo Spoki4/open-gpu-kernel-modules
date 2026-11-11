@@ -2822,6 +2822,14 @@ free_mem:
 // memory process registers the GPU. Then this stays off (status says so).
 // Interrupts stay disabled; the buffer is polled every policy step.
 // Knob "hot 0|1" (default 0 until verified on the bench).
+//
+// "hot 2" (2026-11-11, a probe, BACKLOG I5): the second kind of counters too
+// (MOMC, same class). Evicting cold memory first needs to know what is in
+// use while it is still in vidmem; MIMC says that only of what already is
+// in sysmem. Whether MOMC counts a channel's accesses to vidmem on this GPU
+// under GSP is not known (nvidia-uvm does not use it): with 2 the entries are
+// only counted apart (in a channel but outside evicted allocations, by entry
+// type and aperture), nothing acts on them. local/momc-probe.sh compares.
 // ---------------------------------------------------------------------------
 
 #define VIDMEM_HOT_THRESHOLD     256
@@ -2838,6 +2846,8 @@ typedef struct
     volatile NvU32 *pGet, *pPut, *pIntrEnClear;
     NvU32           intrMask;
     NvU64           notifs, sysNotifs, matched, restored;
+    NvU64           elsewhere, typeCpu, apVid;   // the probe (hot 2)
+    NvU32           logged;
     // Allocations that were hot lately (restored because of it): taken last.
     MEMORY_DESCRIPTOR *recent[VIDMEM_HOT_RING];
     NvU64              recentNs[VIDMEM_HOT_RING];
@@ -2938,9 +2948,11 @@ _vidmemHotInit(OBJGPU *pGpu)
     _vidmemHot.intrMask     = regs.accessCntrMask;
 
     cfg.mimcGranularity = NVC365_CTRL_ACCESS_COUNTER_GRANULARITY_2M;
-    cfg.momcGranularity = NVC365_CTRL_ACCESS_COUNTER_GRANULARITY_64K;
+    cfg.momcGranularity = (_vidmemHotEnabled >= 2) ? NVC365_CTRL_ACCESS_COUNTER_GRANULARITY_2M :
+                                                     NVC365_CTRL_ACCESS_COUNTER_GRANULARITY_64K;
     cfg.mimcLimit       = NVC365_CTRL_ACCESS_COUNTER_USE_LIMIT_FULL;
-    cfg.momcLimit       = NVC365_CTRL_ACCESS_COUNTER_USE_LIMIT_NONE;
+    cfg.momcLimit       = (_vidmemHotEnabled >= 2) ? NVC365_CTRL_ACCESS_COUNTER_USE_LIMIT_FULL :
+                                                     NVC365_CTRL_ACCESS_COUNTER_USE_LIMIT_NONE;
     cfg.threshold       = VIDMEM_HOT_THRESHOLD;
     cfg.cmd = NVC365_CTRL_ACCESS_COUNTER_SET_MIMC_GRANULARITY | NVC365_CTRL_ACCESS_COUNTER_SET_MOMC_GRANULARITY |
               NVC365_CTRL_ACCESS_COUNTER_SET_MIMC_LIMIT | NVC365_CTRL_ACCESS_COUNTER_SET_MOMC_LIMIT |
@@ -2959,8 +2971,8 @@ _vidmemHotInit(OBJGPU *pGpu)
     if (_vidmemHot.pIntrEnClear != NULL)
         MEM_WR32(_vidmemHot.pIntrEnClear, _vidmemHot.intrMask);
 
-    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hot memory: access counters on (%u entries, 2 MB, threshold %u)\n",
-              _vidmemHot.entries, VIDMEM_HOT_THRESHOLD);
+    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hot memory: access counters on (%u entries, 2 MB, threshold %u%s)\n",
+              _vidmemHot.entries, VIDMEM_HOT_THRESHOLD, (_vidmemHotEnabled >= 2) ? ", vidmem counters too" : "");
     return NV_OK;
 
 fail:
@@ -2982,7 +2994,7 @@ _vidmemHotResetCounters(void)
 
     if (!_vidmemHotEnabled || !_vidmemHot.bInit || _vidmemHot.bFailed)
         return;
-    reset.counterType = NVC365_CTRL_ACCESS_COUNTER_TYPE_MIMC;
+    reset.counterType = (_vidmemHotEnabled >= 2) ? NVC365_CTRL_ACCESS_COUNTER_TYPE_ALL : NVC365_CTRL_ACCESS_COUNTER_TYPE_MIMC;
     (void)pRmApi->Control(pRmApi, _vidmemHot.hClient, _vidmemHot.hBuffer,
                           NVC365_CTRL_CMD_ACCESS_CNTR_BUFFER_RESET_COUNTERS, &reset, sizeof(reset));
 }
@@ -3013,7 +3025,6 @@ _vidmemHotPoll(OBJGPU *pGpu)
 {
     KernelFifo *pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
     NvU32 get, put, n = 0;
-    static NvU32 logged;
 
     if (!_vidmemHotEnabled)
         return;
@@ -3027,7 +3038,7 @@ _vidmemHotPoll(OBJGPU *pGpu)
     while ((get != put) && (n++ < _vidmemHot.entries))
     {
         NvU32 *pEntry = (NvU32 *)(_vidmemHot.pBuf + (NvU64)get * NVC365_NOTIFY_BUF_SIZE);
-        NvU32  addrType, aperture, count;
+        NvU32  addrType, aperture, count, type;
         NvU64  addr, instLo, instHi;
         INST_BLOCK_DESC inst;
         KernelChannel *pKernelChannel = NULL;
@@ -3036,6 +3047,7 @@ _vidmemHotPoll(OBJGPU *pGpu)
         if (!DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _VALID, pEntry))
             break;      // not written yet
         addrType = DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _ADDR_TYPE, pEntry);
+        type     = DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _TYPE, pEntry);
         aperture = DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _APERTURE, pEntry);
         count    = DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _COUNTER_VAL, pEntry);
         addr     = (NvU64)DRF_VAL_MW(C365, _NOTIFY_BUF_ENTRY, _ADDR_LO, pEntry) |
@@ -3047,6 +3059,10 @@ _vidmemHotPoll(OBJGPU *pGpu)
         inst.gfid     = GPU_GFID_PF;
 
         _vidmemHot.notifs++;
+        if (type == NVC365_NOTIFY_BUF_ENTRY_TYPE_CPU)
+            _vidmemHot.typeCpu++;
+        if (aperture == NVC365_NOTIFY_BUF_ENTRY_APERTURE_VID_MEM)
+            _vidmemHot.apVid++;
         //
         // A virtual address (GVA) entry: its aperture field says nothing
         // (always 0 here, BACKLOG I5, 2026-11-07: 28665 entries from a
@@ -3069,11 +3085,17 @@ _vidmemHotPoll(OBJGPU *pGpu)
                 pState->hotNs = osGetMonotonicTimeNs();
                 pState->hotCount++;
             }
+            else if (pKernelChannel != NULL)
+            {
+                // In somebody's address space, not evicted: resident memory (the probe).
+                _vidmemHot.elsewhere++;
+            }
         }
-        if (logged < 32)
+        if (_vidmemHot.logged < 32)
         {
-            logged++;
-            NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hot memory: %s 0x%llx aperture %u count %u channel %s -> %s\n",
+            _vidmemHot.logged++;
+            NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hot memory: %s %s 0x%llx aperture %u count %u channel %s -> %s\n",
+                      (type == NVC365_NOTIFY_BUF_ENTRY_TYPE_CPU) ? "cpu" : "gpu",
                       (addrType == NVC365_NOTIFY_BUF_ENTRY_ADDR_TYPE_GVA) ? "va" : "pa", addr, aperture, count,
                       (pKernelChannel != NULL) ? "found" : "-",
                       (pState != NULL) ? "evicted allocation" : "not evicted");
@@ -4886,10 +4908,13 @@ _vidmemEvictStatus(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
                  _vidmemBornAllocs, _vidmemBornBytes >> 20, _vidmemBornFailed, _vidmemBusiestPid,
                  _vidmemEvictWindows ? "evicted too" : "kept in vidmem", _vidmemEvictQuiesce);
     _vidmemEvictPrintBlock(pGpu, buf, bufSize, pLen);
-    EVICT_PRINTF("hot memory: %s; notifications %llu (sysmem %llu, on evicted allocations %llu), hot allocations restored %llu\n",
+    EVICT_PRINTF("hot memory: %s%s; notifications %llu (sysmem %llu, on evicted allocations %llu), hot allocations restored %llu; "
+                 "probe: outside evicted allocations %llu, type cpu %llu, aperture vidmem %llu\n",
                  !_vidmemHotEnabled ? "off" :
                  (!_vidmemHot.bInit ? "on, not started yet" : (_vidmemHot.bFailed ? "on, access counters unavailable" : "on")),
-                 _vidmemHot.notifs, _vidmemHot.sysNotifs, _vidmemHot.matched, _vidmemHot.restored);
+                 (_vidmemHotEnabled >= 2) ? ", vidmem counters too" : "",
+                 _vidmemHot.notifs, _vidmemHot.sysNotifs, _vidmemHot.matched, _vidmemHot.restored,
+                 _vidmemHot.elsewhere, _vidmemHot.typeCpu, _vidmemHot.apVid);
     EVICT_PRINTF("window hints: %s; could give up %llu MB to visible apps, %llu MB to the foreground (added to their budgets)\n",
                  _vidmemHintsActive() ? "on (policy follows window visibility)" : "off (GPU samples)",
                  _vidmemReclaimableBytes >> 20, _vidmemReclaimableFgBytes >> 20);
@@ -5003,10 +5028,12 @@ vidmemEvictProcess
     }
     else if (mode == 10)
     {
-        _vidmemHotEnabled = (arg != 0);
-        if (!_vidmemHotEnabled)
+        // 2: the vidmem counters too (a probe). A change sets the counters up anew.
+        if (NV_MIN(arg, 2) != _vidmemHotEnabled)
             vidmemEvictHotTeardown(pGpu);
-        EVICT_PRINTF("hot memory tracking %s\n", _vidmemHotEnabled ? "on (next policy step)" : "off");
+        _vidmemHotEnabled = NV_MIN(arg, 2);
+        EVICT_PRINTF("hot memory tracking %s%s\n", _vidmemHotEnabled ? "on (next policy step)" : "off",
+                     (_vidmemHotEnabled >= 2) ? ", vidmem counters too" : "");
     }
     else if (mode == 9)
     {
