@@ -6,7 +6,7 @@
 #
 #   sudo ./mkimage.sh
 #
-# Guest specifics: user spoki4 (uid 1000 like on the host, so files in the
+# Guest specifics: a user named like yours (uid 1000 like on the host, so files in the
 # shared repo keep their owner) without a password, sudo without a password,
 # ssh with the host's public keys, a root shell on the serial console, no
 # Secure Boot, no screen locker, no suspend. It is a throw-away test machine.
@@ -17,7 +17,7 @@ REPO=$(cd -- "$HERE/../.." && pwd)
 STATE=${NVVM_STATE:-/var/lib/nvidia-vm}
 IMG=$STATE/guest.img
 SIZE=${SIZE:-160G}
-USER_NAME=${SUDO_USER:-spoki4}
+USER_NAME=${SUDO_USER:?run with sudo from your own account}
 USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
 MNT=$STATE/mnt
 

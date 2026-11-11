@@ -347,7 +347,7 @@ def start_bg(run, sizes, verify_s=30):
     game. nvt-game checks their content (errors= at the end)."""
     procs = []
     for i, mb in enumerate(sizes):
-        name = os.path.join(LOCAL, "nvt-idle-a" if i % 2 == 0 else "nvt-idle-b")
+        name = os.path.join(LOCAL, "tests", "nvt-idle-a" if i % 2 == 0 else "nvt-idle-b")
         f = open(os.path.join(run.dir, f"bg-{i}.log"), "w")
         procs.append((subprocess.Popen([name, "--mb", str(mb), "--idle", "--verify-s", str(verify_s)], stdout=f,
                                        stderr=subprocess.STDOUT, env=gs.env(), start_new_session=True), f))
@@ -396,7 +396,7 @@ def scenario_death(run, a, inp):
     game. N cycles."""
     urls = ["https://en.wikipedia.org/wiki/Graphics_processing_unit",
             "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
-            f"file://{LOCAL}/nvt-webgl.html?mode=anim&tex=200"]
+            f"file://{LOCAL}/tests/nvt-webgl.html?mode=anim&tex=200"]
     chrome = Chromium(urls)
     run.log("chrome_start", pid=chrome.pid)
     time.sleep(5)

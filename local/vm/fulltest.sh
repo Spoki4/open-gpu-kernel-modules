@@ -27,7 +27,7 @@
 #   momcprobe    momc-probe.sh       a probe, not a check: do access counters report accesses
 #                                    to vidmem (I5)? The answer is in the PASS line
 # Not here: pressing "start benchmark" in the game (input is the user's), see
-# BACKLOG #16.
+# problem #16.
 #
 # Log: local/stress-logs/fulltest-<date_time>.log; vmtest's and nvtest's own next to it.
 set -uo pipefail
@@ -51,7 +51,7 @@ say() { echo "$*" | tee -a "$log"; }
 gssh() { timeout "${GSSH_T:-60}" local/vm/vm.sh ssh "$@" 2>/dev/null | tr -d '\r'; }
 BAD='Xid|BUG:|Oops|general protection|kernel panic|soft lockup|hung task'
 NOISE="$BAD|can.t update VA|[Aa]ssert|not remade|move copy failed"
-CLEAN="cd '$ROOT/local' && { ./nvt-session.sh stop; pkill -f '[n]vt-'; pkill -x gbm-hog; pkill -f '^[.]/sddm-greeter'; pkill -f '[f]ragchurn'; pkill -f '[c]ontig'; pkill -f '[c]ompact-test'; : | sudo -n tee /proc/driver/nvidia/vidmem_hints; } >/dev/null 2>&1; true"
+CLEAN="cd '$ROOT/local/tests' && { ./nvt-session.sh stop; pkill -f '[n]vt-'; pkill -x gbm-hog; pkill -f '^[.]/sddm-greeter'; pkill -f '[f]ragchurn'; pkill -f '[c]ontig'; pkill -f '[c]ompact-test'; : | sudo -n tee /proc/driver/nvidia/vidmem_hints; } >/dev/null 2>&1; true"
 
 names=() verdicts=() notes=()
 stop_why=
@@ -79,7 +79,7 @@ stage() { # NAME STALL MAX PASSRE GUESTCMD
     t0=$(gssh "date '+%F %T'")
     out=$(mktemp)
     local/watchdog.sh --stall "$stall" --max "$max" --on-kill "timeout 60 '$ROOT/local/vm/vm.sh' ssh \"$CLEAN\"" -- \
-        local/vm/vm.sh ssh "cd '$ROOT/local' && $cmd" 2>&1 | grep --line-buffered -v '^Pseudo-terminal' | tee -a "$log" >"$out"
+        local/vm/vm.sh ssh "cd '$ROOT/local/tests' && $cmd" 2>&1 | grep --line-buffered -v '^Pseudo-terminal' | tee -a "$log" >"$out"
     rc=${PIPESTATUS[0]}
     line=$(grep -E "$passre|FAIL|WATCHDOG (STALL|TIMEOUT)" "$out" | tail -1)
     if grep -qE "^${name^^} SKIP" "$out"; then
@@ -120,7 +120,7 @@ fi
 if (( build )); then vmt smoke integrity; else vmt smoke --no-build integrity; fi
 gssh "cd '$ROOT/local' && sudo -n ./evict.sh status | sed -n '1,4p'" | sed 's/^/  /' | tee -a "$log"
 
-stage tools 300 900 'TOOLS OK' "./build.sh tools >/tmp/build-tools.log 2>&1 && echo TOOLS OK || { tail -5 /tmp/build-tools.log; echo TOOLS FAIL; }"
+stage tools 300 900 'TOOLS OK' "../build.sh tools >/tmp/build-tools.log 2>&1 && echo TOOLS OK || { tail -5 /tmp/build-tools.log; echo TOOLS FAIL; }"
 stage move 180 900 'MOVETEST PASS' "./move-test.sh"
 stage contig 180 600 'CONTIGTEST PASS' "./contig-test.sh"
 stage contigloop 180 600 'CONTIGLOOPTEST PASS' "./contigloop-test.sh"
@@ -135,14 +135,14 @@ stage desktop 240 900 'DESKTOP PASS' "
     k0=\$(pgrep -x kwin_wayland | head -1); p0=\$(pgrep -x plasmashell | head -1)
     [[ -n \$k0 ]] || { echo 'DESKTOP FAIL no Plasma session in the guest'; exit 0; }
     T0=\$(date '+%F %T')
-    s0=\$(sudo -n ./evict.sh status | grep -o 'background compaction.*')
+    s0=\$(sudo -n ../evict.sh status | grep -o 'background compaction.*')
     ./fragchurn.sh 150 moves 7 | tail -6
     sleep 30
-    sudo -n ./evict.sh status | grep -E '^(compaction saw|fragmentation|windows cleared)' | sed 's/^/  /'
+    sudo -n ../evict.sh status | grep -E '^(compaction saw|fragmentation|windows cleared)' | sed 's/^/  /'
     echo \"  before: \$s0\"
     k1=\$(pgrep -x kwin_wayland | head -1); p1=\$(pgrep -x plasmashell | head -1)
     bad=\$(sudo journalctl -k --since \"\$T0\" --no-pager | grep -cE '$NOISE')
-    shared=\$(sudo -n ./evict.sh status | sed -n 's/.*movable with a pause of the compositor \\([0-9]*\\).*/\\1/p')
+    shared=\$(sudo -n ../evict.sh status | sed -n 's/.*movable with a pause of the compositor \\([0-9]*\\).*/\\1/p')
     echo \"  kwin \$k0 -> \$k1, plasmashell \$p0 -> \$p1, kernel complaints \$bad, window buffers movable \${shared:-?} MB\"
     if [[ \$k0 == \"\$k1\" && \$p0 == \"\$p1\" && \$bad == 0 ]]; then echo DESKTOP PASS; else echo DESKTOP FAIL; fi"
 
@@ -150,14 +150,14 @@ if (( game )); then
     stage game 240 1500 'GAME PASS' "
         T0=\$(date '+%F %T')
         g=\$(./game-start.sh 2>/tmp/game-start.err) || { echo \"GAME SKIP \$(cat /tmp/game-start.err)\"; exit 0; }
-        echo \"  game pid \$g: \$(sudo -n ./evict.sh status | awk -v p=\$g '\$1 == p {print \$3\" MB vram, \"\$4\" MB ram\"}')\"
+        echo \"  game pid \$g: \$(sudo -n ../evict.sh status | awk -v p=\$g '\$1 == p {print \$3\" MB vram, \"\$4\" MB ram\"}')\"
         ./fragchurn.sh 150 moves 11 | tail -4
         ./contigloop-test.sh 40 2 | tail -5
         sleep 20
-        sudo -n ./evict.sh status | grep -E '^(compaction saw|fragmentation|windows cleared)' | sed 's/^/  /'
+        sudo -n ../evict.sh status | grep -E '^(compaction saw|fragmentation|windows cleared)' | sed 's/^/  /'
         alive=0; kill -0 \$g 2>/dev/null && alive=1
         bad=\$(sudo journalctl -k --since \"\$T0\" --no-pager | grep -cE '$NOISE')
-        echo \"  game alive \$alive: \$(sudo -n ./evict.sh status | awk -v p=\$g '\$1 == p {print \$3\" MB vram, \"\$4\" MB ram\"}'); kernel complaints \$bad\"
+        echo \"  game alive \$alive: \$(sudo -n ../evict.sh status | awk -v p=\$g '\$1 == p {print \$3\" MB vram, \"\$4\" MB ram\"}'); kernel complaints \$bad\"
         pkill -f '[b]1_benchmark' ; sleep 3; (steam -shutdown >/dev/null 2>&1 &) ; sleep 8
         if [[ \$alive == 1 && \$bad == 0 ]]; then echo GAME PASS; else echo GAME FAIL; fi"
 fi

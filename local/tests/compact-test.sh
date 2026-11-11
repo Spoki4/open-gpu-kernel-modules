@@ -1,5 +1,5 @@
 #!/bin/bash
-# BACKLOG #16: background compaction. Vidmem is fragmented as in
+# problem #16: background compaction. Vidmem is fragmented as in
 # contig-test.sh (twelve idle apps with interleaved 16 MB buffers, every other
 # one exits); then the policy, asked to keep a TARGET MB free run, moves the
 # survivors' buffers a little every step. Checks: the longest free run grows,
@@ -7,7 +7,7 @@
 # With `fg` the survivors are the window in focus (hints written by hand: run
 # with nobody logged in on the guest): 40 s with `compactfg off` must move
 # nothing, then compaction must gather the run out of the foreground's memory
-# too (BACKLOG #16, 2026-11-11).
+# too (problem #16, 2026-11-11).
 # Ends with COMPACTTEST PASS|FAIL.
 #   ./compact-test.sh [SECONDS=120] [TARGET_MB=4096] [fg]
 cd "$(dirname "$0")" || exit 1
@@ -17,17 +17,17 @@ T=$(mktemp -d /tmp/compact-test.XXXX)
 T0=$(date '+%F %T')
 fails=0
 fail() { echo "  FAIL: $*"; fails=$((fails + 1)); }
-st() { sudo -n ./evict.sh status; }
+st() { sudo -n ../evict.sh status; }
 frag() { st | grep '^fragmentation' | sed 's/^fragmentation: //'; }
 longest() { st | grep '^fragmentation' | grep -o 'longest [0-9]*' | cut -d' ' -f2; }
 old=$(st | grep -o 'keeps a free run of [0-9]*' | grep -o '[0-9]*$')
 pids=()
-trap 'sudo -n ./evict.sh compact "${old:-1024}" >/dev/null; sudo -n ./evict.sh compactfg on >/dev/null; [[ -z $fg ]] || : >"$H" 2>/dev/null; kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null; rm -rf "$T"' EXIT
-sudo -n ./evict.sh compact 0 >/dev/null
+trap 'sudo -n ../evict.sh compact "${old:-1024}" >/dev/null; sudo -n ../evict.sh compactfg on >/dev/null; [[ -z $fg ]] || : >"$H" 2>/dev/null; kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null; rm -rf "$T"' EXIT
+sudo -n ../evict.sh compact 0 >/dev/null
 names=(nvt-idle-a nvt-idle-b nvt-bg-a nvt-bg-b nvt-bg-c nvt-bg-d)
 # As many apps as the card takes, twelve on 12 GB: the same ~2 GB left free at the
 # end on a bigger card, or the contiguous requests just fit there.
-free0=$(sudo -n ./evict.sh status | grep '^fragmentation' | grep -o 'free [0-9]*' | cut -d' ' -f2)
+free0=$(sudo -n ../evict.sh status | grep '^fragmentation' | grep -o 'free [0-9]*' | cut -d' ' -f2)
 napps=$(( (${free0:-11700} - 2100) / 800 / 2 * 2 )); (( napps >= 12 )) || napps=12
 for i in $(seq 0 $((napps - 1))); do
     ./"${names[i % 6]}" --mb 800 --chunk-mb 16 --idle --verify-s 30 --floor-mb 512 >"$T/p$i.log" 2>&1 &
@@ -46,16 +46,16 @@ echo "holes:  $(frag)"
 if [[ -n $fg ]]; then
     # This shell is the foreground, and so are the survivors, by inheritance.
     printf '%s f\n' $$ >"$H"
-    sudo -n ./evict.sh compactfg off >/dev/null
-    sudo -n ./evict.sh compact $((target - 1)) >/dev/null
+    sudo -n ../evict.sh compactfg off >/dev/null
+    sudo -n ../evict.sh compact $((target - 1)) >/dev/null
     sleep 40
     loff=$(longest)
     echo "  compactfg off, 40 s: longest $l0 -> $loff MB; $(st | grep -o 'background compaction.*'); $(st | grep -o 'compaction saw.*')"
     (( loff < l0 + 64 )) || fail "the foreground's memory moved with compactfg off ($l0 -> $loff MB)"
     grep -q "^$$ f" "$H" || fail "the hints were overwritten (somebody logged in on the guest?): $(tr '\n' ' ' <"$H")"
-    sudo -n ./evict.sh compactfg on >/dev/null
+    sudo -n ../evict.sh compactfg on >/dev/null
 fi
-sudo -n ./evict.sh compact "$target" >/dev/null
+sudo -n ../evict.sh compact "$target" >/dev/null
 t0=$SECONDS
 while (( SECONDS - t0 < dur )); do
     sleep 10

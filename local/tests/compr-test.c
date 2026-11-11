@@ -14,7 +14,7 @@
 //                   start of a plain C MB vkAllocateMemory block of its memory type,
 //                   the way DXVK/vkd3d suballocate images from 256 MB chunks. The
 //                   driver backs such a block with 64 KB pages (a dedicated image
-//                   gets 2 MB pages), which is the slow case of BACKLOG #5.
+//                   gets 2 MB pages), which is the slow case of problem #5.
 //
 //   write (default) every iteration: full clear (vkCmdClearColorImage, usually a
 //                   fast clear), four rectangle clears inside a render pass

@@ -1,5 +1,5 @@
 #!/bin/bash
-# BACKLOG #16/#15: room for big contiguous buffers in fragmented vidmem is made
+# problems #16/#15: room for big contiguous buffers in fragmented vidmem is made
 # by moving memory to other vidmem pages, not out to sysmem. Twelve idle apps
 # allocate 16 MB buffers at the same time (interleaved), every other one
 # exits: gigabytes free, in small pieces. Then a "compositor" (gbm-hog named
@@ -13,13 +13,13 @@ T=$(mktemp -d /tmp/contig-test.XXXX)
 T0=$(date '+%F %T')
 fails=0
 fail() { echo "  FAIL: $*"; fails=$((fails + 1)); }
-frag() { sudo -n ./evict.sh status | grep '^fragmentation' | sed 's/^fragmentation: //'; }
+frag() { sudo -n ../evict.sh status | grep '^fragmentation' | sed 's/^fragmentation: //'; }
 pids=()
 trap 'kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null; [[ -z ${ownhints:-} ]] || : >/proc/driver/nvidia/vidmem_hints; rm -rf "$T"' EXIT
 names=(nvt-idle-a nvt-idle-b nvt-bg-a nvt-bg-b nvt-bg-c nvt-bg-d)
 # As many apps as the card takes, twelve on 12 GB: the same ~2 GB left free at the
 # end on a bigger card, or the contiguous requests just fit there.
-free0=$(sudo -n ./evict.sh status | grep '^fragmentation' | grep -o 'free [0-9]*' | cut -d' ' -f2)
+free0=$(sudo -n ../evict.sh status | grep '^fragmentation' | grep -o 'free [0-9]*' | cut -d' ' -f2)
 napps=$(( (${free0:-11700} - 2100) / 800 / 2 * 2 )); (( napps >= 12 )) || napps=12
 for i in $(seq 0 $((napps - 1))); do
     ./"${names[i % 6]}" --mb 800 --chunk-mb 16 --idle --verify-s 2 --floor-mb 512 >"$T/p$i.log" 2>&1 &
@@ -42,23 +42,23 @@ H=/proc/driver/nvidia/vidmem_hints
 if [[ ! -s $H ]]; then printf '%s h\n' "${keep[@]}" >"$H"; ownhints=1; sleep 2; fi
 # Two more buffers than the longest free run takes, or no window has to be cleared
 # (the control run on the RTX 5000, 2026-11-11: a 2254 MB run took all eight).
-lrun=$(sudo -n ./evict.sh status | grep '^fragmentation' | grep -o 'longest [0-9]*' | cut -d' ' -f2)
+lrun=$(sudo -n ../evict.sh status | grep '^fragmentation' | grep -o 'longest [0-9]*' | cut -d' ' -f2)
 [[ -n $bufs ]] || bufs=$(( ${lrun:-1536} / 256 + 2 ))
-before=$(sudo -n ./evict.sh status | grep -o 'windows cleared.*: [0-9]* MB' | grep -o '[0-9]* MB$' | cut -d' ' -f1)
+before=$(sudo -n ../evict.sh status | grep -o 'windows cleared.*: [0-9]* MB' | grep -o '[0-9]* MB$' | cut -d' ' -f1)
 cp ./gbm-hog "$T/kwin_wayland"
 "$T/kwin_wayland" --force --scanout --size 8192x8192 --max "$bufs" --floor-mb 64 --hold 6 >"$T/comp.log" 2>&1 &
 comp=$!
 for _ in $(seq 150); do grep -q '^RESULT' "$T/comp.log" && break; sleep 0.2; done
 echo "  compositor: $(grep '^RESULT' "$T/comp.log" || tail -2 "$T/comp.log")"
 echo "with them: $(frag)"
-after=$(sudo -n ./evict.sh status | grep -o 'windows cleared.*: [0-9]* MB' | grep -o '[0-9]* MB$' | cut -d' ' -f1)
+after=$(sudo -n ../evict.sh status | grep -o 'windows cleared.*: [0-9]* MB' | grep -o '[0-9]* MB$' | cut -d' ' -f1)
 sudo journalctl -k --since "$T0" --no-pager | grep -o 'window .*cleared: .*' | sed 's/^/  /' | tail -12
 ram=0
 for p in "${keep[@]}"; do
-    r=$(sudo -n ./evict.sh status | awk -v p="$p" '$2 == p || $1 == p {print $4; exit}')
+    r=$(sudo -n ../evict.sh status | awk -v p="$p" '$2 == p || $1 == p {print $4; exit}')
     ram=$((ram + ${r:-0}))
 done
-sudo -n ./evict.sh status | sed -n '1,12p' >"$T/status.txt"
+sudo -n ../evict.sh status | sed -n '1,12p' >"$T/status.txt"
 echo "  moved inside vidmem: $(( ${after:-0} - ${before:-0} )) MB; survivors in sysmem: $ram MB"
 got=$(grep -o ' count=[0-9]*' "$T/comp.log" | cut -d= -f2)
 [[ ${got:-0} -ge $bufs ]] || fail "the compositor got ${got:-0} of $bufs buffers"

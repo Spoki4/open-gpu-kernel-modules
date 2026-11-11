@@ -1,4 +1,4 @@
-# BACKLOG #15, a regression found on the first GPU run (nvtest fgprio on the
+# problem #15, a regression found on the first GPU run (nvtest fgprio on the
 # RTX 5000, 2026-11-11): a Chrome whose WebGL memory is hundreds of 6 MB
 # contiguous buffers. Counted as "buffers that need a window", they came back
 # 256 MB a step (11 s instead of 0.7 s) and the last ones never. Only buffers

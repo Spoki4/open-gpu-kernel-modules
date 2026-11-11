@@ -286,7 +286,7 @@ def main():
             if f.endswith(".exe"):
                 subprocess.run([VM, "win", "put", os.path.join(DL, f), f"C:/nvwin/dl/{f}"], check=True)
                 print("copied", f)
-        subprocess.run([VM, "win", "put", os.path.join(LOCAL, "nvt-webgl.html"), "C:/nvwin/nvt-webgl.html"], check=True)
+        subprocess.run([VM, "win", "put", os.path.join(LOCAL, "tests", "nvt-webgl.html"), "C:/nvwin/nvt-webgl.html"], check=True)
         for f in ("nvt-idle.cs", "gpumem.ps1"):
             subprocess.run([VM, "win", "put", os.path.join(LOCAL, "vm", "win", f), f"C:/nvwin/{f}"], check=True)
         print(win(r"& C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /optimize "

@@ -46,7 +46,7 @@ extern NvU32 _vidmemCompactRunMB;
 // How long ago `then` was, seen from `now` (ns); 0 when `then` is not before
 // `now`. A policy step takes `now` once at its start, and a move during the
 // step sets timestamps after it: a plain `now - then` wraps to ~584 years
-// there, and "moved out a moment ago" read as "long ago" (BACKLOG #9: ghostty
+// there, and "moved out a moment ago" read as "long ago" (problem #9: ghostty
 // moved out for the game and brought back in the same step, 449 times).
 //
 #define VE_AGO_NS(now, then) (((then) >= (now)) ? 0ULL : ((now) - (then)))
@@ -84,7 +84,7 @@ typedef struct
 // memory is 6 MB contiguous buffers (1.3 GB of them) got room for 256 MB a
 // step and came back in 11 s instead of 0.7 s, its last 30 MB never (nvtest
 // fgprio on the RTX 5000, 2026-11-11; the host's Chrome buffers that looped
-// were 130-192 MB, BACKLOG #15).
+// were 130-192 MB, problem #15).
 //
 #define VIDMEM_EVICT_CONTIG_WINDOW_BYTES (32ULL << 20)
 
@@ -140,7 +140,7 @@ NvU32 osGetVidmemHint(NvU32 pid, NvU32 *pGeneration);   // arch/nvalloc/unix/src
 //   COMPOSITOR  anyone but the desktop itself, the foreground last
 //   FG_ALLOC    + visible ones still drawing (a game on the other monitor,
 //               a video), only for what an allocation of the foreground
-//               needs right now (BACKLOG #7, R): numbered after COMPOSITOR,
+//               needs right now (problem #7, R): numbered after COMPOSITOR,
 //               whose 3 is in recorded traces
 //
 #define VE_LEVEL_HIDDEN     0
@@ -244,7 +244,7 @@ NvBool vepPlatChunkInfo(OBJGPU *pGpu, NvU64 *pFreeChunks, NvU64 *pLongest);
 // may give memory at `level`. forPid's own memory never leaves vidmem for it.
 NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
                          NvU32 forPid, NvU32 level, NvU64 *pMovedMB);
-// Background compaction (BACKLOG #16): lengthen the longest run of free 2 MB
+// Background compaction (problem #16): lengthen the longest run of free 2 MB
 // chunks by moving up to `budgetMB` of memory next to it (of processes not
 // drawing now, never the foreground) to other vidmem pages. Nothing to do when the run already has `wantMB`.
 // Returns the MB moved (0: nothing to do or nothing possible now).

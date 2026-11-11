@@ -216,7 +216,7 @@ TRACE_EVENT(vidmem_tick,
 // eligible bytes, hint, idle s (GPU samples, ~0 = busy), recent samples,
 // s since last work submission, never-evict. inherited: bits of the hint
 // above the state, 1 from an ancestor, 2 of another name, 4 fullscreen
-// window, 8 started by Steam (BACKLOG R4)
+// window, 8 started by Steam (rule R4)
 TRACE_EVENT(vidmem_proc,
     TP_PROTO(u32 pid, const char *comm, const u64 *a),
     TP_ARGS(pid, comm, a),
@@ -312,7 +312,7 @@ TRACE_EVENT(vidmem_budget,
 );
 
 // How fragmented free vidmem is (the PMA region the user allocations come
-// from), BACKLOG #16. at=tick: every few policy steps; at=evict/restore:
+// from), problem #16. at=tick: every few policy steps; at=evict/restore:
 // after a batch of process pid (its why), with the longest free run and the
 // free chunks just before it. A 2 MB chunk is free when all its 64 KB frames
 // are; a run is free chunks in a row (what a contiguous or a 2 MB-page

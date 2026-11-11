@@ -388,7 +388,7 @@ def cmd_run(a):
         if a.apps:
             chrome = sc.Chromium(["https://www.youtube.com/watch?v=aqz-KE-bpKQ",
                                   "https://en.wikipedia.org/wiki/Graphics_processing_unit",
-                                  f"file://{LOCAL}/nvt-webgl.html?mode=anim&tex=200"])
+                                  f"file://{LOCAL}/tests/nvt-webgl.html?mode=anim&tex=200"])
             log("chromium", pid=chrome.pid)
             time.sleep(8)
         if a.bg_fill is not None:

@@ -7,8 +7,7 @@
 #                           tree:      the modules just built in ../../kernel-open
 #                           installed: what boots (updates/nvidia-local, else stock)
 #                           stock:     linux-cachyos-nvidia-open from the guest's packages
-#   sudo ./guest.sh install         copy the tree build to updates/nvidia-local: boots from now on
-#   sudo ./guest.sh install stock   remove it again
+#   sudo ./guest.sh install [stock] the same as ../install.sh [stock]: what boots from now on
 #   ./guest.sh status
 #
 # A build that hangs the guest: ./vm.sh reset on the host (--force if it is dead; that can wedge the GPU), the guest comes back
@@ -18,10 +17,6 @@ set -euo pipefail
 KVER=$(uname -r)
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 TREE="$HERE/../../kernel-open"
-DEST=/usr/lib/modules/$KVER/updates/nvidia-local
-DEPMOD_CONF=/etc/depmod.d/nvidia-local.conf
-RESERVE_CONF=/etc/modprobe.d/nvidia-vidmem-reserve.conf
-RESERVE_MB=${RESERVE_MB:-0}   # 0: no reserve, the compositor gets priority instead (video_mem.c)
 MODULES=(nvidia nvidia-modeset nvidia-drm nvidia-uvm)
 UNLOAD=(nvidia_drm nvidia_modeset nvidia_uvm nvidia)
 MARK=/run/nvidia-local-loaded
@@ -135,28 +130,9 @@ reload() {
     echo "now: $(running_build)"
 }
 
-install_tree() {
-    need_root
-    if [[ ${1:-} == stock ]]; then
-        rm -rf "$DEST" "$DEPMOD_CONF" "$RESERVE_CONF"
-        depmod "$KVER"
-        echo "boots the stock modules from now on"
-        return
-    fi
-    check_tree
-    install -d -m 0755 "$DEST"
-    local m
-    for m in "${MODULES[@]}"; do install -m 0644 "$TREE/$m.ko" "$DEST/$m.ko"; done
-    # Stock modules live in extramodules/, which depmod would otherwise prefer.
-    for m in "${MODULES[@]}"; do echo "override ${m//-/_} $KVER updates/nvidia-local"; done >"$DEPMOD_CONF"
-    echo "options nvidia NVreg_RegistryDwords=\"RmVidmemUserReserveMB=$RESERVE_MB\"" >"$RESERVE_CONF"
-    depmod "$KVER"
-    echo "installed $(modinfo -F version "$DEST/nvidia.ko") into $DEST, boots from now on; reserve $RESERVE_MB MB"
-}
-
 case ${1:-} in
 reload) reload "${2:-tree}" ;;
-install) install_tree "${2:-}" ;;
+install) exec "$HERE/../install.sh" "${2:-install}" ;;
 status)
     echo "running: $(running_build)"
     echo "boots: $(modinfo -F filename nvidia 2>/dev/null)"

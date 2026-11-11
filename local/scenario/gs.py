@@ -15,7 +15,7 @@ screenshots (spectacle). Used by scenario.py; also a CLI:
   ./gs.py wheel CLICKS [X Y]          mouse wheel (positive: down), at X,Y
   ./gs.py cursor                      where KWin has the cursor (logical px)
 
-Runs as the session user (spoki4) in the guest, e.g. over vm.sh ssh.
+Runs as the session user in the guest, e.g. over vm.sh ssh.
 """
 
 import json

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Unattended install of the Windows benchmark guest (local/vm/win.sh create),
-  adapted from vsos-kiosk's winbuilder/vm/autounattend.xml. @USER@ and
+  adapted from another project of the author. @USER@ and
   @PASSWORD@ are filled in by win.sh; the filled copy lives only in the
   guest's state directory. The product key is Microsoft's published KMS
   client setup key for Windows 11 Pro: it selects the edition and activates

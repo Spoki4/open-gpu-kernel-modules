@@ -21,7 +21,7 @@
 #   ./vm.sh console              guest serial console (root shell; Ctrl-] quits)
 #   ./vm.sh log                  follow the serial log (kernel messages survive a hang)
 #   ./vm.sh qmp JSON             one QMP command, e.g. '{"execute":"qom-list","arguments":{"path":"/objects"}}'
-#   ./vm.sh ssh [CMD...]         shell or command in the guest as spoki4
+#   ./vm.sh ssh [CMD...]         shell or command in the guest as your user
 #   ./vm.sh wait                 wait until the guest answers ssh
 #   ./vm.sh build                build the modules in the guest, for the guest kernel
 #   ./vm.sh reload [tree|installed|stock]
@@ -62,9 +62,9 @@ KBDS=(
 # as "... (debounced)", which has no by-id link: found by name.
 MOUSE_NAME="Logitech G703 LS (debounced)"
 MOUSE_RAW=/dev/input/by-id/usb-Logitech_USB_Receiver-if02-event-mouse
-SSH_PORT=2230   # 2222 is taken by the vsos-winbuild VM
+SSH_PORT=2230
 OVMF_CODE=/usr/share/edk2/x64/OVMF_CODE.4m.fd
-GUEST_USER=spoki4
+GUEST_USER=${NVVM_GUEST_USER:-${SUDO_USER:-$(id -un)}}   # mkimage.sh gives the guest the same user
 
 die() { echo "vm.sh: $*" >&2; exit 1; }
 # The NVVM_* settings survive sudo thanks to SETENV in the sudoers rule.
@@ -152,7 +152,7 @@ start() {
     # NVVM_VIOMMU=1: the guest gets an IOMMU of its own (emulated VT-d; the guest
     # boots with intel_iommu=on), so the GPU's DMA to guest memory is mapped
     # piece by piece as the guest driver maps it, the way it is on the host
-    # (DMA-FQ), not as one pinned block (BACKLOG #5). Slower to boot.
+    # (DMA-FQ), not as one pinned block (problem #5). Slower to boot.
     if [[ ${NVVM_VIOMMU:-0} == 1 ]]; then
         args+=(-device intel-iommu,caching-mode=on,intremap=off)
     fi

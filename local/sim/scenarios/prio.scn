@@ -1,4 +1,4 @@
-# BACKLOG R and #7: the focused window comes first.
+# rules R and #7: the focused window comes first.
 #  - #7: Chrome focused on monitor 2 next to a fullscreen game drawing on
 #    monitor 1 gets its WebGPU memory: the game gives what is needed, not
 #    more (it was denied and the page died next to CoD).

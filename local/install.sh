@@ -1,102 +1,57 @@
 #!/bin/bash
-# Installs the locally patched NVIDIA modules built in ../kernel-open.
+# Makes the modules built in ../kernel-open the ones that load at boot
+# (Arch / CachyOS: stock modules come from the linux-*-nvidia-open package and
+# stay in place, ours go beside them and win).
 #
-#   sudo ./install.sh enroll-key   # step 1: create MOK key, queue it for enrollment, then reboot
-#   sudo ./install.sh install      # step 2: after the key is enrolled, sign and install modules
+#   sudo ./install.sh           copy the build to updates/nvidia-local; reboot to use it
+#   sudo ./install.sh stock     remove it again; reboot to be back on the stock modules
+#   ./install.sh status         which build runs now and which one boots
 #
-# Modules go to /lib/modules/$KVER/updates/nvidia-local, which depmod prefers
-# over Canonical's kernel/nvidia-595-open. Undo with ./rollback.sh.
+# Nothing is signed: with Secure Boot the kernel must accept unsigned modules
+# (no lockdown / module.sig_enforce), as CachyOS does by default.
+# RESERVE_MB=768 sudo ./install.sh also keeps a fixed block of vidmem for the
+# compositor (the first approach; 0, the default, relies on eviction instead).
 set -euo pipefail
 
 KVER=${KVER:-$(uname -r)}
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-BUILD=${BUILD:-$HERE/../kernel-open}   # nvtest-root.sh promote passes its candidate copies
-KEYDIR=/var/lib/nvidia-local-mok
-DEST=/lib/modules/$KVER/updates/nvidia-local
-SIGN=/usr/src/linux-headers-$KVER/scripts/sign-file
-RESERVE_MB=${RESERVE_MB:-0}   # 0: no reserve, the compositor gets priority instead (video_mem.c)
-MODPROBE_CONF=/etc/modprobe.d/nvidia-vidmem-reserve.conf
-# Ubuntu's nvidia-dkms-* builds its own modules into updates/dkms; depmod
-# must prefer ours over those (and over kernel/nvidia-*).
+TREE="$HERE/../kernel-open"
+DEST=/usr/lib/modules/$KVER/updates/nvidia-local
 DEPMOD_CONF=/etc/depmod.d/nvidia-local.conf
-MODULES=(nvidia nvidia-modeset nvidia-drm nvidia-uvm nvidia-peermem)
+RESERVE_CONF=/etc/modprobe.d/nvidia-vidmem-reserve.conf
+RESERVE_MB=${RESERVE_MB:-0}
+MODULES=(nvidia nvidia-modeset nvidia-drm nvidia-uvm)
 
 die() { echo "install.sh: $*" >&2; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die "run with sudo"; }
 
-[[ $EUID -eq 0 ]] || die "run with sudo"
-
-# The wording of `mokutil --test-key` differs between versions, so compare the
-# key's SHA1 fingerprint with the enrolled list instead. The list is captured
-# first: piping it into `grep -q` breaks under pipefail (SIGPIPE upstream).
-key_enrolled() {
-    local fp enrolled
-    fp=$(openssl x509 -inform DER -in "$KEYDIR/MOK.der" -noout -fingerprint -sha1 \
-         | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')
-    enrolled=$(mokutil --list-enrolled 2>/dev/null | tr -d ': ' | tr 'A-F' 'a-f')
-    [[ -n $fp && $enrolled == *"$fp"* ]]
-}
-
-enroll_key() {
-    if [[ ! -f $KEYDIR/MOK.der ]]; then
-        install -d -m 0700 "$KEYDIR"
-        openssl req -new -x509 -newkey rsa:2048 -nodes -days 36500 -sha256 \
-            -subj "/CN=$(hostname) local NVIDIA module signing/" \
-            -keyout "$KEYDIR/MOK.priv" -outform DER -out "$KEYDIR/MOK.der"
-        chmod 0600 "$KEYDIR/MOK.priv"
-        echo "created key in $KEYDIR"
-    fi
-    if key_enrolled; then
-        echo "key is already enrolled, run: sudo $0 install"
-        return
-    fi
-    echo "Choose a one-time password; you will type it again in MOK Manager after reboot."
-    mokutil --import "$KEYDIR/MOK.der"
-    cat <<EOF
-
-Reboot now. On the blue "MOK management" screen choose:
-  Enroll MOK -> Continue -> Yes -> enter the password -> Reboot
-Then run: sudo $0 install
-EOF
-}
-
-install_modules() {
-    [[ -f $KEYDIR/MOK.der ]] || die "no key, run: sudo $0 enroll-key"
-    if [[ $(mokutil --sb-state 2>/dev/null) == *"SecureBoot enabled"* ]]; then
-        key_enrolled || die "key is not enrolled yet; the kernel would refuse the modules. Run enroll-key and reboot first."
-    fi
-    [[ -x $SIGN ]] || die "missing $SIGN (install linux-headers-$KVER)"
-
-    local version
-    version=$(modinfo -F version "$BUILD/nvidia.ko")
-    local want
-    want=$(dpkg-query -W -f='${db:Status-Abbrev} ${Version}\n' 'libnvidia-gl-*:amd64' 2>/dev/null | awk '$1 == "ii" {print $2}' | cut -d- -f1 | sort -V | tail -1)
-    [[ $version == "$want" ]] || die "built $version but userspace is $want; versions must match"
-    [[ $(modinfo -F vermagic "$BUILD/nvidia.ko" | cut -d' ' -f1) == "$KVER" ]] || die "modules were built for another kernel"
-
-    install -d "$DEST"
-    {
-        echo "# Written by local/install.sh: the patched modules win over dkms/kernel copies."
-        for m in "${MODULES[@]}"; do echo "override $m * updates/nvidia-local"; done
-    } >"$DEPMOD_CONF"
-    for m in "${MODULES[@]}"; do
-        install -m 0644 "$BUILD/$m.ko" "$DEST/$m.ko"
-        strip --strip-debug "$DEST/$m.ko"
-        "$SIGN" sha256 "$KEYDIR/MOK.priv" "$KEYDIR/MOK.der" "$DEST/$m.ko"
-    done
-    depmod -a "$KVER"
-
-    echo "options nvidia NVreg_RegistryDwords=\"RmVidmemUserReserveMB=$RESERVE_MB\"" > "$MODPROBE_CONF"
-    update-initramfs -u -k "$KVER"
-
-    echo
-    echo "modprobe will now load:"
-    modinfo -k "$KVER" -F filename nvidia
-    echo "reserve: $RESERVE_MB MB ($MODPROBE_CONF)"
-    echo "Reboot to switch to the patched modules."
-}
-
-case ${1:-} in
-    enroll-key) enroll_key ;;
-    install)    install_modules ;;
-    *)          echo "usage: sudo $0 enroll-key | install"; exit 2 ;;
+case ${1:-install} in
+install)
+    need_root
+    [[ -f $TREE/nvidia.ko ]] || die "nothing built in $TREE (./build.sh)"
+    # The kernel side and the userspace driver must be the same release.
+    built=$(modinfo -F version "$TREE/nvidia.ko")
+    want=$(pacman -Q nvidia-utils | awk '{print $2}' | cut -d- -f1)
+    [[ $built == "$want" ]] || die "the build is $built, userspace is nvidia-utils $want"
+    [[ $(modinfo -F vermagic "$TREE/nvidia.ko" | cut -d' ' -f1) == "$KVER" ]] \
+        || die "the build is for another kernel, not $KVER"
+    install -d -m 0755 "$DEST"
+    for m in "${MODULES[@]}"; do install -m 0644 "$TREE/$m.ko" "$DEST/$m.ko"; done
+    # Stock modules live in extramodules/, which depmod would otherwise prefer.
+    for m in "${MODULES[@]}"; do echo "override ${m//-/_} $KVER updates/nvidia-local"; done >"$DEPMOD_CONF"
+    echo "options nvidia NVreg_RegistryDwords=\"RmVidmemUserReserveMB=$RESERVE_MB\"" >"$RESERVE_CONF"
+    depmod "$KVER"
+    echo "installed $built into $DEST, boots from now on; reserve $RESERVE_MB MB"
+    ;;
+stock)
+    need_root
+    rm -rf "$DEST" "$DEPMOD_CONF" "$RESERVE_CONF"
+    depmod "$KVER"
+    echo "boots the stock modules from now on"
+    ;;
+status)
+    echo "running: $(sed -n '1s/.*Module for [^ ]* *\([0-9.]*\) .*) *\(.*\)$/\1 built \2/p' /proc/driver/nvidia/version 2>/dev/null || true)"
+    echo "boots:   $(modinfo -F filename nvidia 2>/dev/null)"
+    ;;
+*) sed -n '2,/^set -e/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

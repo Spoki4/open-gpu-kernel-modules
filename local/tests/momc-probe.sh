@@ -1,5 +1,5 @@
 #!/bin/bash
-# BACKLOG I5, a probe: do the GPU's access counters tell which memory is in
+# idea I5, a probe: do the GPU's access counters tell which memory is in
 # use while it still is in vidmem? (Needed to move cold memory out first; the
 # counters in use now, MIMC, speak only of what already is in sysmem.)
 # An app reads 512 MB of its own vidmem every frame, nothing is evicted.
@@ -16,19 +16,19 @@ T=$(mktemp -d /tmp/momc-probe.XXXX)
 T0=$(date '+%F %T')
 fails=0
 fail() { echo "  FAIL: $*"; fails=$((fails + 1)); }
-st() { sudo -n ./evict.sh status; }
+st() { sudo -n ../evict.sh status; }
 hot() { st | grep '^hot memory'; }
 num() { hot | grep -o "$1 [0-9]*" | grep -o '[0-9]*$'; }
 klog() { sudo journalctl -k --since "$T0" --no-pager; }
 app=
-trap 'sudo -n ./evict.sh hot off >/dev/null; kill ${app:-} 2>/dev/null; wait 2>/dev/null; rm -rf "$T"' EXIT
+trap 'sudo -n ../evict.sh hot off >/dev/null; kill ${app:-} 2>/dev/null; wait 2>/dev/null; rm -rf "$T"' EXIT
 ./nvt-bg-a --mb 512 --chunk-mb 16 --fps 30 --floor-mb 512 >"$T/app.log" 2>&1 &
 app=$!
 for _ in $(seq 150); do grep -q '^START' "$T/app.log" && break; sleep 0.2; done
 grep -q '^START' "$T/app.log" || fail "the app did not start: $(tail -1 "$T/app.log")"
 phase() { # NAME KNOB
-    sudo -n ./evict.sh hot off >/dev/null
-    sudo -n ./evict.sh hot "$2" >/dev/null
+    sudo -n ../evict.sh hot off >/dev/null
+    sudo -n ../evict.sh hot "$2" >/dev/null
     sleep "$dur"
     echo "  $1: $(hot)"
     hot | grep -q 'unavailable' && fail "access counters unavailable ($1)"
@@ -40,7 +40,7 @@ phase "vidmem counters too" momc
 n2=$(num notifications); e2=$(num 'outside evicted allocations'); c2=$(num 'type cpu'); v2=$(num 'aperture vidmem')
 ram=$(st | awk -v p="$app" '$1 == p {print $4; exit}')
 (( ${ram:-0} == 0 )) || echo "  note: $ram MB of the app in sysmem, its accesses count as the usual kind"
-sudo -n ./evict.sh hot off >/dev/null
+sudo -n ../evict.sh hot off >/dev/null
 kill -INT $app; wait $app; rc=$?; app=
 (( rc == 0 )) || fail "app exit $rc: $(grep -m1 -E '^ERROR|^RESULT' "$T/app.log")"
 echo "  app: $(grep '^RESULT' "$T/app.log" | grep -o 'errors=[0-9]*')"

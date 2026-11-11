@@ -1,5 +1,5 @@
 #!/bin/bash
-# BACKLOG #16: fragment free vidmem the way a long desktop session does, to
+# problem #16: fragment free vidmem the way a long desktop session does, to
 # see how short the free runs get and to try compaction on it. Many idle
 # processes (nvt-game --idle under the nvt-idle-*/nvt-bg-* names) of mixed
 # sizes and buffer sizes start and exit in random order while free vidmem is
@@ -20,7 +20,7 @@ chunks=(2 2 4 4 8 8 16 16 32 32 64 128 256)
 pids=()
 trap 'kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null' EXIT
 free_mb() { nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits | awk -F', ' '{print $1 - $2}'; }
-frag() { sudo -n ./evict.sh status 2>/dev/null | grep '^fragmentation' | sed 's/^fragmentation: //'; }
+frag() { sudo -n ../evict.sh status 2>/dev/null | grep '^fragmentation' | sed 's/^fragmentation: //'; }
 alive() { local p out=(); for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && out+=("$p"); done; pids=("${out[@]}"); }
 t0=$SECONDS last=-10 started=0 ended=0 moved=0
 echo "fragchurn: $dur s, moves $moves, seed $seed, free kept in $LOW..$HIGH MB"
@@ -40,7 +40,7 @@ while (( SECONDS - t0 < dur )); do
         i=$(( RANDOM % ${#pids[@]} ))
         if (( moves && RANDOM % 3 == 0 )); then
             op=evict; (( RANDOM % 2 )) && op=restore
-            sudo -n ./evict.sh $op "${pids[i]}" >/dev/null 2>&1; moved=$((moved + 1))
+            sudo -n ../evict.sh $op "${pids[i]}" >/dev/null 2>&1; moved=$((moved + 1))
         else
             kill "${pids[i]}" 2>/dev/null; wait "${pids[i]}" 2>/dev/null; ended=$((ended + 1))
         fi

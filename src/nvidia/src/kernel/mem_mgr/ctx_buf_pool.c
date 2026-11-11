@@ -43,7 +43,7 @@
 #include "gpu/mem_mgr/heap.h"
 #include "gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.h"
 
-// Local patch: vidmem_evict.c (BACKLOG #13).
+// Local patch: vidmem_evict.c (problem #13).
 NvBool vidmemEvictMakeRoomForKernel(OBJGPU *pGpu, NvU32 pid, NvU64 size);
 
 /*
@@ -301,7 +301,7 @@ ctxBufPoolReserve
         if (totalSize[i] > 0)
         {
             //
-            // Local patch (BACKLOG #13): vidmem full, or its free part in
+            // Local patch (problem #13): vidmem full, or its free part in
             // 64 KB holes: make room as for an allocation of the process that
             // creates the channel (hidden processes move out; for the
             // foreground also what its allocations may take) and try once

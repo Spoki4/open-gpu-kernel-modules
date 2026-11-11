@@ -1,5 +1,19 @@
 # NVIDIA Linux Open GPU Kernel Module Source
 
+> **This is a personal fork.** On top of NVIDIA's release it adds what the
+> Linux driver lacks and Windows has: when video memory runs out, the memory
+> of windows nobody looks at moves to system memory and comes back when
+> needed, so a game plus a desktop that together want more VRAM than the card
+> has keep working instead of freezing the compositor or killing a browser
+> tab. It also compacts fragmented video memory in the background. Written
+> for one desktop (RTX 3080 Ti, KDE Plasma on Wayland, CachyOS), not meant
+> for upstream, no warranty.
+>
+> What it does, how to build, install and test it: [local/README.md](local/README.md).
+> The changes to NVIDIA's code: `git diff <release tag> -- . ':!local'`.
+>
+> NVIDIA's own README follows unchanged.
+
 This is the source release of the NVIDIA Linux open GPU kernel modules,
 version 620.70.06.
 

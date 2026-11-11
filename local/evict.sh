@@ -5,8 +5,8 @@
 #
 #   sudo ./evict.sh status                      # per process: vram, ram, evictable, idle
 #   sudo ./evict.sh dry     <pid|chrome|name>   # list what could move, and why not
-#   sudo ./evict.sh move    <pid|chrome|name>   # move its vidmem to other vidmem pages (no sysmem; BACKLOG #16)
-#   sudo ./evict.sh compact MB                  # background compaction keeps a free run of MB (0: off; BACKLOG #16)
+#   sudo ./evict.sh move    <pid|chrome|name>   # move its vidmem to other vidmem pages (no sysmem; problem #16)
+#   sudo ./evict.sh compact MB                  # background compaction keeps a free run of MB (0: off; problem #16)
 #   sudo ./evict.sh evict   <pid|chrome|name>
 #   sudo ./evict.sh restore <pid|chrome|name>
 #   sudo ./evict.sh auto    on|off|hints        # automatic eviction under VRAM pressure
@@ -21,12 +21,12 @@
 #                                               # (compaction, cleared windows; default on)
 #   sudo ./evict.sh fgown on|off                # a focused app that is not a game gets an allocation
 #                                               # nobody can make room for; as much of its own older
-#                                               # memory goes to sysmem (BACKLOG #7; default on)
+#                                               # memory goes to sysmem (problem #7; default on)
 #   sudo ./evict.sh compactfg on|off            # background compaction also moves the memory of the
 #                                               # window in focus, 32 MB a step (default on)
 #   sudo ./evict.sh hot     on|off|momc         # access counters: evicted allocations in use
 #                                               # come back one by one (experiment); momc: also
-#                                               # count accesses to vidmem (a probe, momc-probe.sh)
+#                                               # count accesses to vidmem (a probe, tests/momc-probe.sh)
 #   sudo ./evict.sh quiesce 0..4                # how channels are stopped (experiment, see
 #                                               # _vidmemEvictQuiesce in vidmem_evict.c)
 set -euo pipefail

@@ -1,5 +1,5 @@
-# The job runner of the Windows benchmark guest (local/vm/win.sh), from
-# vsos-kiosk's winbuilder/vm/agent.ps1.
+# The job runner of the Windows benchmark guest (local/vm/win.sh),
+# adapted from another project of the author.
 #
 # Started at logon in the desktop session of the build user. Commands that
 # come over SSH run in a service session with no desktop: the kiosk window,

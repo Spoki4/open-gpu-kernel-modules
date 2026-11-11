@@ -117,7 +117,7 @@ _vidmemQueryAlignment
 // up. A block rather than a byte count, because scanout buffers must be
 // physically contiguous: with only a byte reserve, a game freeing and
 // re-allocating at the limit left 776 MB free but 66 MB (often less)
-// contiguous (see local/HANDOFF.md). The compositor and kernel threads keep
+// contiguous (see local/README.md). The compositor and kernel threads keep
 // PMA's bottom-up placement for contiguous allocations, and their
 // non-contiguous ones (textures, pixmaps) go top-down, so they use the block
 // only once everything above is taken. Reserve-bound processes are told the
@@ -185,7 +185,7 @@ static NvU64 _vidmemLastPmaAlign;
 // allocation with PHYSICALITY_DEFAULT is contiguous too (bContig below), and
 // the size is rounded up to its pages. Making room by the attribute alone
 // counted free 2 MB chunks for a contiguous 6 MB WebGL buffer, saw enough and
-// moved nothing (nvtest fgprio-idle after stress.sh scanout: 35 free chunks,
+// moved nothing (nvtest fgprio-idle after a scanout stress run: 35 free chunks,
 // longest free run 5 MB), and the same for kwin's 32 MB buffers (scanout
 // churn-8x16).
 //
@@ -433,7 +433,7 @@ vidmemPmaUsedMap
     {
         NvU64 word = pMap[frame >> 6];
 
-        // Whole words at once where they are all free or all taken (BACKLOG #16:
+        // Whole words at once where they are all free or all taken (problem #16:
         // this runs before and after every move batch while tracing).
         if (((frame & 63) == 0) && (frame + 64 <= pRegmap->totalFrames) && ((word == 0) || (word == ~0ULL)))
         {
@@ -1446,7 +1446,7 @@ vidmemConstruct_IMPL
         // PMA found no place (free memory in 64 KB holes, a 2 MB-page
         // allocation). The foreground and visible processes get whole chunks
         // made free, as the compositor, then it is tried again
-        // (vidmemEvictMakeRoomPlace(), BACKLOG #7).
+        // (vidmemEvictMakeRoomPlace(), problem #7).
         //
         if ((rmStatus == NV_ERR_NO_MEMORY) && bReserveBound && !bExempt && !bBornEvicted &&
             (_vidmemUserReserveMB == 0) &&

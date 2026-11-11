@@ -18,8 +18,8 @@ minute). Marks of the recording become `mark` lines.
 recording with the behaviour it should have had becomes a test.
 
 RECORDING: a gamerec id (20261106_112014), local/game-logs/<id> or
-/var/lib/gamerec/<id>. Needs read access to the root-owned half (group
-spoki4 has it).
+/var/lib/gamerec/<id>. Needs read access to the root-owned half (the user's
+group has it).
 """
 import argparse
 import datetime as dt

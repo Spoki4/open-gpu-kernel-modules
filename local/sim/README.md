@@ -59,7 +59,7 @@ One command per line, `#` starts a comment. Times are seconds from the start.
 | command | |
 |---|---|
 | `cap MB` | vidmem for processes |
-| `set KNOB VALUE` | `fg_headroom`, `bg_cushion`, `auto`, `low`, `high` (policy registry knobs), `fg_own` (BACKLOG #7, 1/0), `copy_gbs`, `frag`, `longest` (MB, longest free run: a bigger contiguous allocation comes back from sysmem only into a window the policy had cleared; 0: no limit), `autotick` (policy step every 2 s, default 1), `hints` |
+| `set KNOB VALUE` | `fg_headroom`, `bg_cushion`, `auto`, `low`, `high` (policy registry knobs), `fg_own` (problem #7, 1/0), `copy_gbs`, `frag`, `longest` (MB, longest free run: a bigger contiguous allocation comes back from sysmem only into a window the policy had cleared; 0: no limit), `autotick` (policy step every 2 s, default 1), `hints` |
 | `proc PID NAME [old] [never] [exempt] [chunk=MB]` | a process; `old`: seen long before the start; kwin_wayland/Xwayland are the compositor |
 | `hint PID f\|v\|h\|- [inh] [other] [full] [launched]` | window hint (focused, visible, hidden, none), inherited from a parent (of another app), has a fullscreen window, started by Steam/GameMode |
 | `act PID IDLE_S\|- SAMPLES` | GPU activity: seconds since its last work (`-` never), engine samples in the last ~10 s |

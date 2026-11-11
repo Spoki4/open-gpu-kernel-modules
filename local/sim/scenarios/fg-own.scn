@@ -1,4 +1,4 @@
-# BACKLOG #7 (the user's choice 2026-11-06): the focused window gets its
+# problem #7 (the user's choice 2026-11-06): the focused window gets its
 # allocation even when nobody is left to give; as much of its own older memory
 # goes to sysmem instead. A WebGPU page focused next to memory that cannot
 # move was denied and died. A game is still turned away (its engine falls back

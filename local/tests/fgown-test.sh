@@ -1,5 +1,5 @@
 #!/bin/bash
-# BACKLOG #7: the focused window gets its allocation even when nobody is left
+# problem #7: the focused window gets its allocation even when nobody is left
 # to give; as much of its own older memory goes to sysmem instead (it was a
 # denial: a WebGPU page focused next to a game died). A process nobody may
 # move (named like the login screen) fills vidmem down to LEFT MB; a focused
@@ -17,12 +17,12 @@ T=$(mktemp -d /tmp/fgown-test.XXXX)
 T0=$(date '+%F %T')
 fails=0
 fail() { echo "  FAIL: $*"; fails=$((fails + 1)); }
-st() { sudo -n ./evict.sh status; }
+st() { sudo -n ../evict.sh status; }
 free_mb() { st | sed -n 's/.*free outside reserve \([0-9]*\) MB.*/\1/p'; }
 col() { st | awk -v p="$1" -v c="$2" '$1 == p {print $c; exit}'; }
 wait_start() { local i; for i in $(seq 150); do grep -q '^START\|^FATAL\|^ERROR' "$1" && return; sleep 0.2; done; }
 hog= app=
-trap 'sudo -n ./evict.sh fgown on >/dev/null; kill $hog $app 2>/dev/null; wait 2>/dev/null; : >"$H" 2>/dev/null; rm -rf "$T"' EXIT
+trap 'sudo -n ../evict.sh fgown on >/dev/null; kill $hog $app 2>/dev/null; wait 2>/dev/null; : >"$H" 2>/dev/null; rm -rf "$T"' EXIT
 ln -sf nvt-game ./sddm-greeter
 free=$(free_mb)
 [[ ${free:-0} -gt $((left + 512)) ]] || { echo "  FAIL: only ${free:-?} MB free at the start"; echo "FGOWNTEST FAIL 1"; exit 0; }
@@ -39,7 +39,7 @@ run_app() { # LOG
 }
 
 # 1. Off: the old behaviour, a denial (the app stops short of what it wanted).
-sudo -n ./evict.sh fgown off >/dev/null
+sudo -n ../evict.sh fgown off >/dev/null
 run_app "$T/off.log"
 got_off=$(grep -o 'allocated_mb=[0-9]*' "$T/off.log" | cut -d= -f2)
 echo "  fgown off: $(grep '^START' "$T/off.log" | cut -c1-110 || tail -1 "$T/off.log"); in sysmem $(col "$app" 4) MB"
@@ -47,7 +47,7 @@ kill -INT $app 2>/dev/null; wait $app 2>/dev/null; app=
 sleep 2
 
 # 2. On: all of it, part in sysmem.
-sudo -n ./evict.sh fgown on >/dev/null
+sudo -n ../evict.sh fgown on >/dev/null
 run_app "$T/on.log"
 got_on=$(grep -o 'allocated_mb=[0-9]*' "$T/on.log" | cut -d= -f2)
 grep -q "^$app f" "$H" || fail "the hints were overwritten (somebody logged in on the guest?)"

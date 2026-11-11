@@ -1,4 +1,4 @@
-# BACKLOG #15: contiguous buffers of the window in focus come back through a
+# problem #15: contiguous buffers of the window in focus come back through a
 # cleared window, not by moving the game on the other monitor out. On the
 # host (2026-11-10 20:45) Chrome's 130 MB buffers sat in sysmem, 379 MB of WoW
 # went out "for the foreground again", and the buffers still did not fit

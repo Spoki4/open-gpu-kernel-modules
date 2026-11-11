@@ -40,7 +40,7 @@ SSH_PORT=2240
 OVMF_CODE=/usr/share/edk2/x64/OVMF_CODE.4m.fd
 OVMF_VARS=/usr/share/edk2/x64/OVMF_VARS.4m.fd
 WIN_USER=bench
-UDIR=${NVWIN_USER_DIR:-/home/spoki4/.local/share/nvwin}
+UDIR=${NVWIN_USER_DIR:-$(getent passwd "${SUDO_USER:-$(id -un)}" | cut -d: -f6)/.local/share/nvwin}
 KEY=$UDIR/id_ed25519
 KBDS=(
     /dev/input/by-id/usb-0416_Gaming_Keyboard-event-kbd

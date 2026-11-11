@@ -959,7 +959,7 @@ _pmaPredictOutOfMemory
     // placed at physically 2 MB-aligned addresses (the scans align
     // addrBase up). On a region that does not start on 2 MB (GA102 in the
     // test VM: region 0 at 0x37c0000) a free aligned 2 MB page straddles two
-    // counted groups: with vidmem fragmented (after stress.sh scanout) the
+    // counted groups: with vidmem fragmented (after a scanout stress run) the
     // counter said 15 while 35 aligned 2 MB pages were free in every map,
     // and an allocation of more 2 MB pages than the counter would have been
     // refused here without a scan. There the counter is no guide; the scan

@@ -1,5 +1,5 @@
 # First logon of the Windows benchmark guest (autounattend.xml ->
-# FirstLogonCommands, elevated), adapted from vsos-kiosk's winbuilder setup.
+# FirstLogonCommands, elevated), adapted from another project of the author.
 # Runs from the unattend stick next to agent.ps1, authorized_keys and
 # user.txt. Everything win.sh needs to drive the guest: OpenSSH with the key,
 # the job runner in the desktop session (games and the frame-time capture

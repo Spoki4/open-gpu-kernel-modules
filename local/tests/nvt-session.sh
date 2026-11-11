@@ -73,8 +73,8 @@ start() {
         printf '[Plugins]\nnvidia-vram-hintsEnabled=true\n' >"$cfg/kwinrc"
         # The script from this checkout, not whatever the user has installed.
         rm -rf "$data/kwin-wayland/scripts/nvidia-vram-hints" "$data/kwin/scripts/nvidia-vram-hints"
-        cp -r "$HERE/kwin-vram-hints" "$data/kwin-wayland/scripts/nvidia-vram-hints"
-        cp -r "$HERE/kwin-vram-hints" "$data/kwin/scripts/nvidia-vram-hints"
+        cp -r "$HERE/../kwin-vram-hints" "$data/kwin-wayland/scripts/nvidia-vram-hints"
+        cp -r "$HERE/../kwin-vram-hints" "$data/kwin/scripts/nvidia-vram-hints"
         # shellcheck disable=SC2046
         XDG_CONFIG_HOME=$cfg XDG_DATA_HOME=$data QML_XHR_ALLOW_FILE_WRITE=1 bwrap --dev-bind / / $(hide_args) \
             kwin_wayland --virtual --socket "$SOCK" --width 1920 --height 1080 \
