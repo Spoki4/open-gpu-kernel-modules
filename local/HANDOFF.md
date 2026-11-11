@@ -65,7 +65,7 @@ before either, never touch the other instance of the project.
 - A10 (Ampere, the chip of the 3080 Ti) was out of stock on 2026-11-11; it is
   the better card when it comes back (a10-45, GRA11/GRA9).
 - 2026-11-11, first runs of the unverified builds on a GPU happened here
-  (final build 11af746b + the fgown gate fix): move, contig, contigloop,
+  (final build f4d36f2b + the fgown gate fix): move, contig, contigloop,
   compact, compact fg, fgown PASS, no Xid; four driver bugs and most of the
   blind-written test setups were fixed on the way (BACKLOG #7, #15, #16
   «Ход» 11.11 12:30). Not run here: nvtest all, the desktop and game stages
@@ -77,7 +77,7 @@ before either, never touch the other instance of the project.
 - 2026-11-11 13:20: `nvtest all` runs there too (headless KWin on the NVIDIA
   GPU + google-chrome; `export NVT_CHROME_FLAGS="--enable-unsafe-webgpu
   --enable-features=Vulkan" NVTEST_FORCE=1`, user ubuntu is in render, video,
-  adm, systemd-journal). Final build 6a147076: 13 of 15, the six memory
+  adm, systemd-journal). Final build 8f186b82: 13 of 15, the six memory
   tests 6 of 6. `active` fails there on any build (the witness stalls for
   seconds while an app draws from sysmem: the card/VM, checked against
   67deb430 built in `~/old-67deb430`); `fgprio-idle` failed once in a full
