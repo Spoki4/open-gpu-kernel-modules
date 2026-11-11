@@ -641,6 +641,7 @@ static NvU64 _vidmemMovableHiddenBytes = NV_U64_MAX, _vidmemMovableFgIdleBytes =
              _vidmemMovableFgAllocBytes = NV_U64_MAX;
 // What the foreground itself could give for its own allocation (0: a game, or nothing; BACKLOG #7).
 static NvU64 _vidmemMovableFgOwnBytes = NV_U64_MAX;
+static NvU64 _vidmemMovableWalkNs;    // when the sums above were counted
 
 //
 // The foreground's allocation fits nowhere and nobody is left to give: an
@@ -687,6 +688,7 @@ _vidmemEvictUpdateReclaimable(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 nowN
     _vidmemMovableHiddenBytes = sum;
     _vidmemMovableFgIdleBytes = sumFgIdle;
     _vidmemMovableFgAllocBytes = sumFg;
+    _vidmemMovableWalkNs = nowNs;
     _vidmemMovableFgOwnBytes = 0;
     for (i = 0; i < count; i++)
     {
@@ -1438,8 +1440,25 @@ NvU32 _vidmemFgHeadroomMB = 2048;
 // Nothing to move a moment ago: do not walk every client per allocation.
 static NvU64 _vidmemMakeRoomFruitlessNs;
 
+static NvBool _veMakeRoomAllowed(NvU32 pid, NvBool bContig);
+
 NvBool
 vepMakeRoomAllowed(NvU32 pid)
+{
+    return _veMakeRoomAllowed(pid, NV_FALSE);
+}
+
+//
+// bContig: a contiguous request that found no place. A window for it is also
+// cleared by moves inside vidmem of processes that may not be moved out (the
+// ones that draw, BACKLOG #16), so "nobody to move out as of the last walk"
+// does not turn it away (contigloop-test on the RTX 5000, 2026-11-11: the
+// second 224 MB buffer of the focused app was denied with 7 GB free in pieces,
+// the hidden apps around it checking their memory every 2 s, "drawing").
+// At most one fruitless try a second, as for the rest.
+//
+static NvBool
+_veMakeRoomAllowed(NvU32 pid, NvBool bContig)
 {
     NvU64 nowNs = osGetMonotonicTimeNs();
 
@@ -1449,11 +1468,20 @@ vepMakeRoomAllowed(NvU32 pid)
         return NV_FALSE;
     if ((_vidmemMakeRoomFruitlessNs != 0) && (VE_AGO_NS(nowNs, _vidmemMakeRoomFruitlessNs) < 1000000000ULL))
         return NV_FALSE;
+    if (bContig)
+        return NV_TRUE;
     // Nobody to move for it as of the last walk: no walk now (#8).
     if (!_vidmemEvictAnyMovable((VE_HINT_STATE(_vidmemHint(pid, NULL)) == VE_HINT_FG) ?
                                 VE_LEVEL_FG_ALLOC : VE_LEVEL_HIDDEN) &&
         !((VE_HINT_STATE(_vidmemHint(pid, NULL)) == VE_HINT_FG) && _vidmemFgOwnEnabled &&
-          (_vidmemMovableFgOwnBytes >= (4ULL << 20))))
+          //
+          // Its own memory as of the last walk, or that walk is old: an app
+          // that took its memory within one policy step had none then, and
+          // was turned away (fgown-test on the RTX 5000, 2026-11-11: 288 MB
+          // in 2 ms, then a denial). Not for a game: it gives nothing here.
+          //
+          ((_vidmemMovableFgOwnBytes >= (4ULL << 20)) ||
+           (!_vidmemFgIsGame && (VE_AGO_NS(nowNs, _vidmemMovableWalkNs) >= 250000000ULL)))))
         return NV_FALSE;
     return NV_TRUE;
 }
@@ -1709,11 +1737,29 @@ vepMakeRoomCompositorRun(OBJGPU *pGpu, NvU64 size, NvBool bContig, NvU64 align,
                                   pWantMB, pAvail, pMovedMB);
 }
 
+// Why vepMakeRoomAllowed() says no, for the log of a contiguous request left without a window.
+const char *
+vepMakeRoomDeniedWhy(NvU32 pid)
+{
+    NvU64 nowNs = osGetMonotonicTimeNs();
+
+    if (!_vidmemAutoActive() || !_vidmemHintsActive())
+        return "the policy is off (no window hints)";
+    if (VE_HINT_STATE(_vidmemHint(pid, NULL)) < VE_HINT_VISIBLE)
+        return "its window is not visible";
+    if ((_vidmemMakeRoomFruitlessNs != 0) && (VE_AGO_NS(nowNs, _vidmemMakeRoomFruitlessNs) < 1000000000ULL))
+        return "nothing could be moved a moment ago";
+    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: movable as of the last walk (MB): hidden %llu, for an idle foreground %llu, for a foreground's allocation %llu, the foreground's own %llu\n",
+              _vidmemMovableHiddenBytes >> 20, _vidmemMovableFgIdleBytes >> 20, _vidmemMovableFgAllocBytes >> 20,
+              _vidmemMovableFgOwnBytes >> 20);
+    return "nobody may be moved for it as of the last walk";
+}
+
 // The level an ordinary process's failed placement makes room at (~0: none).
 NvU32
-vepMakeRoomPlaceLevel(NvU32 pid)
+vepMakeRoomPlaceLevel(NvU32 pid, NvBool bContig)
 {
-    if (!vepMakeRoomAllowed(pid))
+    if (!_veMakeRoomAllowed(pid, bContig))
         return NV_U32_MAX;
     return (VE_HINT_STATE(_vidmemHint(pid, NULL)) == VE_HINT_FG) ? VE_LEVEL_FG_ALLOC : VE_LEVEL_HIDDEN;
 }

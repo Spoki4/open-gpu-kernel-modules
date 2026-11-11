@@ -4478,38 +4478,69 @@ vidmemEvictMakeRoomCompositor(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvB
 // foreground and visible processes get whole chunks made free, as the
 // compositor; the caller tries once more. Same locking as the compositor's.
 //
+//
+// Who asks. A buffer made through nvidia-drm (GBM with scanout use, a dumb
+// buffer) is allocated by that module's kernel client, whose ProcID is the
+// modprobe that loaded it: the window hint to go by is the calling process's
+// (first run on a GPU, 2026-11-11: a focused app's 320 MB contiguous buffer
+// was "of modprobe, its window is not visible" and no window was tried).
+//
+static NvU32
+_vidmemRequesterPid(RmClient *pRmClient)
+{
+    if (staticCast(pRmClient, RsClient)->type == CLIENT_TYPE_KERNEL)
+        return osGetCurrentProcess();
+    return pRmClient->ProcID;
+}
+
 NvBool
 vidmemEvictMakeRoomPlace(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvBool bContig, NvU64 align)
 {
     static NvU32 failLogged;
     NvU64        t0 = VMT_NOW(), avail = 0, wantMB = 0, movedMB = 0, dt;
-    NvU32        level;
+    NvU32        level, pid;
     NvBool       bOk;
     NvBool       bLocked = NV_FALSE;
 
+    pid = (pRmClient != NULL) ? _vidmemRequesterPid(pRmClient) : 0;
     if ((pRmClient == NULL) || _vidmemEvictIsBusyThread() || !rmapiLockIsWriteOwner())
+    {
+        static NvU32 lockLogged;
+
+        if (bContig && (pRmClient != NULL) && !_vidmemEvictIsBusyThread() && (lockLogged++ < 8))
+            NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: no window for %llu KB contiguous of %s(%u): the API lock is not held for writing\n",
+                      size >> 10, pRmClient->name, pid);
         return NV_FALSE;
-    level = vepMakeRoomPlaceLevel(pRmClient->ProcID);
+    }
+    level = vepMakeRoomPlaceLevel(pid, bContig);
     if (level == NV_U32_MAX)
+    {
+        static NvU32 whyLogged;
+
+        // A contiguous request turned away with nothing tried: say why (first run on a GPU, 2026-11-11).
+        if (bContig && ((whyLogged++ < 8) || ((whyLogged % 256) == 0)))
+            NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: no window for %llu KB contiguous of %s(%u): %s\n",
+                      size >> 10, pRmClient->name, pid, vepMakeRoomDeniedWhy(pid));
         return NV_FALSE;
+    }
     if (!rmGpuLockIsOwner() && !rmDeviceGpuLockIsOwner(pGpu->gpuInstance))
     {
         if (rmDeviceGpuLocksAcquire(pGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_MEM) != NV_OK)
             return NV_FALSE;
         bLocked = NV_TRUE;
     }
-    bOk = vepMakeRoomPlaceRun(pGpu, pRmClient->ProcID, size, bContig, align, level, &wantMB, &avail, &movedMB);
+    bOk = vepMakeRoomPlaceRun(pGpu, pid, size, bContig, align, level, &wantMB, &avail, &movedMB);
     if (bLocked)
         rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
     dt = VMT_NOW() - t0;
     if (bOk || (failLogged++ < 8) || ((failLogged % 256) == 0))
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: %s %llu KB%s of %s(%u): %llu MB moved in %llu us\n",
                   bOk ? "room made to place" : "no place for", size >> 10, bContig ? " contiguous" : "",
-                  pRmClient->name, pRmClient->ProcID, movedMB, dt / 1000);
+                  pRmClient->name, pid, movedMB, dt / 1000);
     if (osVidmemTraceOn(VMT_MAKEROOM))
     {
         NvU64 a[VMT_ARGS] = { size, wantMB, avail, bOk, dt, level };
-        osVidmemTrace(VMT_MAKEROOM, pRmClient->ProcID, a);
+        osVidmemTrace(VMT_MAKEROOM, pid, a);
     }
     return bOk;
 }
