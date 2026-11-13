@@ -1,0 +1,61 @@
+# Background compaction next to a game (host, 2026-11-11, five hours of WoW
+# with Chrome on the second monitor): the game held 6.3 GB of the 9.4 GB in
+# use in blocks of 64-256 MB, a compaction step moved allocations of 32 MB at
+# most, so every block was a wall: 107 steps found "no stretch longer than
+# the run", the longest free run was 260-570 MB with 1.9 GB free, and Chrome
+# was denied eight contiguous buffers of 130-192 MB.
+# Now the window in focus gives allocations of up to 96 MB and the others of
+# up to 256 MB (`-set compact_big=0` for the old step: the checks on the run
+# then fail, nothing moves).
+cap 10100
+set layout 1
+set copy_gbs 10              # 400 MB of the game moved in 33 ms that evening
+set fg_headroom 0            # the layout is the subject, not who is moved out
+proc 1614 kwin_wayland old
+proc 2617 chrome old
+proc 3686 spotify old
+proc 12557 game old
+
+act 1614 0 4
+alloc 1614 250 n=5 fixed
+mark the session leaves the game's blocks, the browser's buffers and holes interleaved
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+alloc 12557 256 n=2 fixed            # mapped by the CPU: nobody moves these
+free 3686 99999                      # the holes: 1.4 GB in pieces of 16 MB
+hint 12557 f full
+hint 2617 v
+act 12557 0 30
+act 2617 2 4
+expect free - >= 1600
+expect longest - <= 300              # as that evening: 260 MB with 1.9 GB free
+
+mark the game in focus: its 64 MB blocks move, 96 MB a step; its 256 MB blocks are walls 1.1 GB apart
+at 150
+expect compact_steps - >= 10
+expect compact_pause 12557 <= 11     # 96 MB at 10 MB/ms
+expect longest - >= 900
+expect longest - <= 1150             # no further between two walls
+
+mark a look at the browser: the rest ends at once, the game gives its 256 MB blocks, 256 MB a step
+hint 12557 v full
+hint 2617 f
+act 2617 0 20
+at 170
+expect longest - >= 1270             # three quarters of what is free, 20 s after the switch
+expect compact_pause 12557 <= 27     # 256 MB at 10 MB/ms
+expect compact_pause 2617 <= 11      # the browser is the focus now: its pieces are the small ones
+expect evicts 12557 == 0             # compaction moves inside vidmem only
+expect evicts 2617 == 0

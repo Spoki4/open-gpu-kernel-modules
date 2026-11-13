@@ -33,11 +33,38 @@
 // step (each step holds the RM locks for its copy and pauses the owners), and
 // the pause after a step that had nothing to do (doubles up to 15 min while
 // nothing changes).
-#define VIDMEM_EVICT_COMPACT_RUN_MB   1024
-#define VIDMEM_EVICT_COMPACT_STEP_MB  32
+//
+// A step moves whole allocations, and one bigger than the step is a wall.
+// With 32 MB for everyone a game stood still: WoW held 6.3 GB of 9.4 GB in
+// use in blocks of 64-256 MB, no stretch between them was longer than the
+// free run, 107 steps in five hours found nothing to do and Chrome was
+// denied eight contiguous buffers of 130-192 MB with 0.8-1.4 GB free (host,
+// 2026-11-11). So the step follows who pays for it (knob "compactbig", 0:
+// 32 MB for everyone as before):
+//   - the memory of the window in focus moves in allocations of FG_STEP_MB at
+//     most: a pause of about 9 ms at the 10 MB/ms a move makes, less than a
+//     frame at 60 Hz, and the 64 MB blocks most engines allocate in are in;
+//   - the others' in allocations of BIG_STEP_MB at most (26 ms, for a window
+//     the user is not working in);
+//   - a step moves BIG_STEP_MB in all, FG_STEP_MB while a game is in focus:
+//     the RM locks are held for the copy, and the game's own calls wait.
+//
+#define VIDMEM_EVICT_COMPACT_RUN_MB      1024
+#define VIDMEM_EVICT_COMPACT_STEP_MB     32
+#define VIDMEM_EVICT_COMPACT_FG_STEP_MB  96
+#define VIDMEM_EVICT_COMPACT_BIG_STEP_MB 256
 // (not a round number: a 30 s rest met a process that works every 30 s each time)
 #define VIDMEM_EVICT_COMPACT_REST_SEC 14
+//
+// Steps in a row that moved memory while the window being cleared did not
+// grow: then compaction rests as after a step with nothing to do. What moves
+// goes wherever the allocator puts it, the next window may be over it.
+//
+#define VIDMEM_EVICT_COMPACT_STALL_STEPS 16
 extern NvU32 _vidmemCompactRunMB;
+extern NvU32 _vidmemCompactBig;
+// A chunk of the cost map of vepCompactWindow() that holds a frame nobody can move.
+#define VEP_COMPACT_FIXED NV_U32_MAX
 #define VIDMEM_EVICT_HYST_MB        512
 #define VIDMEM_EVICT_MAX_PROCS      128
 #define VIDMEM_EVICT_MAX_PER_TICK   2
@@ -244,11 +271,22 @@ NvBool vepPlatChunkInfo(OBJGPU *pGpu, NvU64 *pFreeChunks, NvU64 *pLongest);
 // may give memory at `level`. forPid's own memory never leaves vidmem for it.
 NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
                          NvU32 forPid, NvU32 level, NvU64 *pMovedMB);
-// Background compaction (problem #16): lengthen the longest run of free 2 MB
-// chunks by moving up to `budgetMB` of memory next to it (of processes not
-// drawing now, never the foreground) to other vidmem pages. Nothing to do when the run already has `wantMB`.
-// Returns the MB moved (0: nothing to do or nothing possible now).
-NvU64  vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budgetMB, NvU64 wantMB);
+// Background compaction (problem #16), one step: clear the window of 2 MB
+// chunks that moving makes the longest free run, by moving what is in it to
+// other vidmem pages. Whose memory: anyone's but the compositor's. Whole
+// allocations move: one of the window in focus up to `fgStepMB`, of the
+// others up to `stepMB`, bigger ones count as fixed; `stepMB` in all per
+// step. Nothing to do when the run already has `wantMB`. Returns the MB moved
+// (0: nothing to do or nothing possible now); *pWindowMB: the window it
+// worked on (0: none), for the policy to see whether the steps get anywhere.
+NvU64  vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB, NvU64 fgStepMB,
+                      NvU64 wantMB, NvU64 *pWindowMB);
+// The window for a step, shared by the driver and the simulator. pCost: per
+// 2 MB chunk the frames in use that may move (0: free), VEP_COMPACT_FIXED
+// when it holds one that may not; the longest free run is `runLen` chunks
+// at `runStart`. NV_TRUE: chunks [*pLo, *pHi).
+NvBool vepCompactWindow(const NvU32 *pCost, NvU64 chunks, NvU64 runStart, NvU64 runLen, NvU64 budgetFrames,
+                        NvU64 *pLo, NvU64 *pHi);
 // Total evicted bytes right now (the engine's count).
 extern NvU64 _vidmemEvictBytes;
 // kwin_wayland / Xwayland (video_mem.c).

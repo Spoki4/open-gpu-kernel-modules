@@ -8,10 +8,14 @@
 # with nobody logged in on the guest): 40 s with `compactfg off` must move
 # nothing, then compaction must gather the run out of the foreground's memory
 # too (problem #16, 2026-11-11).
+# CHUNK_MB (16): the size of the buffers. A game holds its memory in blocks of
+# 64-256 MB, and a step that moved 32 MB at most stood before them (host,
+# 2026-11-11): 64 with `fg` (the window in focus gives up to 96 MB a piece)
+# and 128 without (the others up to 256 MB) must pass like 16.
 # Ends with COMPACTTEST PASS|FAIL.
-#   ./compact-test.sh [SECONDS=120] [TARGET_MB=4096] [fg]
+#   [CHUNK_MB=16] ./compact-test.sh [SECONDS=120] [TARGET_MB=4096] [fg]
 cd "$(dirname "$0")" || exit 1
-dur=${1:-120} target=${2:-4096} fg=${3:-}
+dur=${1:-120} target=${2:-4096} fg=${3:-} chunk=${CHUNK_MB:-16}
 H=/proc/driver/nvidia/vidmem_hints
 T=$(mktemp -d /tmp/compact-test.XXXX)
 T0=$(date '+%F %T')
@@ -30,7 +34,7 @@ names=(nvt-idle-a nvt-idle-b nvt-bg-a nvt-bg-b nvt-bg-c nvt-bg-d)
 free0=$(sudo -n ../evict.sh status | grep '^fragmentation' | grep -o 'free [0-9]*' | cut -d' ' -f2)
 napps=$(( (${free0:-11700} - 2100) / 800 / 2 * 2 )); (( napps >= 12 )) || napps=12
 for i in $(seq 0 $((napps - 1))); do
-    ./"${names[i % 6]}" --mb 800 --chunk-mb 16 --idle --verify-s 30 --floor-mb 512 >"$T/p$i.log" 2>&1 &
+    ./"${names[i % 6]}" --mb 800 --chunk-mb "$chunk" --idle --verify-s 30 --floor-mb 512 >"$T/p$i.log" 2>&1 &
     pids+=($!)
 done
 for i in $(seq 0 $((napps - 1))); do
@@ -42,7 +46,7 @@ for i in $(seq 0 $((napps - 1))); do
 done
 sleep 1
 l0=$(longest)
-echo "holes:  $(frag)"
+echo "holes:  $(frag); buffers of $chunk MB"
 if [[ -n $fg ]]; then
     # This shell is the foreground, and so are the survivors, by inheritance.
     printf '%s f\n' $$ >"$H"
