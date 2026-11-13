@@ -278,6 +278,8 @@ static NvU32 _vidmemEvictCurPid;
 // Who asked for the next evict/restore call (VMT_WHY_*), set by each caller.
 NvU32 _vidmemEvictWhy;
 static NvU64 _vidmemRelocateMaxBytes;  // mode 3: bigger allocations stay where they are (0: no limit)
+// mode 3, a compaction step: no more than this in all (0: no limit), and what the step moved so far.
+static NvU64 _vidmemRelocateTotalBytes, _vidmemRelocateDoneBytes;
 static NvU64 _vidmemRelocateKeepLo, _vidmemRelocateKeepHi;  // mode 3: no new pages in [lo, hi) either (hi 0: none)
 
 // Lock waits/holds shorter than this are not traced ("trace-lock US").
@@ -2620,12 +2622,20 @@ _vidmemEvictPidLocked
 
                 if (mode == 3)
                 {
-                    if ((_vidmemRelocateMaxBytes != 0) && (bytes > _vidmemRelocateMaxBytes))
+                    //
+                    // Bigger than the step's pieces, or than what is left of
+                    // the step: whole allocations move, also for a corner in
+                    // the window, and the step's pause is what it moves in all.
+                    //
+                    if (((_vidmemRelocateMaxBytes != 0) && (bytes > _vidmemRelocateMaxBytes)) ||
+                        ((_vidmemRelocateTotalBytes != 0) &&
+                         (_vidmemRelocateDoneBytes + bytes > _vidmemRelocateTotalBytes)))
                     {
                         skipped++;
                         skippedBytes += bytes;
                         continue;
                     }
+                    _vidmemRelocateDoneBytes += bytes;
                     // What the compositor maps too: in phase 2, with its channels stopped.
                     status = NV_OK;
                     if (_vidmemEvictHasCompositor(pRefs, numRefs))
@@ -2677,6 +2687,9 @@ _vidmemEvictPidLocked
             {
                 failed++;
                 failedBytes += bytes;
+                // Not moved after all: the compaction step has it left to spend.
+                if (mode == 3)
+                    _vidmemRelocateDoneBytes -= NV_MIN(_vidmemRelocateDoneBytes, bytes);
                 EVICT_PRINTF("0x%x %llu KB %s failed 0x%x\n", RES_GET_HANDLE(pMemory), bytes >> 10,
                              VE_MODE_NAME(mode), status);
                 if (mode == 3)
@@ -4141,10 +4154,12 @@ done:
 
 //
 // Background compaction (problem #16), one step: the window of 2 MB chunks
-// that `budgetMB` of moving makes the longest free run, holding only memory
-// that may move (_vidmemCompactVictim(): never the foreground's), is cleared
-// to vidmem pages outside it. Allocations bigger than the budget count as fixed: moving one
-// whole for a corner of it would hold the locks too long.
+// that `stepMB` of moving makes the longest free run, holding only memory
+// that may move (_vidmemCompactVictim()), is cleared to vidmem pages outside
+// it. Whole allocations move, so one bigger than its owner's piece size
+// counts as fixed (vidmem_evict_policy.h, VIDMEM_EVICT_COMPACT_*_STEP_MB:
+// the window in focus gives smaller pieces than the others), and the step
+// stops at `stepMB` moved in all.
 //
 static NvU32 _vidmemCompactSteps;
 static NvU64 _vidmemCompactMovedMB;
@@ -4157,8 +4172,8 @@ static NvU64 _vidmemCompactMovedMB;
 // desktop with a game on screen had 31 MB movable of 3.9 GB in use and
 // compaction stood still (2026-11-10: game 2186 MB "drawing", plasmashell
 // 370 MB "never").
-// The window in focus: for background compaction only (bFgToo), a step of
-// VIDMEM_EVICT_COMPACT_STEP_MB at most, on quiet policy steps, until the free
+// The window in focus: for background compaction only (bFgToo), in pieces of
+// VIDMEM_EVICT_COMPACT_FG_STEP_MB at most, on quiet policy steps, until the free
 // run is long enough (the user, 2026-11-11: the game is the biggest owner,
 // without it the holes between its buffers stay for as long as it is played;
 // evict.sh compactfg off for the old rule). Never for a window cleared for
@@ -4182,19 +4197,22 @@ static NvU64 _vidmemCompactSeen[VC_COUNT];
 static NvU64 _vidmemCompactSeenUsed;
 
 NvU64
-vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budgetMB, NvU64 wantMB)
+vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB, NvU64 fgStepMB,
+               NvU64 wantMB, NvU64 *pWindowMB)
 {
+    NvU64   budgetMB = stepMB;
     Heap   *pHeap = GPU_GET_HEAP(pGpu);
     PMA    *pPma = (pHeap != NULL) ? pHeap->pPmaObject : NULL;
     NvU64   base = 0, frames = 0, largest = 0, words, chunks, off, c, f;
     NvU64   runStart = 0, runLen = 0, cur = 0, freeChunks = 0;
-    NvU64   budgetFrames = (budgetMB << 20) >> PMA_PAGE_SHIFT, cost, lo, hi;
+    NvU64   budgetFrames = (budgetMB << 20) >> PMA_PAGE_SHIFT, lo, hi;
     NvU64  *pUsed, *pMovable = NULL, movedMB = 0;
     NvU32  *pCost = NULL;
     VIDMEM_EVICT_MAPREF *pRefs = NULL;
     NvU32   i, victims = 0;
     const char *why = "";
 
+    *pWindowMB = 0;
     if (pPma == NULL)
         return 0;
     pUsed = vidmemPmaUsedMap(pPma, &base, &frames, &largest);
@@ -4255,7 +4273,10 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budge
     {
         RmClient **ppClient;
         NvBool     bVictim = _vidmemCompactVictim(&pProcs[i], NV_TRUE);
-        NvU32      cat = (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) ? VC_FG : VC_DESKTOP;
+        NvBool     bFg = (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG);
+        NvU32      cat = bFg ? VC_FG : VC_DESKTOP;
+        // The biggest allocation of this process a step moves (vidmem_evict_policy.h).
+        NvU64      limit = (bFg ? NV_MIN(fgStepMB, stepMB) : stepMB) << 20;
 
         if (bVictim)
             victims++;
@@ -4287,7 +4308,7 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budge
                     _vidmemCompactSeen[cat] += bytes;
                     continue;
                 }
-                if (bytes > (budgetMB << 20))
+                if (bytes > limit)
                 {
                     _vidmemCompactSeen[VC_BIG] += bytes;
                     continue;
@@ -4324,41 +4345,8 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budge
         }
     }
 
-    //
-    // The longest window that `budgetMB` of moving turns into one free run,
-    // among the stretches without a fixed frame that are longer than the run
-    // there is now (shorter ones can never beat it). Step after step the same
-    // window grows: what is free in it costs nothing the next time.
-    //
-    lo = hi = 0;
-    {
-        NvU64 seg = 0, best = 0, bestCost = 0;
-
-        for (c = 0; c <= chunks; c++)
-        {
-            NvU64 l, r;
-
-            if ((c < chunks) && (pCost[c] != NV_U32_MAX))
-                continue;
-            if (c - seg > runLen)
-            {
-                for (l = r = seg, cost = 0; r < c; r++)
-                {
-                    cost += pCost[r];
-                    while (cost > budgetFrames)
-                        cost -= pCost[l++];
-                    if ((cost != 0) && ((r + 1 - l > best) || ((r + 1 - l == best) && (cost < bestCost))))
-                    {
-                        best     = r + 1 - l;
-                        bestCost = cost;
-                        lo       = l;
-                        hi       = r + 1;
-                    }
-                }
-            }
-            seg = c + 1;
-        }
-    }
+    // The window this step clears (vepCompactWindow(), shared with the simulator).
+    (void)vepCompactWindow(pCost, chunks, runStart, runLen, budgetFrames, &lo, &hi);
     if (hi == lo)
     {
         why = "no stretch longer than the run is free of memory that cannot be moved now";
@@ -4367,7 +4355,15 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budge
 
     _vidmemEvictRangeLo     = base + ((off + lo * VIDMEM_EVICT_CHUNK_FRAMES) << PMA_PAGE_SHIFT);
     _vidmemEvictRangeHi     = base + ((off + hi * VIDMEM_EVICT_CHUNK_FRAMES) << PMA_PAGE_SHIFT);
-    _vidmemRelocateMaxBytes = budgetMB << 20;
+    *pWindowMB = (hi - lo) << 1;
+    //
+    // The step moves `stepMB` in all: a window is chosen by the frames in it,
+    // and an allocation with a corner there moves whole (with 256 MB pieces
+    // on 64 KB pages, three of them touching one window would be 0.8 GB and
+    // 80 ms in one step). What is left in the window goes at the next steps.
+    //
+    _vidmemRelocateTotalBytes = stepMB << 20;
+    _vidmemRelocateDoneBytes  = 0;
     // The run there is stays free, unless the window is growing that very run.
     if ((runStart >= hi) || (runStart + runLen <= lo))
     {
@@ -4380,11 +4376,16 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budge
 
         if (!_vidmemCompactVictim(&pProcs[i], NV_TRUE) || !_vidmemPidHasInRange(pProcs[i].pid))
             continue;
+        if (_vidmemRelocateDoneBytes >= _vidmemRelocateTotalBytes)
+            break;
+        _vidmemRelocateMaxBytes =
+            ((VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) ? NV_MIN(fgStepMB, stepMB) : stepMB) << 20;
         (void)_vidmemEvictPidLocked(pGpu, 3, pProcs[i].pid, NULL, 0, NULL, &moved);
         movedMB += moved >> 20;
     }
     _vidmemEvictRangeLo = _vidmemEvictRangeHi = 0;
     _vidmemRelocateMaxBytes = 0;
+    _vidmemRelocateTotalBytes = _vidmemRelocateDoneBytes = 0;
     _vidmemRelocateKeepLo = _vidmemRelocateKeepHi = 0;
     if (movedMB != 0)
     {
@@ -4753,9 +4754,12 @@ _vidmemEvictPrintBlock(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
                      largest >> 20, _vidmemBgCushionMB, _vidmemCompRooms, _vidmemCompRoomFails,
                      _vidmemCompRoomMovedMB, _vidmemCompRoomMaxNs / 1000);
         EVICT_PRINTF("windows cleared for contiguous allocations: %llu MB moved inside vidmem; "
-                     "background compaction: keeps a free run of %u MB, %u steps, %llu MB moved%s\n",
+                     "background compaction: keeps a free run of %u MB, %u steps, %llu MB moved%s; "
+                     "allocations of up to %u MB move (%u MB of the window in focus)\n",
                      _vidmemContigInVidmemMB, _vidmemCompactRunMB, _vidmemCompactSteps, _vidmemCompactMovedMB,
-                     _vidmemCompactFg ? "" : "; not the window in focus");
+                     _vidmemCompactFg ? "" : "; not the window in focus",
+                     _vidmemCompactBig ? VIDMEM_EVICT_COMPACT_BIG_STEP_MB : VIDMEM_EVICT_COMPACT_STEP_MB,
+                     _vidmemCompactBig ? VIDMEM_EVICT_COMPACT_FG_STEP_MB : VIDMEM_EVICT_COMPACT_STEP_MB);
         EVICT_PRINTF("compaction saw (MB): in use %llu; movable %llu; compositor %llu, foreground %llu, "
                      "movable with a pause of the compositor %llu, bigger than a step %llu, refused %llu\n",
                      _vidmemCompactSeenUsed >> 20, _vidmemCompactSeen[VC_MOVABLE] >> 20,
@@ -5010,7 +5014,16 @@ vidmemEvictProcess
         return status;
 
     // 12: move inside vidmem (problem #16), mode 3 of _vidmemEvictPidLocked().
-    if (mode == 16)
+    if (mode == 17)
+    {
+        _vidmemCompactBig = (arg != 0);
+        if (_vidmemCompactBig)
+            EVICT_PRINTF("background compaction moves allocations of up to %u MB of the window in focus, %u MB of the others\n",
+                         VIDMEM_EVICT_COMPACT_FG_STEP_MB, VIDMEM_EVICT_COMPACT_BIG_STEP_MB);
+        else
+            EVICT_PRINTF("background compaction moves allocations of up to %u MB\n", VIDMEM_EVICT_COMPACT_STEP_MB);
+    }
+    else if (mode == 16)
     {
         _vidmemCompactFg = (arg != 0);
         EVICT_PRINTF("background compaction %s the memory of the window in focus\n",

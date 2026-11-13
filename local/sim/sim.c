@@ -36,6 +36,7 @@ typedef struct
     NvU8  where;      // W_*
     NvU8  movable;    // the driver could move it (eligible)
     NvU8  contig;
+    NvU32 id;         // in the layout (knob "layout"), 0: not placed
 } Alloc;
 
 typedef struct
@@ -58,6 +59,8 @@ typedef struct
     double stallMs, maxStallMs;   // moves made inside its own allocations
     NvU64  windowKB;              // a contiguous window cleared for it and not used yet
     NvU32  windows;               // windows cleared for it
+    double compactMaxMs;          // longest pause a compaction step gave it
+    NvU64  compactKB;             // moved by compaction
 } Proc;
 
 static Proc   gProcs[MAXP];
@@ -75,6 +78,13 @@ static int    gVerbose;
 static double gCopyGBs = 3.5;     // copy speed of a move (2026-11-06 CoD: 494 MB in 139 ms)
 static double gFrag = 1.0;        // share of free memory in free 2 MB chunks
 static NvU64  gLongestMB;         // longest free run (0: no limit): a bigger contiguous buffer comes back only into a cleared window
+// The layout (knob "layout"): which allocation holds each 2 MB chunk, 0 free.
+static int    gLayout;
+static NvU32 *gChunk;
+static NvU64  gChunks;
+static NvU32  gNextId = 1;
+static NvU32  gCompactSteps, gCompactIdle;
+static NvU64  gCompactKB;
 static long   gClockOffset;       // display: wall clock (unix s) at scenario time 0
 static int    gHaveClock;
 static const char *gScenario;
@@ -201,6 +211,116 @@ static NvU64 freeKB(void)
     return (u < gCapKB) ? gCapKB - u : 0;
 }
 
+// --- the layout: where allocations lie -------------------------------------
+//
+// With `set layout 1` every allocation in vidmem holds whole 2 MB chunks: the
+// lowest free ones (a contiguous one the first free run, when there is one).
+// Enough for what compaction is about: the pieces a game's blocks cut the
+// free memory into. Not modelled: 64 KB pages inside a chunk, the windows
+// cleared for contiguous requests (vepPlatMakeContig() still always finds one).
+//
+static void layEnsure(void)
+{
+    NvU64 n = gCapKB >> 11;
+
+    if (n > gChunks)
+    {
+        gChunk = realloc(gChunk, n * sizeof(*gChunk));
+        memset(gChunk + gChunks, 0, (n - gChunks) * sizeof(*gChunk));
+        gChunks = n;
+    }
+}
+
+static void layRemove(Alloc *a)
+{
+    NvU64 c;
+
+    if (a->id == 0)
+        return;
+    for (c = 0; c < gChunks; c++)
+        if (gChunk[c] == a->id)
+            gChunk[c] = 0;
+    a->id = 0;
+}
+
+static int layOpen(NvU64 c, NvU64 aLo, NvU64 aHi, NvU64 bLo, NvU64 bHi)
+{
+    return (gChunk[c] == 0) && !((c >= aLo) && (c < aHi)) && !((c >= bLo) && (c < bHi));
+}
+
+// Places `a` outside [aLo, aHi) and [bLo, bHi); 0: no room there.
+static int layPlace(Alloc *a, NvU64 aLo, NvU64 aHi, NvU64 bLo, NvU64 bHi)
+{
+    NvU64 need = (a->kb + 2047) >> 11, c, run = 0, open = 0;
+
+    if (!gLayout || (a->where != W_VID) || (need == 0))
+        return 1;
+    layEnsure();
+    for (c = 0; c < gChunks; c++)
+        open += layOpen(c, aLo, aHi, bLo, bHi);
+    if (open < need)
+        return 0;
+    a->id = gNextId++;
+    if (a->contig)
+    {
+        for (c = 0; c < gChunks; c++)
+        {
+            run = layOpen(c, aLo, aHi, bLo, bHi) ? run + 1 : 0;
+            if (run == need)
+            {
+                for (run = 0; run < need; run++)
+                    gChunk[c - run] = a->id;
+                return 1;
+            }
+        }
+    }
+    for (c = 0; (c < gChunks) && (need != 0); c++)
+    {
+        if (layOpen(c, aLo, aHi, bLo, bHi))
+        {
+            gChunk[c] = a->id;
+            need--;
+        }
+    }
+    return 1;
+}
+
+static void layPlaceNew(Proc *p, Alloc *a)
+{
+    if (!layPlace(a, 0, 0, 0, 0))
+    {
+        fprintf(stderr, "%s:%d: layout: no free 2 MB chunks for %llu KB of %s (sizes in whole chunks?)\n",
+                gScenario, gLine, (unsigned long long)a->kb, p->name);
+        exit(2);
+    }
+}
+
+// Free chunks and the longest run of them; *pStart (optional): where it begins.
+static NvU64 layLongest(NvU64 *pFree, NvU64 *pStart)
+{
+    NvU64 c, run = 0, best = 0, nfree = 0;
+
+    layEnsure();
+    for (c = 0; c < gChunks; c++)
+    {
+        if (gChunk[c] != 0)
+        {
+            run = 0;
+            continue;
+        }
+        nfree++;
+        if (++run > best)
+        {
+            best = run;
+            if (pStart != NULL)
+                *pStart = c + 1 - run;
+        }
+    }
+    if (pFree != NULL)
+        *pFree = nfree;
+    return best;
+}
+
 static void accumulate(double toS);
 
 // --- the platform (vidmem_evict_policy.h) ---------------------------------
@@ -285,6 +405,7 @@ NV_STATUS vepPlatMovePid(OBJGPU *pGpu, NvU32 mode, NvU32 pid, NvU64 *pMovedBytes
             if ((_vidmemEvictBudgetBytes != 0) && ((kb << 10) >= _vidmemEvictBudgetBytes))
                 continue;
             a->where = W_EVICT;
+            layRemove(a);
             kb += a->kb;
             n++;
         }
@@ -312,6 +433,7 @@ NV_STATUS vepPlatMovePid(OBJGPU *pGpu, NvU32 mode, NvU32 pid, NvU64 *pMovedBytes
                 p->windowKB = 0;
             }
             a->where = W_VID;
+            layPlaceNew(p, a);
             kb += a->kb;
             n++;
         }
@@ -372,6 +494,11 @@ void vepPlatHotRestore(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count)
 NvBool vepPlatChunkInfo(OBJGPU *pGpu, NvU64 *pFreeChunks, NvU64 *pLongest)
 {
     (void)pGpu;
+    if (gLayout)
+    {
+        *pLongest = layLongest(pFreeChunks, NULL);
+        return NV_TRUE;
+    }
     *pFreeChunks = (NvU64)((double)(freeKB() >> 11) * gFrag);
     *pLongest = *pFreeChunks;
     return NV_TRUE;
@@ -393,11 +520,146 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
     return NV_TRUE;
 }
 
-// Fragmentation is not modelled: nothing to compact.
-NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 budgetMB, NvU64 wantMB)
+//
+// One compaction step as the driver's vepPlatCompact() makes it
+// (vidmem_evict.c), on the layout: the same window (vepCompactWindow()),
+// whole allocations out of it, the owner's piece size and the step's total.
+// Without the layout fragmentation is not modelled: nothing to compact.
+//
+#define SIM_CHUNK_FRAMES 32       // 2 MB in the 64 KB frames the driver counts
+NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB, NvU64 fgStepMB,
+                     NvU64 wantMB, NvU64 *pWindowMB)
 {
-    (void)pGpu; (void)pProcs; (void)count; (void)budgetMB; (void)wantMB;
-    return 0;
+    NvU64   freeChunks = 0, runStart = 0, runLen, lo = 0, hi = 0, c, doneKB = 0, keepLo = 0, keepHi = 0;
+    NvU32  *pCost;
+    Alloc **byId;
+    Proc  **procOf;
+    NvU8   *inWin;
+    double  stepMs = 0;
+    int     i, k, failed = 0;
+
+    (void)pGpu; (void)pProcs; (void)count;
+    *pWindowMB = 0;
+    if (!gLayout)
+        return 0;
+    runLen = layLongest(&freeChunks, &runStart);
+    wantMB = NV_MAX(wantMB, (freeChunks << 1) * 3 / 4);
+    if (((runLen << 1) >= wantMB) || (runLen == 0) || (freeChunks < runLen + (stepMB >> 1) + 16))
+        return 0;
+
+    pCost  = calloc(gChunks, sizeof(*pCost));
+    byId   = calloc(gNextId, sizeof(*byId));
+    procOf = calloc(gNextId, sizeof(*procOf));
+    inWin  = calloc(gNextId, 1);
+    for (i = 0; i < gNumProcs; i++)
+    {
+        for (k = 0; k < gProcs[i].na; k++)
+        {
+            byId[gProcs[i].a[k].id]   = &gProcs[i].a[k];
+            procOf[gProcs[i].a[k].id] = &gProcs[i];
+        }
+    }
+#define SIM_VICTIM(p) ((strcmp((p)->name, "kwin_wayland") != 0) && (strcmp((p)->name, "Xwayland") != 0))
+#define SIM_LIMIT_KB(p) (((VE_HINT_STATE((p)->hint) == VE_HINT_FG) ? NV_MIN(fgStepMB, stepMB) : stepMB) << 10)
+    for (c = 0; c < gChunks; c++)
+    {
+        NvU32 id = gChunk[c];
+
+        if (id == 0)
+            continue;
+        pCost[c] = (SIM_VICTIM(procOf[id]) && byId[id]->movable && (byId[id]->kb <= SIM_LIMIT_KB(procOf[id]))) ?
+                   SIM_CHUNK_FRAMES : VEP_COMPACT_FIXED;
+    }
+    if (!vepCompactWindow(pCost, gChunks, runStart, runLen, (stepMB << 20) >> 16, &lo, &hi))
+    {
+        gCompactIdle++;
+        if (gVerbose)
+            printf("%s  COMPACT nothing to move: longest free run %llu MB of %llu MB wanted, pieces of up to %llu MB (%llu MB of the focus)\n",
+                   clockStr(gNowS), (unsigned long long)(runLen << 1), (unsigned long long)wantMB,
+                   (unsigned long long)stepMB, (unsigned long long)NV_MIN(fgStepMB, stepMB));
+        goto done;
+    }
+    *pWindowMB = (hi - lo) << 1;
+    // The run there is stays free, unless the window is growing that very run.
+    if ((runStart >= hi) || (runStart + runLen <= lo))
+    {
+        keepLo = runStart;
+        keepHi = runStart + runLen;
+    }
+    for (c = lo; c < hi; c++)
+        inWin[gChunk[c]] = 1;
+    for (i = 0; i < gNumProcs; i++)
+    {
+        Proc  *p = &gProcs[i];
+        NvU64  kb = 0;
+        NvU32  n = 0;
+        double ms;
+
+        if (!SIM_VICTIM(p))
+            continue;
+        for (k = 0; k < p->na; k++)
+        {
+            Alloc *a = &p->a[k];
+
+            if ((a->id == 0) || !inWin[a->id] || !a->movable || (a->kb > SIM_LIMIT_KB(p)) ||
+                (doneKB + a->kb > (stepMB << 10)))
+                continue;
+            //
+            // New chunks first, outside the window and the run that is kept,
+            // then the old ones go; no room there: it stays (the driver's
+            // _vidmemRelocate() fails the same way and never breaks the run).
+            //
+            {
+                NvU32 oldId = a->id;
+                NvU64 x;
+
+                if (!layPlace(a, lo, hi, keepLo, keepHi))
+                {
+                    failed++;
+                    continue;
+                }
+                for (x = 0; x < gChunks; x++)
+                    if (gChunk[x] == oldId)
+                        gChunk[x] = 0;
+            }
+            doneKB += a->kb;
+            kb += a->kb;
+            n++;
+        }
+        if (kb == 0)
+            continue;
+        // The owner is paused for the copy of its own memory.
+        ms = moveMs(kb, n);
+        stepMs += ms;
+        p->compactMaxMs = NV_MAX(p->compactMaxMs, ms);
+        p->compactKB += kb;
+        if (gVerbose)
+            printf("%s  COMPACT %s(%u) %llu MB in %u allocs, %.0f ms; window %llu MB\n", clockStr(gNowS), p->name,
+                   p->pid, (unsigned long long)(kb >> 10), n, ms, (unsigned long long)((hi - lo) << 1));
+    }
+    if (doneKB == 0)
+    {
+        gCompactIdle++;
+        if (gVerbose)
+            printf("%s  COMPACT window %llu MB: no room outside it and the run for what is in it (%d allocations)\n",
+                   clockStr(gNowS), (unsigned long long)((hi - lo) << 1), failed);
+    }
+    if (doneKB != 0)
+    {
+        gCompactSteps++;
+        gCompactKB += doneKB;
+        gCtxMs += stepMs;
+        accumulate(gNowS + stepMs / 1000.0);
+        if (gVerbose)
+            printf("%s  COMPACT longest free run %llu -> %llu MB\n", clockStr(gNowS),
+                   (unsigned long long)(runLen << 1), (unsigned long long)(layLongest(NULL, NULL) << 1));
+    }
+done:
+    free(pCost);
+    free(byId);
+    free(procOf);
+    free(inWin);
+    return (doneKB + 1023) >> 10;
 }
 
 // --- processes and allocations -------------------------------------------
@@ -435,6 +697,8 @@ static void addAlloc(Proc *p, NvU64 kb, int where, int movable, int contig)
     p->a[p->na].where = (NvU8)where;
     p->a[p->na].movable = (NvU8)movable;
     p->a[p->na].contig = (NvU8)contig;
+    p->a[p->na].id = 0;
+    layPlaceNew(p, &p->a[p->na]);
     p->na++;
     if (where == W_EVICT)
         _vidmemEvictBytes += kb << 10;
@@ -553,10 +817,13 @@ static void simFree(Proc *p, NvU64 kb)
 
         if (a->where == W_EVICT)
             _vidmemEvictBytes -= NV_MIN(_vidmemEvictBytes, take << 10);
+        layRemove(a);
         a->kb -= take;
         kb -= take;
         if (a->kb == 0)
             p->na--;
+        else
+            layPlaceNew(p, a);
     }
 }
 
@@ -774,6 +1041,10 @@ static double metric(const char *m, Proc *p)
 {
     if (strcmp(m, "free") == 0)
         return (double)(freeKB() >> 10);
+    if (strcmp(m, "longest") == 0)          // MB, the longest free run (layout)
+        return gLayout ? (double)(layLongest(NULL, NULL) << 1) : (double)gLongestMB;
+    if (strcmp(m, "compact_steps") == 0)    return gCompactSteps;
+    if (strcmp(m, "compact_idle") == 0)     return gCompactIdle;
     if (p == NULL)
     {
         fprintf(stderr, "%s:%d: metric %s needs a pid\n", gScenario, gLine, m);
@@ -792,6 +1063,8 @@ static double metric(const char *m, Proc *p)
     if (strcmp(m, "denied") == 0)     return p->denied;
     if (strcmp(m, "born") == 0)       return p->born;
     if (strcmp(m, "stallmax") == 0)   return p->maxStallMs;
+    if (strcmp(m, "compact_pause") == 0) return p->compactMaxMs;
+    if (strcmp(m, "compact_moved") == 0) return (double)(p->compactKB >> 10);
     if (strcmp(m, "sysfg_mbs") == 0)  return p->sysFgMBs;
     fprintf(stderr, "%s:%d: unknown metric %s\n", gScenario, gLine, m);
     exit(2);
@@ -831,6 +1104,9 @@ static int setKnob(const char *k, const char *v)
     else if (strcmp(k, "fg_own") == 0)       _vidmemFgOwnEnabled = (NvU32)d;
     else if (strcmp(k, "autotick") == 0)     gAutoTick = (int)d;
     else if (strcmp(k, "hints") == 0)        gHintsActive = (int)d;
+    else if (strcmp(k, "layout") == 0)       gLayout = (int)d;
+    else if (strcmp(k, "compact") == 0)      _vidmemCompactRunMB = (NvU32)d;
+    else if (strcmp(k, "compact_big") == 0)  _vidmemCompactBig = (NvU32)d;
     else return 0;
     return 1;
 }
@@ -956,6 +1232,18 @@ static void runScenario(FILE *f)
             for (i = 0; i < count; i++)
                 simAlloc(p, kb / (NvU64)count, !fixed, contig);
         }
+        else if (strcmp(tok[0], "mix") == 0 && n >= 4)
+        {
+            // mix n=COUNT PID MB [PID MB]...: COUNT rounds of one allocation
+            // each, without the allocation path: with the layout on they lie
+            // interleaved, as a session leaves them.
+            int count = atoi(tok[1] + 2), i, k;
+
+            for (i = 0; i < count; i++)
+                for (k = 2; k + 1 < n; k += 2)
+                    addAlloc(getProc((NvU32)strtoul(tok[k], NULL, 10), NULL), (NvU64)(atof(tok[k + 1]) * 1024),
+                             W_VID, 1, 0);
+        }
         else if (strcmp(tok[0], "place") == 0 && n >= 5)
         {
             // Initial state as recorded, without the allocation path: VRAM MB
@@ -1059,6 +1347,18 @@ static void summary(void)
     printf("vid / evict: at the end; denied: MB of allocations turned away (the app's own sysmem fallback);\n"
            "fg_sys / vis_sys: MB moved out integrated over the time the process was focused / visible;\n"
            "stall: moves made inside the process's own allocations (it waited for them).\n");
+    if (gLayout)
+    {
+        NvU64 nfree = 0, run = layLongest(&nfree, NULL);
+
+        printf("layout: %llu MB free in whole 2 MB chunks, the longest run %llu MB; compaction: %u steps moved %llu MB, %u found nothing to move\n",
+               (unsigned long long)(nfree << 1), (unsigned long long)(run << 1), gCompactSteps,
+               (unsigned long long)(gCompactKB >> 10), gCompactIdle);
+        for (i = 0; i < gNumProcs; i++)
+            if (gProcs[i].compactKB != 0)
+                printf("  %-16.16s %llu MB moved by compaction, longest pause %.0f ms\n", gProcs[i].name,
+                       (unsigned long long)(gProcs[i].compactKB >> 10), gProcs[i].compactMaxMs);
+    }
     if (gChecks != 0)
         printf("\nexpect: %d of %d passed\n", gChecks - gFailures, gChecks);
 }

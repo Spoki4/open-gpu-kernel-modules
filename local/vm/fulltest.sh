@@ -16,6 +16,8 @@
 #   contigloop   contigloop-test.sh  a focused app remaking a contiguous buffer: no loop (#15)
 #   compact      compact-test.sh     background compaction lengthens the free run (#16)
 #   compactfg    compact-test.sh fg  the same out of the memory of the window in focus (#16)
+#   compactbig   compact-test.sh     the same with 128 MB blocks, as a game on the other monitor holds
+#   compactbigfg compact-test.sh fg  the same with 64 MB blocks of the window in focus
 #   fgown        fgown-test.sh       the focused app gets memory nobody can make room for (#7)
 #   nvtest       vmtest.sh all       the whole bench (15 scenarios; S, #5-#13, R)
 #   desktop      the guest's Plasma session under fragchurn with moves: compaction and
@@ -126,6 +128,8 @@ stage contig 180 600 'CONTIGTEST PASS' "./contig-test.sh"
 stage contigloop 180 600 'CONTIGLOOPTEST PASS' "./contigloop-test.sh"
 stage compact 180 900 'COMPACTTEST PASS' "./compact-test.sh 120 4096"
 stage compactfg 180 900 'COMPACTTEST PASS' "./compact-test.sh 120 4096 fg"
+stage compactbig 180 900 'COMPACTTEST PASS' "CHUNK_MB=128 ./compact-test.sh 120 4096"
+stage compactbigfg 180 900 'COMPACTTEST PASS' "CHUNK_MB=64 ./compact-test.sh 120 4096 fg"
 stage fgown 180 600 'FGOWNTEST PASS' "./fgown-test.sh"
 vmt nvtest --no-build --no-reload all
 

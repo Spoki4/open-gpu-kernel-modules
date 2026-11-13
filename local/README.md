@@ -40,7 +40,10 @@ These patches do the same inside the driver.
   physically contiguous, and a long session leaves gigabytes free in pieces
   of a few MB. A contiguous request gets a window cleared for it by moving
   other memory to other vidmem pages (no sysmem), and a background step
-  compacts vidmem a little at a time so the longest free run stays long.
+  compacts vidmem a little at a time so the longest free run stays long. A
+  step moves whole allocations: of the window in focus those up to 96 MB (a
+  pause of about 9 ms), of the others up to 256 MB, and 256 MB in all (96 MB
+  while a game is in focus).
 - **Does not keep a fixed reserve** for the compositor any more (the first
   approach, `RmVidmemUserReserveMB`, still there and off by default).
 - Fixes found on the way in NVIDIA's own code: a channel group leaked on GSP
@@ -92,12 +95,13 @@ sudo ./local/evict.sh evict|restore|move <pid|chrome|name>   # by hand: to sysme
 sudo ./local/evict.sh auto on|off|hints  # the automatic policy (hints, the default: only with window hints)
 sudo ./local/evict.sh compact MB         # background compaction keeps a free run of MB (0: off)
 sudo ./local/evict.sh compactfg on|off   # ... also out of the focused window's memory
+sudo ./local/evict.sh compactbig on|off  # ... in allocations of up to 256 MB (96 MB of the focus); off: 32 MB
 sudo ./local/evict.sh moveshared on|off  # window buffers shared with the compositor may move inside vidmem
 sudo ./local/evict.sh fgown on|off       # the focused app pays for its allocation with its own older memory
 ```
 
 The full list is in the script's header. If the desktop stutters, switch off
-`moveshared`, then `compactfg`, and look at `status`.
+`moveshared`, then `compactbig`, then `compactfg`, and look at `status`.
 
 Per GPU there are also `/proc/driver/nvidia/gpus/<bdf>/vidmem_pma` (free
 memory, longest free run; readable by everyone) and the kernel log lines
@@ -222,7 +226,8 @@ cd local/tests
 ./move-test.sh                 # moves inside vidmem keep the content
 ./contig-test.sh               # contiguous buffers in fragmented vidmem: a window is cleared
 ./contigloop-test.sh           # a focused app remaking a contiguous buffer: no clearing loop
-./compact-test.sh [120 4096 fg]  # background compaction lengthens the free run (fg: out of the focused window too)
+./compact-test.sh [120 4096 fg]  # background compaction lengthens the free run (fg: out of the focused window too;
+                                 # CHUNK_MB=64|128: with blocks the size a game holds)
 ./fgown-test.sh                # the focused app gets an allocation nobody can make room for
 ./fragchurn.sh                 # fragments vidmem like a long session
 ./momc-probe.sh                # a probe: do the GPU's access counters report accesses to vidmem?
@@ -307,9 +312,16 @@ with any build; `fgprio` see idea I15 below). On the 3080 Ti the build before
 compaction ran two hours under a game with no Xid; the current one was
 installed on the host on 2026-11-11.
 
+The first evening on the host (2026-11-11, five hours of WoW with Chrome on
+the second monitor): no Xid, no crash, 68 moves out and 31 back without a
+failure, single moves of 1-36 ms. Compaction stood still next to the game
+(problem #17), and Chrome was denied 8 of its 17 contiguous buffers.
+
 Not verified yet: `vm/fulltest.sh` on the 3080 Ti (its `desktop` and `game`
 stages have never run), moving buffers shared with the compositor under a
-real Plasma session, the access-counter probe on Ampere.
+real Plasma session, the access-counter probe on Ampere. The fix for problem
+#17 has run in the simulator only (`sim/scenarios/compact-game.scn`); on a
+GPU the stages `compactbig` and `compactbigfg` of `fulltest.sh` are for it.
 
 ## Numbers cited in the code
 
@@ -332,6 +344,7 @@ Comments and tests refer to the problems that led to a piece of code.
 | 13 | new contexts failed in fragmented vidmem | xdg-desktop-portal crash |
 | 15 | Chrome's contiguous buffers: windows cleared at the game's cost, in a loop | freezes up to 1.5 s, 75 GB of copies in an evening |
 | 16 | fragmentation: 7 GB free, the longest piece under 1 GB | all of the above, later in a session |
+| 17 | compaction moved 32 MB allocations, a game holds blocks of 64-256 MB | 107 idle steps in five hours, Chrome denied contiguous buffers with 1-2 GB free |
 
 Rules (R): R1 focus > previously focused > visible > hidden, and nothing
 returns to visible windows while the focus lacks memory; R2 the focus may

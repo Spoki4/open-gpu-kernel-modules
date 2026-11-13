@@ -47,10 +47,17 @@ the clock from `vidmem_evict_sim.h`.
   meanwhile, as in the driver (the policy takes `nowNs` once per step).
 - Activity (idle seconds, engine samples) and window hints are inputs, as
   the driver would have sampled them.
-- Not modelled: fragmentation (`frag` scales free 2 MB chunks, default none),
-  contiguous windows for the compositor (always found), per-allocation hot or
-  cold (access counters), sizes of real allocations (a process grows in
-  `chunk=` MB pieces), apps reacting to their budget.
+- With `set layout 1` allocations have places: each holds whole 2 MB chunks,
+  the lowest free ones. Background compaction then runs as in the driver:
+  the same window search (`vepCompactWindow()` in the policy file), whole
+  allocations moved out of the window, the owner's piece size and the step's
+  total, no new chunks in the window or in the run that is kept. `mix` lays
+  several processes' allocations out interleaved.
+- Not modelled: fragmentation without the layout (`frag` scales free 2 MB
+  chunks, default none), 64 KB pages inside a chunk, contiguous windows for
+  requests (always found, layout or not), per-allocation hot or cold (access
+  counters), sizes of real allocations (a process grows in `chunk=` MB
+  pieces), apps reacting to their budget.
 
 ## Scenarios
 
@@ -59,7 +66,7 @@ One command per line, `#` starts a comment. Times are seconds from the start.
 | command | |
 |---|---|
 | `cap MB` | vidmem for processes |
-| `set KNOB VALUE` | `fg_headroom`, `bg_cushion`, `auto`, `low`, `high` (policy registry knobs), `fg_own` (problem #7, 1/0), `copy_gbs`, `frag`, `longest` (MB, longest free run: a bigger contiguous allocation comes back from sysmem only into a window the policy had cleared; 0: no limit), `autotick` (policy step every 2 s, default 1), `hints` |
+| `set KNOB VALUE` | `fg_headroom`, `bg_cushion`, `auto`, `low`, `high` (policy registry knobs), `fg_own` (problem #7, 1/0), `copy_gbs`, `frag`, `longest` (MB, longest free run: a bigger contiguous allocation comes back from sysmem only into a window the policy had cleared; 0: no limit), `autotick` (policy step every 2 s, default 1), `hints`, `layout` (1: allocations have places), `compact` (MB, the free run compaction keeps), `compact_big` (0: compaction moves allocations of 32 MB at most, as before problem #17) |
 | `proc PID NAME [old] [never] [exempt] [chunk=MB]` | a process; `old`: seen long before the start; kwin_wayland/Xwayland are the compositor |
 | `hint PID f\|v\|h\|- [inh] [other] [full] [launched]` | window hint (focused, visible, hidden, none), inherited from a parent (of another app), has a fullscreen window, started by Steam/GameMode |
 | `act PID IDLE_S\|- SAMPLES` | GPU activity: seconds since its last work (`-` never), engine samples in the last ~10 s |
@@ -67,11 +74,12 @@ One command per line, `#` starts a comment. Times are seconds from the start.
 | `free PID MB` | frees the newest first |
 | `target PID MB ELIG [spread=S]` | grow or shrink to MB in total (ELIG of it movable), at once or spread over S seconds |
 | `place PID VRAM RAM ELIG` | initial state without the allocation path |
+| `mix n=COUNT PID MB [PID MB]...` | COUNT rounds of one allocation each, without the allocation path: interleaved in the layout |
 | `comp MB [contig]` | an allocation of the compositor side no process holds (makes room, is not kept) |
 | `at T` | run until T (steps every 2 s with autotick) |
 | `step` | a policy step now (what a hint change triggers) |
 | `mark TEXT` | a line in the output |
-| `expect METRIC PID\|- OP VALUE` | a check: `vid`, `evicted`, `sys` (= evicted), `evicts`, `moved_out` (MB copied out in all), `restores`, `restorefails`, `windows` (contiguous windows cleared for it), `pingpong`, `denied`, `denied_mb`, `born`, `stallmax`, `sysfg_mbs`, `free`; OP `<= >= < > ==` |
+| `expect METRIC PID\|- OP VALUE` | a check: `vid`, `evicted`, `sys` (= evicted), `evicts`, `moved_out` (MB copied out in all), `restores`, `restorefails`, `windows` (contiguous windows cleared for it), `pingpong`, `denied`, `denied_mb`, `born`, `stallmax`, `sysfg_mbs`, `free`, `longest` (MB, the longest free run), `compact_steps`, `compact_idle` (steps that moved / found nothing), `compact_pause` (ms, the longest pause a step gave the process), `compact_moved`; OP `<= >= < > ==` |
 | `rec PID VRAM RAM` | recorded values for `-cmp` (replays) |
 | `clock UNIX_S` | wall clock at time 0 (output shows HH:MM:SS) |
 

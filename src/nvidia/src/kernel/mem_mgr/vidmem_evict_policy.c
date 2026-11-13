@@ -126,8 +126,13 @@ NvU32  _vidmemLowMB = 1024;
 NvU32  _vidmemHighMB = 2560;
 NvU64  _vidmemLastPressureNs;
 NvU32  _vidmemCompactRunMB = VIDMEM_EVICT_COMPACT_RUN_MB;
+NvU32  _vidmemCompactBig = 1;          // the step follows who pays for it (0: 32 MB for everyone)
 static NvU64 _vidmemCompactRestNs;   // no compaction step before this (monotonic ns)
 static NvU32 _vidmemCompactIdleSteps; // steps in a row that had nothing to do (the rest doubles)
+static NvU32 _vidmemCompactFgPid;     // the focus at the last step (a change ends the rest)
+static NvU64 _vidmemCompactTryNs;     // the last step that looked for something to move
+static NvU64 _vidmemCompactWindowMB;  // the window the last moving step worked on
+static NvU32 _vidmemCompactStalled;   // moving steps in a row whose window did not grow
 static NvU32 _vidmemCompactRunSeenMB; // the knob at the last step (a new value: try at once)
 NvU32  _vidmemBusiestPid;          // updated every tick
 NvU64  _vidmemBusiestSinceNs;      // since when it is the busiest without a break
@@ -1119,6 +1124,58 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
 }
 
 //
+// Background compaction: the longest window that `budgetFrames` of moving
+// turns into one free run, among the stretches without a fixed frame that
+// are longer than the run there is now (shorter ones can never beat it).
+// Step after step the same window grows: what is free in it costs nothing
+// the next time.
+//
+// A stretch apart from the run can be cleared only into the free chunks
+// outside the run (the run is kept), so it gets as long as those at most:
+// when that is no longer than the run, clearing it is work for nothing. The
+// simulator showed it at once with a game's 256 MB blocks as walls 1.1 GB
+// apart: the run at its 1056 MB, 640 MB free elsewhere, and eight more steps
+// moved 600 MB of the game into a second window that could never be longer.
+//
+NvBool
+vepCompactWindow(const NvU32 *pCost, NvU64 chunks, NvU64 runStart, NvU64 runLen, NvU64 budgetFrames,
+                 NvU64 *pLo, NvU64 *pHi)
+{
+    NvU64 seg = 0, best = 0, bestCost = 0, lo = 0, hi = 0, freeChunks = 0, c;
+
+    for (c = 0; c < chunks; c++)
+        freeChunks += (pCost[c] == 0);
+    for (c = 0; c <= chunks; c++)
+    {
+        NvU64 l, r, cost;
+
+        if ((c < chunks) && (pCost[c] != VEP_COMPACT_FIXED))
+            continue;
+        if ((c - seg > runLen) &&
+            (((runStart >= seg) && (runStart < c)) || (freeChunks - NV_MIN(freeChunks, runLen) > runLen)))
+        {
+            for (l = r = seg, cost = 0; r < c; r++)
+            {
+                cost += pCost[r];
+                while (cost > budgetFrames)
+                    cost -= pCost[l++];
+                if ((cost != 0) && ((r + 1 - l > best) || ((r + 1 - l == best) && (cost < bestCost))))
+                {
+                    best     = r + 1 - l;
+                    bestCost = cost;
+                    lo       = l;
+                    hi       = r + 1;
+                }
+            }
+        }
+        seg = c + 1;
+    }
+    *pLo = lo;
+    *pHi = hi;
+    return hi != lo;
+}
+
+//
 // One policy step, after the platform sampled the GPU activity
 // (_vidmemActivityNote(), lastSubmitNs). API lock RW, GPU lock held.
 //
@@ -1190,6 +1247,24 @@ vepPolicyStep(OBJGPU *pGpu)
             _vidmemCompactRestNs    = 0;
             _vidmemCompactIdleSteps = 0;
         }
+        //
+        // The focus changed: who may move in what pieces is different now
+        // (the game the user looked away from gives its big blocks), so the
+        // long rest after fruitless steps ends. With 318 changes of focus in
+        // five hours next to a game the rest still stood at its 15 minutes
+        // (host, 2026-11-11). One look per shortest rest at most: a look
+        // walks every allocation under the locks, and alt-tab comes in bursts.
+        // The rest keeps its length: a fruitless look is followed by as long
+        // a one as before.
+        //
+        if (_vidmemCompactFgPid != _vidmemEvictFgPid(pProcs, count))
+        {
+            _vidmemCompactFgPid    = _vidmemEvictFgPid(pProcs, count);
+            _vidmemCompactRestNs   = NV_MIN(_vidmemCompactRestNs,
+                                            _vidmemCompactTryNs + VIDMEM_EVICT_COMPACT_REST_SEC * 1000000000ULL);
+            _vidmemCompactStalled  = 0;
+            _vidmemCompactWindowMB = 0;
+        }
         if ((moves != _vidmemPolicyMoves) || (evicted != _vidmemEvictBytes))
         {
             // The layout changed: the next quiet step looks again without the long rest.
@@ -1198,18 +1273,36 @@ vepPolicyStep(OBJGPU *pGpu)
         else if ((_vidmemCompactRunMB != 0) && (nowNs >= _vidmemCompactRestNs) &&
                  (VE_AGO_NS(nowNs, _vidmemLastPressureNs) >= (VIDMEM_EVICT_QUIET_SEC * 1000000000ULL)))
         {
-            _vidmemEvictWhy = VMT_WHY_COMPACT;
-            if (vepPlatCompact(pGpu, pProcs, count, VIDMEM_EVICT_COMPACT_STEP_MB, _vidmemCompactRunMB) != 0)
+            NvU64 stepMB = VIDMEM_EVICT_COMPACT_STEP_MB, fgStepMB = VIDMEM_EVICT_COMPACT_STEP_MB;
+            NvU64 windowMB = 0, movedMB;
+
+            if (_vidmemCompactBig)
             {
-                _vidmemCompactIdleSteps = 0;
+                fgStepMB = VIDMEM_EVICT_COMPACT_FG_STEP_MB;
+                stepMB   = _vidmemFgIsGame ? VIDMEM_EVICT_COMPACT_FG_STEP_MB : VIDMEM_EVICT_COMPACT_BIG_STEP_MB;
             }
-            else
+            _vidmemEvictWhy = VMT_WHY_COMPACT;
+            _vidmemCompactTryNs = nowNs;
+            movedMB = vepPlatCompact(pGpu, pProcs, count, stepMB, fgStepMB, _vidmemCompactRunMB, &windowMB);
+            if ((movedMB != 0) && (windowMB > _vidmemCompactWindowMB))
             {
+                // Getting somewhere.
+                _vidmemCompactIdleSteps = 0;
+                _vidmemCompactStalled   = 0;
+            }
+            else if ((movedMB == 0) || (++_vidmemCompactStalled >= VIDMEM_EVICT_COMPACT_STALL_STEPS))
+            {
+                if (movedMB != 0)
+                    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: compaction: %u steps moved memory and the window (%llu MB) did not grow, resting\n",
+                              _vidmemCompactStalled, windowMB);
                 // Nothing to do: 14 s, 28 s, ... up to 15 min while nothing changes.
                 _vidmemCompactRestNs = nowNs + ((VIDMEM_EVICT_COMPACT_REST_SEC * 1000000000ULL) <<
                                                 NV_MIN(_vidmemCompactIdleSteps, 6));
                 _vidmemCompactIdleSteps++;
+                _vidmemCompactStalled = 0;
             }
+            if (movedMB != 0)
+                _vidmemCompactWindowMB = windowMB;
         }
         // Moves change what is left to reclaim: walk again only after some.
         if ((moves != _vidmemPolicyMoves) || (evicted != _vidmemEvictBytes))

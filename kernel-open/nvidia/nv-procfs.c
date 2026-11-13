@@ -467,6 +467,8 @@ nv_procfs_write_vidmem_evict(
         mode = 15;
     else if (strcmp(cmd, "compactfg") == 0)
         mode = 16;
+    else if (strcmp(cmd, "compactbig") == 0)
+        mode = 17;
     else
         return -EINVAL;
 
@@ -476,7 +478,7 @@ nv_procfs_write_vidmem_evict(
         if (arg == NULL)
             return -EINVAL;
         ret = kstrtouint(strim(arg), 10, &pid);
-        if ((ret < 0) || ((mode != 4) && (mode != 6) && (mode != 7) && (mode != 8) && (mode != 10) && (mode != 11) && (mode != 13) && (mode != 14) && (mode != 15) && (mode != 16) && (pid == 0)))
+        if ((ret < 0) || ((mode != 4) && (mode != 6) && (mode != 7) && (mode != 8) && (mode != 10) && (mode != 11) && (mode != 13) && (mode != 14) && (mode != 15) && (mode != 16) && (mode != 17) && (pid == 0)))
         {
             return -EINVAL;
         }
