@@ -1,0 +1,49 @@
+# Sides: the session of compact-game.scn (the game's blocks of 64-256 MB, the
+# browser's and a player's small buffers allocated in between, the player's
+# freed), with the game known as one before the others allocate. They are
+# then placed from the bottom of vidmem and the game from the top
+# (`-set place_sides=0`: everybody from the top, the holes are between the
+# game's blocks, the longest free run is 242 MB and compaction moves 640 MB of
+# the game for a run of 640 MB).
+cap 10100
+set layout 1
+set copy_gbs 10
+set fg_headroom 0            # the layout is the subject, not who is moved out
+proc 1614 kwin_wayland old
+proc 2617 chrome old
+proc 3686 spotify old
+proc 12557 game old
+
+act 1614 0 4
+alloc 1614 250 n=5 fixed
+hint 12557 f full
+hint 2617 v
+act 12557 0 200
+act 2617 2 4
+alloc 12557 64               # the game is up: the next policy step sees it
+at 4
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+mix n=12 12557 64 2617 8 3686 16
+mix n=1 12557 256 2617 8 3686 16
+alloc 12557 256 n=2 fixed            # mapped by the CPU: nobody moves these
+free 3686 99999                      # the holes: 1.4 GB in pieces of 16 MB
+alloc 2617 192 contig                # the browser's biggest buffer
+free 2617 192
+expect free - >= 1600
+mark the holes are between the browser's buffers; the game's blocks stand together
+at 150
+expect longest - >= 576              # three such buffers
+expect compact_moved 12557 == 0      # the game was not paused for it
+expect compact_pause 2617 <= 27
+expect evicts 2617 == 0

@@ -76,6 +76,22 @@
 #define VIDMEM_EVICT_COMPACT_FREE_PCT    75
 extern NvU32 _vidmemCompactRunMB;
 extern NvU32 _vidmemCompactBig;
+//
+// Sides (evict.sh placesides): while a game runs, the others' new memory is
+// placed from the bottom of vidmem and the game's from the top, as all of it
+// was. The game allocates blocks of 64-256 MB for hours while a browser next
+// to it allocates and frees small buffers; placed from the same end, those
+// landed between the blocks, and what they left when freed were holes
+// between walls (host, 2026-11-11: 1.9 GB free, the longest run 260 MB,
+// problem #17). On separate sides the free memory is what is left between
+// the two, and the holes of the desktop side are between memory that moves
+// without a pause of the game. A game: started by a launcher or with a
+// fullscreen window (the hints), holding vidmem. The compositor's stays at
+// the top.
+//
+extern NvU32 _vidmemPlaceSides;
+NvBool vepPlaceLow(NvU32 pid, const char *name);
+NvBool vepGameSideNow(void);
 // A chunk of the cost map of vepCompactWindow() that holds a frame nobody can move.
 #define VEP_COMPACT_FIXED NV_U32_MAX
 #define VIDMEM_EVICT_HYST_MB        512

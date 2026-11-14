@@ -254,7 +254,8 @@ static int layOpen(NvU64 c, NvU64 aLo, NvU64 aHi, NvU64 bLo, NvU64 bHi)
 // Places `a` outside [aLo, aHi) and [bLo, bHi); 0: no room there. Where, as
 // the driver does it (how): a new or restored allocation from the top
 // (LAY_TOP, every non-contiguous one since 2026-11-04) or from the bottom
-// (LAY_LOW: a contiguous one into the first run that holds it); one moved inside vidmem into the smallest free
+// (LAY_LOW: a contiguous one into the first run that holds it, and what
+// vepPlaceLow() sends there); one moved inside vidmem into the smallest free
 // run that holds it, else the lowest free chunks (LAY_FIT, _vidmemRelocate()).
 //
 enum { LAY_LOW, LAY_TOP, LAY_FIT };
@@ -321,7 +322,7 @@ static int layPlace(Alloc *a, int how, NvU64 aLo, NvU64 aHi, NvU64 bLo, NvU64 bH
 
 static void layPlaceNew(Proc *p, Alloc *a)
 {
-    if (!layPlace(a, gPlaceTop ? LAY_TOP : LAY_LOW, 0, 0, 0, 0))
+    if (!layPlace(a, (gPlaceTop && !vepPlaceLow(p->pid, p->name)) ? LAY_TOP : LAY_LOW, 0, 0, 0, 0))
     {
         fprintf(stderr, "%s:%d: layout: no free 2 MB chunks for %llu KB of %s (sizes in whole chunks?)\n",
                 gScenario, gLine, (unsigned long long)a->kb, p->name);
@@ -1173,6 +1174,7 @@ static int setKnob(const char *k, const char *v)
     else if (strcmp(k, "compact") == 0)      _vidmemCompactRunMB = (NvU32)d;
     else if (strcmp(k, "compact_big") == 0)  _vidmemCompactBig = (NvU32)d;
     else if (strcmp(k, "place_top") == 0)    gPlaceTop = (int)d;
+    else if (strcmp(k, "place_sides") == 0)  _vidmemPlaceSides = (NvU32)d;
     else if (strcmp(k, "compact_whole") == 0) gCompactOwners = (int)d;
     else return 0;
     return 1;

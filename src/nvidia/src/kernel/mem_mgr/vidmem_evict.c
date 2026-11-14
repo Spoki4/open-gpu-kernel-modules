@@ -277,6 +277,8 @@ static NvU32 _vidmemEvictCurPid;
 
 // Who asked for the next evict/restore call (VMT_WHY_*), set by each caller.
 NvU32 _vidmemEvictWhy;
+static NvBool _vidmemRestoreLow;       // a restore places the pages from the bottom of vidmem (vepPlaceLow())
+NvBool vidmemEvictPlaceLow(RmClient *pRmClient);
 static NvU64 _vidmemRelocateMaxBytes;  // mode 3: bigger allocations stay where they are (0: no limit)
 // mode 3, a compaction step: no more than this in all (0: no limit), and what the step moved so far.
 static NvU64 _vidmemRelocateTotalBytes, _vidmemRelocateDoneBytes;
@@ -1648,6 +1650,9 @@ _vidmemRestoreBegin(OBJGPU *pGpu, MEMORY_DESCRIPTOR *pMemDesc, VIDMEM_EVICT_MAPR
     {
         allocOptions.flags |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
     }
+    // Back to its owner's side of vidmem (vepPlaceLow()), as a new allocation of it would go.
+    if (_vidmemRestoreLow && !pPmaInfo->bContig)
+        allocOptions.flags |= PMA_ALLOCATE_LOCAL_BOTTOM_UP;
     status = pmaAllocatePages(pPma, pPmaInfo->pageCount, pPmaInfo->pageSize, &allocOptions, pPages);
     if ((status != NV_OK) && bAllowBlock && _vidmemEvictBlockCanTake(pPma, pState->bytes))
     {
@@ -2155,7 +2160,9 @@ vidmemEvictRestoreOnAccess(Memory *pMemory)
     status = _vidmemEvictSetChannels(pGpu, pChannels, NV_TRUE);
     if (status == NV_OK)
     {
+        _vidmemRestoreLow = vidmemEvictPlaceLow(dynamicCast(RES_GET_CLIENT(pMemory), RmClient));
         status = _vidmemRestoreBegin(pGpu, pMemDesc, pRefs, numRefs, NV_TRUE);
+        _vidmemRestoreLow = NV_FALSE;
         if (status == NV_OK)
             status = _vidmemRestoreCommit(pGpu, pMemDesc, pRefs, numRefs);
         (void)_vidmemEvictSetChannels(pGpu, pChannels, NV_FALSE);
@@ -2546,7 +2553,9 @@ _vidmemEvictPidLocked
                 }
                 else
                 {
+                    _vidmemRestoreLow = vidmemEvictPlaceLow(*ppClient);
                     status = _vidmemRestoreBegin(pGpu, pMemDesc, pRefs, numRefs, NV_FALSE);
+                    _vidmemRestoreLow = NV_FALSE;
                     if ((status == NV_OK) && _vidmemEvictHasCompositor(pRefs, numRefs))
                         bPending = NV_TRUE;
                     else if (status == NV_OK)
@@ -3708,6 +3717,13 @@ vidmemEvictWantBorn(OBJGPU *pGpu, RmClient *pRmClient, NV_MEMORY_ALLOCATION_PARA
         return freeBytes >= pAllocData->size + (64ULL << 20);
     }
     return blockFree >= pAllocData->size + (128ULL << 20);
+}
+
+// See vepPlaceLow(): which side of vidmem a new allocation of this client goes to.
+NvBool
+vidmemEvictPlaceLow(RmClient *pRmClient)
+{
+    return (pRmClient != NULL) && vepPlaceLow(pRmClient->ProcID, pRmClient->name);
 }
 
 // See vepNoteContig(): vidmemConstruct() tells of every contiguous allocation it is asked for.
@@ -5040,6 +5056,10 @@ _vidmemEvictStatus(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
         EVICT_PRINTF("bounces: %u moves undone by the policy within %u s, %llu MB copied for nothing (per process: flags)\n",
                      bounces, VIDMEM_EVICT_BOUNCE_SEC, bounceBytes >> 20);
     }
+    EVICT_PRINTF("sides: %s; %s\n", _vidmemPlaceSides ? "on" : "off",
+                 !vepGameSideNow() ? "no game holds vidmem now, everybody's new memory is placed from the top" :
+                 _vidmemPlaceSides ? "a game holds vidmem, the others' new memory is placed from the bottom" :
+                                     "a game holds vidmem");
     EVICT_PRINTF("%-8s %-16s %7s %7s %8s %7s %7s %-7s %s\n",
                  "pid", "name", "vram_mb", "ram_mb", "evict_mb", "idle_s", "samples", "window", "flags");
 
@@ -5106,7 +5126,13 @@ vidmemEvictProcess
         return status;
 
     // 12: move inside vidmem (problem #16), mode 3 of _vidmemEvictPidLocked().
-    if (mode == 17)
+    if (mode == 18)
+    {
+        _vidmemPlaceSides = (arg != 0);
+        EVICT_PRINTF("while a game runs the others' new memory is placed from the %s of vidmem\n",
+                     _vidmemPlaceSides ? "bottom, the game's from the top" : "top, as the game's");
+    }
+    else if (mode == 17)
     {
         _vidmemCompactBig = (arg != 0);
         if (_vidmemCompactBig)

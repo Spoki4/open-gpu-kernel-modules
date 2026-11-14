@@ -610,8 +610,10 @@ NvBool vidmemPmaTopDown(PMA *pPma);
 // Local patch: allocations without an address range get the range above the
 // vidmem user reserve block unless the caller is exempt from the reserve
 // (vidmemUserReservePmaRange()); without the reserve, non-contiguous ones go
-// top-down (vidmemPmaTopDown()). Works on a copy of the options so callers
-// that reuse theirs are not affected.
+// top-down (vidmemPmaTopDown()), unless the caller asked for the bottom
+// (PMA_ALLOCATE_LOCAL_BOTTOM_UP: the desktop's memory while a game runs).
+// Works on a copy of the options so callers that reuse theirs are not
+// affected.
 //
 NV_STATUS
 pmaAllocatePages
@@ -626,25 +628,35 @@ pmaAllocatePages
     PMA_ALLOCATION_OPTIONS options;
     NvU64                  physBegin, physEnd;
     NV_STATUS              status;
+    NvBool                 bLow;
 
-    if ((pPma == NULL) || (allocationOptions == NULL) || pPma->bNuma ||
-        (allocationOptions->flags & PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE))
+    if ((pPma == NULL) || (allocationOptions == NULL))
+    {
+        return _pmaAllocatePagesImpl(pPma, allocationCount, pageSize, allocationOptions, pPages);
+    }
+    bLow = !!(allocationOptions->flags & PMA_ALLOCATE_LOCAL_BOTTOM_UP);
+    if (!bLow && (pPma->bNuma || (allocationOptions->flags & PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE)))
     {
         return _pmaAllocatePagesImpl(pPma, allocationCount, pageSize, allocationOptions, pPages);
     }
 
     options = *allocationOptions;
-    if (vidmemUserReservePmaRange(pPma, pageSize, &physBegin, &physEnd))
+    options.flags &= ~PMA_ALLOCATE_LOCAL_BOTTOM_UP;
+    if (pPma->bNuma || (options.flags & PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE))
+    {
+        // Nothing to add: only the local flag is taken off.
+    }
+    else if (vidmemUserReservePmaRange(pPma, pageSize, &physBegin, &physEnd))
     {
         options.flags    |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
         options.physBegin = physBegin;
         options.physEnd   = physEnd;
     }
-    else if (!(options.flags & PMA_ALLOCATE_CONTIGUOUS) && vidmemPmaTopDown(pPma))
+    else if (!bLow && !(options.flags & PMA_ALLOCATE_CONTIGUOUS) && vidmemPmaTopDown(pPma))
     {
         options.flags |= PMA_ALLOCATE_REVERSE_ALLOC;
     }
-    else
+    else if (!bLow)
     {
         return _pmaAllocatePagesImpl(pPma, allocationCount, pageSize, allocationOptions, pPages);
     }

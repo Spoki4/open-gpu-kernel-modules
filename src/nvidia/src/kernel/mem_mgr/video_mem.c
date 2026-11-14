@@ -193,6 +193,9 @@ static NvBool _vidmemLastPmaContig;
 static NvU64  _vidmemLastPmaBytes;
 NvU64 vidmemEvictBackgroundCushion(RmClient *pRmClient);
 void vidmemEvictNoteContig(NvU64 size);
+NvBool vidmemEvictPlaceLow(RmClient *pRmClient);
+// Whether the allocation vidmemConstruct() is making goes to the bottom of vidmem (vepPlaceLow()).
+static NvBool _vidmemPmaLow;
 void vidmemEvictKeepFgHeadroom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size);
 NvU64 vidmemEvictReclaimableFor(RmClient *pRmClient);
 NV_STATUS vidmemEvictBornAllocation(OBJGPU *pGpu, Memory *pMemory);
@@ -841,6 +844,16 @@ _vidmemPmaAllocate
         allocOptions.flags |= PMA_ALLOCATE_REVERSE_ALLOC;
     }
 
+    //
+    // Local patch: while a game runs, the others' memory is placed from the
+    // bottom, away from the game's blocks (vepPlaceLow(); the top-down rule
+    // of pmaAllocatePages() is taken off for it).
+    //
+    if (_vidmemPmaLow && !bExempt && !bContig && !(allocOptions.flags & PMA_ALLOCATE_REVERSE_ALLOC))
+    {
+        allocOptions.flags |= PMA_ALLOCATE_LOCAL_BOTTOM_UP;
+    }
+
     // Fixed address allocations.
     if (pAllocData->flags & NVOS32_ALLOC_FLAGS_FIXED_ADDRESS_ALLOCATE)
     {
@@ -982,6 +995,9 @@ retry_alloc:
             {
                 bContig = NV_FALSE;
                 allocOptions.flags &= ~PMA_ALLOCATE_CONTIGUOUS;
+                // Local patch: its side of vidmem, as a non-contiguous one from the start.
+                if (_vidmemPmaLow && !bExempt && !(allocOptions.flags & PMA_ALLOCATE_REVERSE_ALLOC))
+                    allocOptions.flags |= PMA_ALLOCATE_LOCAL_BOTTOM_UP;
                 NV_PRINTF(LEVEL_INFO,
                           "pmaAllocatePages failed -- retrying as noncontiguous\n");
                 goto retry_alloc;
@@ -1437,6 +1453,7 @@ vidmemConstruct_IMPL
             goto done;
 
         pAllocRequest->pGpu = pGpu;
+        _vidmemPmaLow = vidmemEvictPlaceLow(pRmClient);
         rmStatus = _vidmemPmaAllocate(vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE), pAllocRequest,
                                       bReserveBound, bExempt, bBornEvicted);
         //
@@ -1468,6 +1485,7 @@ vidmemConstruct_IMPL
             rmStatus = _vidmemPmaAllocate(vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE), pAllocRequest,
                                           bReserveBound, bExempt, bBornEvicted);
         }
+        _vidmemPmaLow = NV_FALSE;
         if (NV_OK != rmStatus)
             goto done;
 

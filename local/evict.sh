@@ -25,6 +25,7 @@
 #   sudo ./evict.sh compactfg on|off            # background compaction also moves the memory of the
 #                                               # window in focus, 32 MB a step (default on)
 #   sudo ./evict.sh compactbig on|off           # background compaction moves allocations of up to 256 MB
+#   sudo ./evict.sh placesides on|off           # while a game runs the others' new memory goes to the bottom of vidmem
 #                                               # (96 MB of the window in focus) instead of 32 MB: a
 #                                               # game's blocks no longer stand in its way (default on)
 #   sudo ./evict.sh hot     on|off|momc         # access counters: evicted allocations in use
@@ -35,7 +36,7 @@
 set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "evict.sh: run with sudo" >&2; exit 1; }
-usage() { echo "usage: sudo $0 status | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows|moveshared|fgown|compactfg|compactbig on|off | quiesce 0..4 | compact MB | trace-lock US" >&2; exit 2; }
+usage() { echo "usage: sudo $0 status | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows|moveshared|fgown|compactfg|compactbig|placesides on|off | quiesce 0..4 | compact MB | trace-lock US" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 
 mode=$1
@@ -48,7 +49,7 @@ case $mode in
         [[ $# -eq 2 ]] || usage
         case $2 in on|1) cmd="hot 1" ;; off|0) cmd="hot 0" ;; momc|2) cmd="hot 2" ;; *) usage ;; esac
         ;;
-    auto|trace|windows|moveshared|fgown|compactfg|compactbig)
+    auto|trace|windows|moveshared|fgown|compactfg|compactbig|placesides)
         [[ $# -eq 2 ]] || usage
         case $2 in
             on|1) cmd="$mode 1" ;;

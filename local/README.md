@@ -46,7 +46,11 @@ These patches do the same inside the driver.
   while a game is in focus). The run it gathers: three quarters of the free
   memory, 1 GB at least; while a game is in focus only three times the
   biggest contiguous buffer asked for in the last half hour (256 MB at
-  least), every step being a pause of the game.
+  least), every step being a pause of the game. And less is left to compact:
+  while a game runs (started by a launcher, or with a fullscreen window), the
+  others' new memory is placed from the bottom of vidmem and the game's from
+  the top, so the small buffers a browser allocates and frees do not end up
+  as holes between the game's blocks.
 - **Does not keep a fixed reserve** for the compositor any more (the first
   approach, `RmVidmemUserReserveMB`, still there and off by default).
 - Fixes found on the way in NVIDIA's own code: a channel group leaked on GSP
@@ -99,6 +103,7 @@ sudo ./local/evict.sh auto on|off|hints  # the automatic policy (hints, the defa
 sudo ./local/evict.sh compact MB         # background compaction keeps a free run of MB or 3/4 of the free memory (0: off)
 sudo ./local/evict.sh compactfg on|off   # ... also out of the focused window's memory
 sudo ./local/evict.sh compactbig on|off  # ... in allocations of up to 256 MB (96 MB of the focus); off: 32 MB
+sudo ./local/evict.sh placesides on|off  # while a game runs the others' new memory goes to the bottom of vidmem; off: to the top, as the game's
 sudo ./local/evict.sh moveshared on|off  # window buffers shared with the compositor may move inside vidmem
 sudo ./local/evict.sh fgown on|off       # the focused app pays for its allocation with its own older memory
 ```
@@ -232,6 +237,7 @@ cd local/tests
 ./compact-test.sh [120 4096 fg]  # background compaction lengthens the free run (fg: out of the focused window too;
                                  # CHUNK_MB=64|128: with blocks the size a game holds)
 ./fgown-test.sh                # the focused app gets an allocation nobody can make room for
+./sides-test.sh [90]           # next to a game the others' memory is placed at the other end of vidmem: compaction does not move the game
 ./bounce-test.sh               # an app covered by the window just focused gives its headroom and stays out (no out-back-out)
 ./fragchurn.sh                 # fragments vidmem like a long session
 ./momc-probe.sh                # a probe: do the GPU's access counters report accesses to vidmem?
@@ -332,7 +338,14 @@ Not verified yet: `vm/fulltest.sh` on the 3080 Ti (its `desktop` and `game`
 stages have never run), moving buffers shared with the compositor under a
 real Plasma session, the access-counter probe on Ampere. The fix for problem
 #17 has run in the simulator only (`sim/scenarios/compact-game.scn`); on a
-GPU the stages `compactbig` and `compactbigfg` of `fulltest.sh` are for it.
+GPU the stages `compactbig` and `compactbigfg` of `fulltest.sh` are for it. So
+have what followed on 2026-11-14: the run compaction wants next to a game,
+the window charged for whole allocations, and the sides
+(`sim/scenarios/place-sides.scn`; stage `sides`, a test written and never
+run). Sides change where the desktop's memory is placed while a game runs:
+the compositor's contiguous buffers then share the bottom of vidmem with it
+(`nvtest` comproom and scanout-churn are the checks; `evict.sh placesides
+off` is the way back).
 
 ## Numbers cited in the code
 
