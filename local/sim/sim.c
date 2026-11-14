@@ -109,10 +109,16 @@ static NvU32  gCmp[16];
 static int    gNumCmp;
 static double gCmpLastMin[16];
 
+// The map (-map FILE), below.
+static FILE  *gMapF;
+static double gMapSkewS;          // a compaction step's moves end this long after its start
+static void mapSync(int mode, NvU32 why);
+static void mapMove(int mode, NvU32 why, NvU32 pid, const char *comm, NvU64 kb, NvU32 allocs, NvU32 failed, double ms);
+
 static const char *whyName(NvU32 why)
 {
     static const char *n[] = { "manual", "auto", "pressure", "alloc", "restore", "room", "idle-back", "hot",
-                               "access", "born" };
+                               "access", "born", "compact" };
     return (why < NV_ARRAY_ELEMENTS(n)) ? n[why] : "?";
 }
 
@@ -356,6 +362,156 @@ static NvU64 layLongest(NvU64 *pFree, NvU64 *pStart)
     return best;
 }
 
+// --- the map (-map FILE) -----------------------------------------------------
+//
+// The layout as the driver's trace tells it (nvidia_vidmem:vidmem_ext,
+// vidmem_move and vidmem_hint, kernel-open/nvidia/nv-vidmem-trace.h), so that
+// `local/trace/nvtrace.py map` draws a scenario the way it draws a recording:
+// what changed since the last call, per process, in 64 KB frames (32 a chunk).
+//
+static NvU32 *gMapPrev;           // who held each chunk at the last call (0 free, else the pid)
+static NvU64  gMapChunks;
+#define MAP_RUNS 64
+
+static void mapLine(const char *op, int mode, NvU32 why, NvU32 pid, const char *comm, const NvU32 *runs, NvU32 n)
+{
+    static const char *modes[] = { "-", "evict", "restore", "move" };
+    NvU32 i;
+
+    fprintf(gMapF, " sim-1 [000] ..... %.6f: vidmem_ext: op=%s mode=%s why=%s pid=%u comm=%s n=%u runs={",
+            gNowS + gMapSkewS - T0, op, modes[mode & 3], (why == 255) ? "-" : whyName(why), pid, comm, n);
+    for (i = 0; i < 2 * n; i++)
+        fprintf(gMapF, "%s0x%x", i ? "," : "", runs[i]);
+    fprintf(gMapF, "}\n");
+}
+
+// The chunks where want[c] == pid and (other == NULL or other[c] != pid), as runs.
+static void mapRuns(const char *op, int mode, NvU32 why, NvU32 pid, const NvU32 *want, const NvU32 *other)
+{
+    Proc       *p = findProc(pid);
+    const char *comm = (p != NULL) ? p->name : "-";
+    NvU32       runs[2 * MAP_RUNS], n = 0;
+    NvU64       c, start = 0, len = 0;
+
+    for (c = 0; c <= gMapChunks; c++)
+    {
+        if ((c < gMapChunks) && (want[c] == pid) && ((other == NULL) || (other[c] != pid)))
+        {
+            if (len++ == 0)
+                start = c;
+            continue;
+        }
+        if (len == 0)
+            continue;
+        if (n == MAP_RUNS)
+        {
+            mapLine(op, mode, why, pid, comm, runs, n);
+            n = 0;
+        }
+        runs[2 * n]     = (NvU32)(start * 32);
+        runs[2 * n + 1] = (NvU32)(len * 32);
+        n++;
+        len = 0;
+    }
+    if (n != 0)
+        mapLine(op, mode, why, pid, comm, runs, n);
+}
+
+static void mapSync(int mode, NvU32 why)
+{
+    NvU32 *idPid, *now, *seen;
+    NvU32  runs[2], nseen = 0, s;
+    NvU64  c;
+    int    i, k, snap;
+
+    if ((gMapF == NULL) || !gLayout)
+        return;
+    layEnsure();
+    idPid = calloc(gNextId + 1, sizeof(*idPid));
+    now   = calloc(gChunks + 1, sizeof(*now));
+    seen  = calloc(2 * gChunks + 2, sizeof(*seen));
+    for (i = 0; i < gNumProcs; i++)
+        for (k = 0; k < gProcs[i].na; k++)
+            idPid[gProcs[i].a[k].id] = gProcs[i].pid;
+    for (c = 0; c < gChunks; c++)
+        now[c] = (gChunk[c] == 0) ? 0 : (idPid[gChunk[c]] ? idPid[gChunk[c]] : 1);
+
+    snap = (gChunks != gMapChunks);
+    if (snap)
+    {
+        gMapPrev   = realloc(gMapPrev, (gChunks + 1) * sizeof(*gMapPrev));
+        gMapChunks = gChunks;
+        runs[0] = 0;
+        runs[1] = (NvU32)(gChunks * 32);
+        mapLine("snap", 0, 255, 0, "-", runs, 1);
+    }
+    // Who is in it (a snapshot) or changed hands; each pid once.
+    for (c = 0; c < gChunks; c++)
+    {
+        NvU32 pids[2] = { now[c], snap ? 0 : gMapPrev[c] };
+
+        if (!snap && (pids[0] == pids[1]))
+            continue;
+        for (k = 0; k < 2; k++)
+        {
+            for (s = 0; (s < nseen) && (seen[s] != pids[k]); s++)
+                ;
+            if ((s == nseen) && (pids[k] != 0))
+                seen[nseen++] = pids[k];
+        }
+    }
+    for (s = 0; s < nseen; s++)
+    {
+        if (snap)
+        {
+            mapRuns("have", 0, 255, seen[s], now, NULL);
+            continue;
+        }
+        mapRuns("free", mode, why, seen[s], gMapPrev, now);
+    }
+    for (s = 0; (s < nseen) && !snap; s++)
+        mapRuns("alloc", mode, why, seen[s], now, gMapPrev);
+    if (snap)
+    {
+        runs[0] = runs[1] = 0;
+        for (c = 0; c < gChunks; c++)
+            runs[0] += (now[c] != 0) * 32;
+        mapLine("snapend", 0, 255, 0, "-", runs, 1);
+    }
+    memcpy(gMapPrev, now, gChunks * sizeof(*now));
+    free(idPid);
+    free(now);
+    free(seen);
+}
+
+static void mapMove(int mode, NvU32 why, NvU32 pid, const char *comm, NvU64 kb, NvU32 allocs, NvU32 failed, double ms)
+{
+    if ((gMapF == NULL) || ((kb == 0) && (failed == 0)))
+        return;
+    mapSync(mode, why);
+    fprintf(gMapF, " sim-1 [000] ..... %.6f: vidmem_move: op=%s pid=%u comm=%s why=%s kb=%llu allocs=%u failed=%u "
+            "shared=0 channels=1 total_us=%.0f quiesce_us=0 sysalloc_us=0 copy_us=%.0f remap_us=0 pma_us=0 sysfree_us=0\n",
+            gNowS + gMapSkewS - T0, (mode == 1) ? "evict" : ((mode == 2) ? "restore" : "move"), pid, comm,
+            whyName(why), (unsigned long long)kb, allocs, failed, ms * 1000.0, ms * 1000.0);
+}
+
+static void mapWindow(NvU64 lo, NvU64 hi, NvU64 keepLo, NvU64 keepHi)
+{
+    NvU32 w[4] = { (NvU32)(lo * 32), (NvU32)((hi - lo) * 32), (NvU32)(keepLo * 32), (NvU32)((keepHi - keepLo) * 32) };
+
+    if (gMapF != NULL)
+        mapLine("window", 3, 10, 0, "-", w, (keepHi > keepLo) ? 2 : 1);
+}
+
+static void mapHint(Proc *p, NvU32 oldState, NvU32 newState)
+{
+    static const char *h[] = { "-", "h", "v", "f" };
+
+    if ((gMapF != NULL) && (oldState != newState))
+        fprintf(gMapF, " sim-1 [000] ..... %.6f: vidmem_hint: pid=%u comm=%s old=%s new=%s\n", gNowS - T0, p->pid,
+                p->name, h[oldState & 3], h[newState & 3]);
+}
+
 static void accumulate(double toS);
 
 // --- the platform (vidmem_evict_policy.h) ---------------------------------
@@ -516,6 +672,7 @@ NV_STATUS vepPlatMovePid(OBJGPU *pGpu, NvU32 mode, NvU32 pid, NvU64 *pMovedBytes
                failed ? " (some failed)" : "", whyName(_vidmemEvictWhy), gCtxWhat,
                gCtxProc ? " of " : "", gCtxProc ? gCtxProc->name : "", ms,
                (unsigned long long)(freeKB() >> 10));
+    mapMove((int)mode, _vidmemEvictWhy, p->pid, p->name, kb, n, failed, ms);
     if (pMovedBytes != NULL)
         *pMovedBytes = kb << 10;
     return (failed != 0) ? NV_ERR_NO_MEMORY : NV_OK;
@@ -641,6 +798,8 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
     }
     for (c = lo; c < hi; c++)
         inWin[gChunk[c]] = 1;
+    mapSync(0, 255);
+    mapWindow(lo, hi, keepLo, keepHi);
     for (i = 0; i < gNumProcs; i++)
     {
         Proc  *p = &gProcs[i];
@@ -684,6 +843,9 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
         // The owner is paused for the copy of its own memory.
         ms = moveMs(kb, n);
         stepMs += ms;
+        gMapSkewS = stepMs / 1000.0;
+        mapMove(3, 10, p->pid, p->name, kb, n, 0, ms);
+        gMapSkewS = 0;
         p->compactMaxMs = NV_MAX(p->compactMaxMs, ms);
         p->compactKB += kb;
         if (gVerbose)
@@ -1210,6 +1372,7 @@ static void runScenario(FILE *f)
         char *s = line, *c = strchr(line, '#');
 
         gLine++;
+        mapSync(0, 255);        // what the line before changed (allocations, frees)
         if (c != NULL)
             *c = '\0';
         while ((n < 16) && ((s = strtok(n ? NULL : s, " \t\r\n")) != NULL))
@@ -1276,6 +1439,7 @@ static void runScenario(FILE *f)
             }
             if (VE_HINT_STATE(h) != VE_HINT_STATE(p->hint))
                 p->hintSwitches++;
+            mapHint(p, VE_HINT_STATE(p->hint), VE_HINT_STATE(h));
             p->hint = h;
             gHintsActive = 1;
         }
@@ -1454,6 +1618,15 @@ int main(int argc, char **argv)
                 gCmp[gNumCmp++] = (NvU32)strtoul(t, NULL, 10);
             }
         }
+        else if ((strcmp(argv[i], "-map") == 0) && (i + 1 < argc - 1))
+        {
+            gMapF = fopen(argv[++i], "w");
+            if (gMapF == NULL)
+            {
+                perror(argv[i]);
+                return 2;
+            }
+        }
         else if ((strcmp(argv[i], "-set") == 0) && (i + 1 < argc - 1))
         {
             char *kv = argv[++i], *eq = strchr(kv, '=');
@@ -1473,7 +1646,7 @@ int main(int argc, char **argv)
     }
     if (argc < 2)
     {
-        fprintf(stderr, "usage: sim [-v] [-cmp PID[,PID]] [-set KNOB=VALUE]... SCENARIO\n");
+        fprintf(stderr, "usage: sim [-v] [-cmp PID[,PID]] [-set KNOB=VALUE]... [-map FILE] SCENARIO\n");
         return 2;
     }
     gScenario = argv[argc - 1];
@@ -1484,6 +1657,13 @@ int main(int argc, char **argv)
         return 2;
     }
     runScenario(f);
+    mapSync(0, 255);
+    // A snapshot at the end, as a recording has one: the reader checks the changes against it.
+    gNowS += 0.001;
+    gMapChunks = 0;
+    mapSync(0, 255);
+    if (gMapF != NULL)
+        fclose(gMapF);
     summary();
     return gFailures ? 1 : 0;
 }

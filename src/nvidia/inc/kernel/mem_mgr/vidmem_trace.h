@@ -57,6 +57,23 @@ NvU64 portTimeGetUptimeNanosecondsHighPrecision(void);
 NvBool osVidmemTraceOn(NvU32 type);
 void   osVidmemTrace(NvU32 type, NvU32 pid, const NvU64 *pArgs);
 
+//
+// The map of vidmem (kernel-open/nvidia/nv-vidmem-trace.h, vidmem_ext): which
+// frames changed hands, as up to VMT_EXT_RUNS runs of (start, count) in 64 KB
+// frames from the base of the PMA region.
+//
+#define VMT_EXT_FREE    0
+#define VMT_EXT_ALLOC   1
+#define VMT_EXT_SNAP    2   // a snapshot begins: one run, (the region's base as a frame number, its frames)
+#define VMT_EXT_HAVE    3   // snapshot: frames of one owner
+#define VMT_EXT_SNAPEND 4
+#define VMT_EXT_WINDOW  5   // a compaction step: the window it clears, then the free run it keeps (if any)
+#define VMT_EXT_RUNS    64
+#define VMT_WHY_NONE    255 // not a move
+
+NvBool osVidmemTraceExtOn(void);
+void   osVidmemTraceExt(NvU32 op, NvU32 mode, NvU32 why, NvU32 pid, const NvU32 *pRuns, NvU32 numRuns);
+
 // Lock waits/holds shorter than this are not traced (evict.sh trace-lock US).
 extern NvU64 vidmemTraceLockNs;
 

@@ -1,0 +1,563 @@
+<!doctype html>
+<!-- The map of vidmem over time: written by `nvtrace.py map` (the data goes
+     into the script tag below; nothing is loaded from anywhere). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vidmem map</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+  --bg: #f6f6f3; --panel: #ffffff; --ink: #1c1d1f; --dim: #6b6f76; --line: #d9d9d4;
+  --free: #e9e9e4; --drv: #9aa0a6; --src: #d93025; --dst: #0b8043; --win: #b06000; --keep: #1a73e8;
+  --cursor: #1c1d1f;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17181a; --panel: #202124; --ink: #e8eaed; --dim: #9aa0a6; --line: #3c4043;
+    --free: #2a2b2e; --drv: #5f6368; --src: #f28b82; --dst: #81c995; --win: #fdd663; --keep: #8ab4f8;
+    --cursor: #e8eaed;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 10px 16px;
+  border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+h1 { font-size: 15px; margin: 0; font-weight: 600; }
+#clock { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 15em; }
+button, select { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:hover { border-color: var(--dim); }
+label.chk { display: inline-flex; gap: 4px; align-items: center; color: var(--dim); }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 12px; padding: 12px 16px; }
+@media (max-width: 1000px) { main { grid-template-columns: minmax(0, 1fr); } }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim);
+  margin: 0 0 6px; font-weight: 600; }
+#tl { width: 100%; height: 150px; display: block; cursor: crosshair; }
+#map { width: 100%; display: block; }
+#mapwrap { position: relative; }
+#tip { position: fixed; display: none; pointer-events: none; background: var(--panel); border: 1px solid var(--dim);
+  border-radius: 6px; padding: 6px 8px; font-size: 12px; z-index: 10; max-width: 320px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.25); white-space: pre-line; }
+table { border-collapse: collapse; width: 100%; }
+td, th { padding: 2px 4px; text-align: left; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr.proc { cursor: pointer; }
+tr.proc:hover td { background: var(--bg); }
+tr.off td { opacity: .35; }
+.scroll { max-height: 260px; overflow: auto; }
+.ev { padding: 2px 4px; border-radius: 4px; cursor: pointer; display: flex; gap: 8px; }
+.ev:hover { background: var(--bg); }
+.ev.cur { background: var(--bg); outline: 1px solid var(--line); }
+.ev time { color: var(--dim); font-variant-numeric: tabular-nums; flex: none; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--dim); margin-top: 6px; font-size: 12px; }
+.warn { color: var(--src); }
+.dim { color: var(--dim); }
+kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font: inherit; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">vidmem map</h1>
+  <span id="clock"></span>
+  <span>
+    <button id="prev" title="previous move (left arrow)">&#9664; move</button>
+    <button id="play" title="play / pause (space)">&#9654; play</button>
+    <button id="next" title="next move (right arrow)">move &#9654;</button>
+    <select id="speed" title="playback speed">
+      <option value="0.1">0.1x</option><option value="1" selected>1x</option><option value="5">5x</option>
+      <option value="30">30x</option><option value="120">120x</option>
+    </select>
+  </span>
+  <span title="which moves the arrows stop at">
+    <label class="chk"><input type="checkbox" id="f1" checked>to sysmem</label>
+    <label class="chk"><input type="checkbox" id="f2" checked>back</label>
+    <label class="chk"><input type="checkbox" id="f3" checked>inside vidmem</label>
+  </span>
+  <span class="dim"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> moves, <kbd>space</kbd> play, wheel on the timeline zooms, drag scrubs</span>
+</header>
+<main>
+  <div>
+    <div class="card" style="margin-bottom:12px">
+      <h2>Timeline</h2>
+      <canvas id="tl"></canvas>
+      <div class="legend" id="tllegend"></div>
+    </div>
+    <div class="card">
+      <h2 id="maptitle">Vidmem</h2>
+      <div id="mapwrap"><canvas id="map"></canvas></div>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--free);border:1px solid var(--line)"></span> free</span>
+        <span><span class="sw" style="background:var(--drv)"></span> the driver itself / not known</span>
+        <span><span class="sw" style="border:2px solid var(--src)"></span> left this place in the move</span>
+        <span><span class="sw" style="border:2px solid var(--dst)"></span> arrived here</span>
+        <span><span class="sw" style="border:2px solid var(--win)"></span> window being cleared</span>
+        <span><span class="sw" style="border:2px dashed var(--keep)"></span> free run kept</span>
+      </div>
+    </div>
+  </div>
+  <div>
+    <div class="card" style="margin-bottom:12px">
+      <h2>At this moment</h2>
+      <div id="now"></div>
+    </div>
+    <div class="card" style="margin-bottom:12px">
+      <h2>The move</h2>
+      <div id="step" class="dim">none at the cursor</div>
+    </div>
+    <div class="card" style="margin-bottom:12px">
+      <h2>Processes <span class="dim" style="text-transform:none;letter-spacing:0">(click: show only this one)</span></h2>
+      <div class="scroll"><table id="procs"></table></div>
+    </div>
+    <div class="card">
+      <h2>Events</h2>
+      <div class="scroll" id="events"></div>
+    </div>
+  </div>
+</main>
+<div id="tip"></div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+"use strict";
+const D = JSON.parse(document.getElementById("data").textContent);
+const F = D.frames, CF = 32, NCH = Math.ceil(F / CF), FMB = D.frame_kb / 1024;
+const E = D.ev, NE = E.t.length;
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const PALETTE = ["#4285f4", "#ea4335", "#fbbc04", "#34a853", "#ab47bc", "#00acc1", "#ff7043", "#9e9d24",
+                 "#5c6bc0", "#f06292", "#26a69a", "#8d6e63", "#7cb342", "#ffa000", "#ec407a", "#29b6f6"];
+const WHY = D.why, OPS = ["", "to sysmem", "back to vidmem", "inside vidmem"];
+
+document.title = D.title + " - vidmem map";
+$("title").textContent = D.title;
+$("maptitle").textContent = `Vidmem, ${(F * FMB / 1024).toFixed(1)} GB: one cell is 2 MB, address 0 at the top left`;
+
+// ---- processes: colours by how much each ever held ----
+const P = D.procs;   // [{pid, comm}], index 0 free, 1 the driver
+(function () {
+  const order = P.map((p, i) => i).filter(i => i > 1).sort((a, b) => P[b].peak - P[a].peak);
+  order.forEach((i, k) => { P[i].color = PALETTE[k % PALETTE.length]; });
+})();
+const pname = i => i === 0 ? "free" : i === 1 ? "driver" : `${P[i].comm} (${P[i].pid})`;
+const pcolor = i => i === 0 ? css("--free") : i === 1 ? css("--drv") : P[i].color;
+let only = 0;        // show only this process (0: all)
+
+// ---- state and seeking ----
+const state = new Uint16Array(F);
+let pos = 0;         // events applied
+const KEY = Math.max(2048, Math.ceil(NE / 48));
+const keys = [new Uint16Array(F)];
+function apply(i) {
+  const k = E.k[i], r = E.r[i];
+  if (k === 2) {                       // a snapshot: the whole map
+    state.fill(0);
+    for (let j = 0; j < r.length; j += 3) state.fill(r[j], r[j + 1], r[j + 1] + r[j + 2]);
+  } else if (k === 0 || k === 1) {
+    const v = k ? E.p[i] : 0;
+    for (let j = 0; j < r.length; j += 2) state.fill(v, r[j], r[j] + r[j + 1]);
+  }
+}
+function seekIndex(n) {
+  if (n < pos || n - pos > KEY) {
+    let kf = Math.min(Math.floor(n / KEY), keys.length - 1);
+    if (!(n < pos) && kf * KEY <= pos) kf = -1;
+    if (kf >= 0) { state.set(keys[kf]); pos = kf * KEY; }
+  }
+  while (pos < n) {
+    apply(pos++);
+    if (pos % KEY === 0 && pos / KEY === keys.length) keys.push(state.slice());
+  }
+}
+function upper(arr, t) {               // first index with arr[i] > t
+  let lo = 0, hi = arr.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] <= t) lo = m + 1; else hi = m; }
+  return lo;
+}
+const T0 = D.t_first, T1 = Math.max(D.t_last, T0 + 1);
+let T = T0, v0 = T0, v1 = T1;         // the cursor and the timeline's view (ms)
+
+// ---- steps: moves that follow each other within a quarter of a second ----
+const M = D.moves;   // [t_end, dur_ms, proc, op, why, kb, allocs, failed]
+let steps = [];
+function buildSteps() {
+  const want = [0, $("f1").checked, $("f2").checked, $("f3").checked];
+  steps = [];
+  for (const m of M) {
+    if (!want[m[3]]) continue;
+    const a = m[0] - m[1], last = steps[steps.length - 1];
+    if (last && a - last.t1 < 250) { last.t1 = Math.max(last.t1, m[0]); last.moves.push(m); }
+    else steps.push({ t0: a, t1: m[0], moves: [m] });
+  }
+  for (const s of steps) {
+    s.kb = [0, 0, 0, 0];
+    for (const m of s.moves) s.kb[m[3]] += m[5];
+    s.op = s.kb.indexOf(Math.max(...s.kb));
+  }
+}
+function stepAt(t) {                   // the step the cursor is in or has just passed
+  let lo = 0, hi = steps.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (steps[m].t0 <= t) lo = m + 1; else hi = m; }
+  const s = steps[lo - 1];
+  return s && t <= s.t1 + 500 ? lo - 1 : -1;
+}
+
+// ---- what the step at the cursor moved: marks per frame (1 left, 2 arrived) ----
+const mark = new Uint8Array(F);
+let markStep = -2, win = null;
+function buildMarks(si) {
+  if (si === markStep) return;
+  markStep = si;
+  mark.fill(0);
+  win = null;
+  if (si < 0) return;
+  const s = steps[si];
+  const a = upper(E.t, s.t0 - 2), b = upper(E.t, s.t1 + 0.5);
+  for (let i = a; i < b; i++) {
+    const k = E.k[i], r = E.r[i];
+    if (k === 5) win = r;
+    if ((k !== 0 && k !== 1) || E.m[i] === 0) continue;
+    for (let j = 0; j < r.length; j += 2) {
+      const e = r[j] + r[j + 1];
+      for (let f = r[j]; f < e; f++) mark[f] |= k ? 2 : 1;
+    }
+  }
+  // The window of a compaction step is traced just before its first move.
+  for (let i = a - 1; i >= 0 && !win && E.t[i] > s.t0 - 300; i--) if (E.k[i] === 5) win = E.r[i];
+}
+
+// ---- formats ----
+function clock(t) {
+  const rel = (t - T0) / 1000;
+  const m = Math.floor(rel / 60), sec = (rel - m * 60).toFixed(3).padStart(6, "0");
+  let s = `+${m}:${sec}`;
+  if (D.wall0 != null) {
+    const d = new Date(D.wall0 * 1000 + t);
+    s = d.toLocaleTimeString("en-GB") + "." + String(d.getMilliseconds()).padStart(3, "0") + "  " + s;
+  }
+  return s;
+}
+const mb = kb => kb >= 10240 ? (kb / 1024).toFixed(0) : (kb / 1024).toFixed(1);
+const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+// ---- the map ----
+const mapC = $("map"), mctx = mapC.getContext("2d");
+let COLS = 128, cw = 8, ch = 10, LEFT = 52, dpr = 1;
+function layoutMap() {
+  const w = $("mapwrap").clientWidth;
+  COLS = NCH > 2048 ? 128 : 64;
+  dpr = window.devicePixelRatio || 1;
+  cw = Math.max(3, Math.floor((w - LEFT) / COLS));
+  const rows = Math.ceil(NCH / COLS);
+  ch = Math.max(cw, Math.min(18, Math.floor(620 / rows)));
+  mapC.style.height = rows * ch + 4 + "px";
+  mapC.width = Math.round(w * dpr);
+  mapC.height = Math.round((rows * ch + 4) * dpr);
+}
+function drawMap() {
+  const g = mctx, rows = Math.ceil(NCH / COLS), SEG = 4, sf = CF / SEG, sw = cw / SEG;
+  const free = css("--free"), bg = css("--panel"), dim = css("--dim");
+  const colors = P.map((p, i) => pcolor(i));
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.fillStyle = bg;
+  g.fillRect(0, 0, mapC.width, mapC.height);
+  g.font = "10px system-ui, sans-serif";
+  g.textBaseline = "middle";
+  for (let r = 0; r < rows; r++) {
+    if (r % (rows > 60 ? 4 : 2) === 0) {
+      g.fillStyle = dim;
+      const gbs = r * COLS * CF * FMB / 1024;
+      g.fillText(gbs.toFixed(2) + " GB", 0, r * ch + ch / 2 + 2);
+    }
+  }
+  const cnt = new Int32Array(P.length);
+  for (let c = 0; c < NCH; c++) {
+    const x = LEFT + (c % COLS) * cw, y = 2 + Math.floor(c / COLS) * ch;
+    for (let s = 0; s < SEG; s++) {
+      // The owner of most of these frames.
+      const f0 = c * CF + s * sf, f1 = Math.min(F, f0 + sf);
+      let best = 0, bn = 0;
+      for (let f = f0; f < f1; f++) { const o = state[f]; if (++cnt[o] > bn) { bn = cnt[o]; best = o; } }
+      for (let f = f0; f < f1; f++) cnt[state[f]] = 0;
+      g.globalAlpha = (only && best !== only && best !== 0) ? 0.18 : 1;
+      g.fillStyle = best ? colors[best] : free;
+      g.fillRect(x + s * sw, y, sw + 0.5, ch - 1);
+    }
+    g.globalAlpha = 1;
+    g.fillStyle = bg;
+    g.fillRect(x + cw - 1, y, 1, ch - 1);
+  }
+  // What the move at the cursor took away and brought.
+  if (markStep >= 0) {
+    const src = css("--src"), dst = css("--dst");
+    for (let c = 0; c < NCH; c++) {
+      let m = 0;
+      const e = Math.min(F, (c + 1) * CF);
+      for (let f = c * CF; f < e; f++) m |= mark[f];
+      if (!m) continue;
+      const x = LEFT + (c % COLS) * cw, y = 2 + Math.floor(c / COLS) * ch;
+      g.lineWidth = 2;
+      if (m & 1) {
+        g.strokeStyle = src;
+        g.strokeRect(x + 1, y + 1, cw - 3, ch - 3);
+        g.beginPath(); g.moveTo(x + 1, y + ch - 2); g.lineTo(x + cw - 2, y + 1); g.stroke();
+      }
+      if (m & 2) { g.strokeStyle = dst; g.strokeRect(x + 1, y + 1, cw - 3, ch - 3); }
+    }
+  }
+  if (win) {
+    span(win[0], win[1], css("--win"), []);
+    if (win.length >= 4) span(win[2], win[3], css("--keep"), [4, 3]);
+  }
+  function span(f0, n, color, dash) {    // an outline along the cells of frames [f0, f0 + n), row by row
+    let c0 = Math.floor(f0 / CF);
+    const c1 = Math.ceil((f0 + n) / CF);
+    g.strokeStyle = color; g.lineWidth = 2; g.setLineDash(dash);
+    while (c0 < c1) {
+      const row = Math.floor(c0 / COLS), end = Math.min(c1, (row + 1) * COLS);
+      g.strokeRect(LEFT + (c0 % COLS) * cw - 1, 2 + row * ch - 1, (end - c0) * cw + 1, ch + 1);
+      c0 = end;
+    }
+    g.setLineDash([]);
+  }
+}
+mapC.addEventListener("mousemove", ev => {
+  const r = mapC.getBoundingClientRect(), x = ev.clientX - r.left - LEFT, y = ev.clientY - r.top - 2;
+  const c = Math.floor(y / ch) * COLS + Math.floor(x / cw), tip = $("tip");
+  if (x < 0 || x >= COLS * cw || c < 0 || c >= NCH) { tip.style.display = "none"; return; }
+  const n = new Map();
+  for (let f = c * CF; f < Math.min(F, (c + 1) * CF); f++) n.set(state[f], (n.get(state[f]) || 0) + 1);
+  const addr = (D.base_frame + c * CF) * D.frame_kb * 1024;
+  let s = `${(c * CF * FMB).toFixed(0)} MB from the base (0x${addr.toString(16)})\n`;
+  for (const [o, k] of [...n].sort((a, b) => b[1] - a[1])) s += `${pname(o)}: ${(k * FMB).toFixed(2)} MB\n`;
+  let m = 0;
+  for (let f = c * CF; f < Math.min(F, (c + 1) * CF); f++) m |= mark[f];
+  if (m & 1) s += "left this place in the move\n";
+  if (m & 2) s += "arrived here in the move\n";
+  tip.textContent = s.trim();
+  tip.style.display = "block";
+  tip.style.left = Math.min(ev.clientX + 14, innerWidth - 330) + "px";
+  tip.style.top = ev.clientY + 14 + "px";
+});
+mapC.addEventListener("mouseleave", () => { $("tip").style.display = "none"; });
+
+// ---- the timeline ----
+const tlC = $("tl"), tctx = tlC.getContext("2d");
+function drawTimeline() {
+  const w = tlC.clientWidth, h = tlC.clientHeight, g = tctx;
+  if (tlC.width !== Math.round(w * dpr)) { tlC.width = Math.round(w * dpr); tlC.height = Math.round(h * dpr); }
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const X = t => (t - v0) / (v1 - v0) * w;
+  const dim = css("--dim"), line = css("--line");
+  const H1 = 62, H2 = 34, Y2 = H1 + 6, Y3 = Y2 + H2 + 6, H3 = h - Y3 - 14;
+  const total = F * FMB;
+  // In use (area) and the longest free run (line), MB of the whole.
+  g.fillStyle = line;
+  g.beginPath(); g.moveTo(0, H1);
+  let lastY = H1;
+  const U = D.used;
+  for (let i = Math.max(0, upper(U.t, v0) - 1); i < U.t.length && U.t[i] <= v1; i++) {
+    const x = Math.max(0, X(U.t[i]));
+    g.lineTo(x, lastY);
+    lastY = H1 - U.mb[i] / total * H1;
+    g.lineTo(x, lastY);
+  }
+  g.lineTo(w, lastY); g.lineTo(w, H1); g.closePath(); g.fill();
+  const FR = D.frag;
+  if (FR.t.length) {
+    g.strokeStyle = css("--keep"); g.lineWidth = 1.5; g.beginPath();
+    let first = true;
+    for (let i = Math.max(0, upper(FR.t, v0) - 1); i < FR.t.length && FR.t[i] <= v1; i++) {
+      const x = X(FR.t[i]), y = H1 - FR.longest[i] / total * H1;
+      if (first) { g.moveTo(x, y); first = false; } else g.lineTo(x, y);
+    }
+    g.stroke();
+  }
+  // Moves: a bar per step, as high as it moved (log scale up to 1 GB).
+  const colors = ["", css("--src"), css("--dst"), css("--win")];
+  for (const s of steps) {
+    if (s.t1 < v0 || s.t0 > v1) continue;
+    const kb = s.kb[1] + s.kb[2] + s.kb[3];
+    const hh = Math.max(3, Math.min(1, Math.log2(1 + kb / 1024) / 10) * H2);
+    g.fillStyle = colors[s.op];
+    g.fillRect(X(s.t0), Y2 + H2 - hh, Math.max(2, X(s.t1) - X(s.t0)), hh);
+  }
+  // The game's frames: the longest one in each stretch of time, up to 100 ms.
+  const FT = D.frametimes;
+  if (FT.t.length) {
+    g.strokeStyle = dim; g.lineWidth = 1; g.beginPath();
+    const px = Math.max(1, Math.floor((upper(FT.t, v1) - upper(FT.t, v0)) / w));
+    let first = true;
+    for (let i = upper(FT.t, v0); i < FT.t.length && FT.t[i] <= v1; i += px) {
+      let m = 0;
+      for (let j = i; j < Math.min(FT.t.length, i + px); j++) m = Math.max(m, FT.ms[j]);
+      const x = X(FT.t[i]), y = Y3 + H3 - Math.min(1, m / 100) * H3;
+      if (first) { g.moveTo(x, y); first = false; } else g.lineTo(x, y);
+    }
+    g.stroke();
+  }
+  g.fillStyle = dim; g.font = "10px system-ui, sans-serif"; g.textBaseline = "top";
+  g.fillText("in use, of " + (total / 1024).toFixed(1) + " GB", 4, 2);
+  g.fillText("moves", 4, Y2);
+  if (FT.t.length) g.fillText("frame time, up to 100 ms", 4, Y3);
+  for (const n of D.notes) {
+    if (n[1] !== "mark" || n[0] < v0 || n[0] > v1) continue;
+    g.strokeStyle = css("--src"); g.setLineDash([3, 3]); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(X(n[0]), 0); g.lineTo(X(n[0]), h - 12); g.stroke(); g.setLineDash([]);
+  }
+  // Time axis and the cursor.
+  g.textBaseline = "bottom";
+  const stepMs = [100, 500, 1000, 5000, 15000, 60000, 300000, 900000, 3600000].find(s => (v1 - v0) / s < w / 110) || 3600000;
+  for (let t = Math.ceil(v0 / stepMs) * stepMs; t < v1; t += stepMs) {
+    g.fillStyle = line; g.fillRect(X(t), h - 12, 1, 4);
+    g.fillStyle = dim; g.fillText(clock(t).split("  ")[0], X(t) + 3, h);
+  }
+  g.fillStyle = css("--cursor");
+  g.fillRect(X(T) - 0.5, 0, 1.5, h - 12);
+}
+let scrub = false;
+const tlT = ev => v0 + (ev.clientX - tlC.getBoundingClientRect().left) / tlC.clientWidth * (v1 - v0);
+tlC.addEventListener("mousedown", ev => { scrub = true; stop(); setT(tlT(ev)); });
+addEventListener("mousemove", ev => { if (scrub) setT(tlT(ev)); });
+addEventListener("mouseup", () => { scrub = false; });
+tlC.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const t = tlT(ev), k = ev.deltaY > 0 ? 1.3 : 1 / 1.3, span = Math.min(T1 - T0, Math.max(50, (v1 - v0) * k));
+  v0 = t - (t - v0) / (v1 - v0) * span;
+  v0 = Math.max(T0, Math.min(v0, T1 - span));
+  v1 = v0 + span;
+  dirty();
+}, { passive: false });
+tlC.addEventListener("dblclick", () => { v0 = T0; v1 = T1; dirty(); });
+
+// ---- the panels ----
+function drawNow() {
+  const cnt = new Int32Array(P.length);
+  for (let f = 0; f < F; f++) cnt[state[f]]++;
+  let run = 0, best = 0, freeChunks = 0;
+  for (let c = 0; c < NCH; c++) {
+    let used = 0;
+    const e = Math.min(F, (c + 1) * CF);
+    for (let f = c * CF; f < e; f++) used += state[f] !== 0;
+    if (used === 0) { run++; freeChunks++; if (run > best) best = run; } else run = 0;
+  }
+  const freeMB = cnt[0] * FMB;
+  $("now").innerHTML =
+    `<table><tr><td>in use</td><td class="n">${((F - cnt[0]) * FMB).toFixed(0)} MB</td></tr>` +
+    `<tr><td>free</td><td class="n">${freeMB.toFixed(0)} MB</td></tr>` +
+    `<tr><td>free in whole 2 MB chunks</td><td class="n">${freeChunks * 2} MB</td></tr>` +
+    `<tr><td>longest free run</td><td class="n">${best * 2} MB</td></tr></table>` +
+    (D.resync.some(r => r[1]) ? `<div class="warn">the trace lost events: ${D.resync.filter(r => r[1]).length} later snapshot(s) differed from what the events had built (${D.resync.reduce((a, r) => a + r[1], 0)} frames)</div>` : "") +
+    (D.resync.length && !D.resync.some(r => r[1]) ? `<div class="dim">${D.resync.length} later snapshot(s) agree with the events</div>` : "");
+  const hint = new Map();
+  for (const hh of D.hints) { if (hh[0] > T) break; hint.set(hh[1], hh[2]); }
+  const rows = P.map((p, i) => i).filter(i => i > 0 && (cnt[i] || P[i].peak > 256)).sort((a, b) => cnt[b] - cnt[a]);
+  $("procs").innerHTML = `<tr><th></th><th>process</th><th title="window state the compositor reported: f focus, v visible, h hidden">win</th><th class="n">MB here</th></tr>` +
+    rows.map(i => `<tr class="proc${only && only !== i ? " off" : ""}" data-i="${i}"><td><span class="sw" style="background:${pcolor(i)}"></span></td>` +
+      `<td>${esc(pname(i))}</td><td>${hint.get(i) || ""}</td><td class="n">${(cnt[i] * FMB).toFixed(0)}</td></tr>`).join("");
+}
+$("procs").addEventListener("click", ev => {
+  const tr = ev.target.closest("tr.proc");
+  if (!tr) return;
+  const i = +tr.dataset.i;
+  only = only === i ? 0 : i;
+  dirty();
+});
+function drawStep(si) {
+  if (si < 0) { $("step").className = "dim"; $("step").textContent = "none at the cursor"; return; }
+  const s = steps[si];
+  $("step").className = "";
+  $("step").innerHTML = `<div class="dim">${clock(s.t0)}, ${(s.t1 - s.t0).toFixed(1)} ms in all</div><table>` +
+    s.moves.map(m => `<tr><td><span class="sw" style="background:${pcolor(m[2])}"></span> ${esc(pname(m[2]))}</td>` +
+      `<td>${OPS[m[3]]}<span class="dim"> (${WHY[m[4]]})</span></td><td class="n">${mb(m[5])} MB</td><td class="n">${m[1].toFixed(1)} ms</td>` +
+      (m[7] ? `<td class="warn">${m[7]} failed</td>` : "") + `</tr>`).join("") + `</table>` +
+    (win ? `<div class="dim">window ${(win[1] * FMB).toFixed(0)} MB at ${(win[0] * FMB).toFixed(0)} MB` +
+      (win.length >= 4 ? `, free run kept: ${(win[3] * FMB).toFixed(0)} MB at ${(win[2] * FMB).toFixed(0)} MB` : "") + `</div>` : "");
+}
+let evList = [], evShown = "";
+function buildEvents() {
+  evList = steps.map((s, i) => ({ t: s.t1, step: i, text: [1, 2, 3].filter(o => s.kb[o]).map(o => `${mb(s.kb[o])} MB ${OPS[o]}`).join(", ") +
+    " - " + [...new Set(s.moves.map(m => P[m[2]].comm))].slice(0, 3).join(", ") }));
+  for (const n of D.notes) evList.push({ t: n[0], text: n[2], note: n[1] });
+  evList.sort((a, b) => a.t - b.t);
+  evShown = "";
+}
+function drawEvents() {
+  let lo = 0, hi = evList.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (evList[m].t <= T) lo = m + 1; else hi = m; }
+  const a = Math.max(0, lo - 8), b = Math.min(evList.length, a + 18), key = a + ":" + b + ":" + lo;
+  if (key === evShown) return;
+  evShown = key;
+  $("events").innerHTML = evList.slice(a, b).map((e, k) =>
+    `<div class="ev${a + k === lo - 1 ? " cur" : ""}" data-t="${e.t}"><time>${clock(e.t).split("  ")[0]}</time>` +
+    `<span class="${e.note === "mark" ? "warn" : ""}">${esc(e.text)}</span></div>`).join("") ||
+    `<span class="dim">no moves in this recording</span>`;
+}
+$("events").addEventListener("click", ev => { const d = ev.target.closest(".ev"); if (d) { stop(); setT(+d.dataset.t); } });
+
+// ---- the loop ----
+let need = false;
+function dirty() { if (!need) { need = true; requestAnimationFrame(render); } }
+function render() {
+  need = false;
+  seekIndex(upper(E.t, T));
+  const si = stepAt(T);
+  buildMarks(si);
+  $("clock").textContent = clock(T);
+  drawMap(); drawTimeline(); drawNow(); drawStep(si); drawEvents();
+}
+function setT(t) {
+  T = Math.max(T0, Math.min(T1, t));
+  if (T < v0 || T > v1) { const span = v1 - v0; v0 = Math.max(T0, Math.min(T - span / 2, T1 - span)); v1 = v0 + span; }
+  dirty();
+}
+function jump(dir) {
+  stop();
+  if (!steps.length) return;
+  let i = 0;
+  if (dir > 0) { while (i < steps.length && steps[i].t1 <= T + 0.01) i++; if (i === steps.length) return; }
+  else { i = steps.length - 1; while (i >= 0 && steps[i].t1 >= T - 0.01) i--; if (i < 0) return; }
+  setT(steps[i].t1);
+}
+let playing = 0, lastTs = 0;
+function stop() { playing = 0; $("play").innerHTML = "&#9654; play"; }
+function tick(ts) {
+  if (!playing) return;
+  const dt = Math.min(100, ts - lastTs);
+  lastTs = ts;
+  setT(T + dt * +$("speed").value);
+  if (T >= T1) { stop(); return; }
+  requestAnimationFrame(tick);
+}
+$("play").onclick = () => {
+  if (playing) { stop(); return; }
+  if (T >= T1) T = T0;
+  playing = 1; $("play").innerHTML = "&#10073;&#10073; pause"; lastTs = performance.now(); requestAnimationFrame(tick);
+};
+$("prev").onclick = () => jump(-1);
+$("next").onclick = () => jump(1);
+for (const id of ["f1", "f2", "f3"]) $(id).onchange = () => { buildSteps(); buildEvents(); markStep = -2; dirty(); };
+addEventListener("keydown", ev => {
+  if (ev.target.tagName === "SELECT" || ev.target.tagName === "INPUT") return;
+  if (ev.key === "ArrowLeft") { jump(-1); ev.preventDefault(); }
+  else if (ev.key === "ArrowRight") { jump(1); ev.preventDefault(); }
+  else if (ev.key === " ") { $("play").onclick(); ev.preventDefault(); }
+});
+addEventListener("resize", () => { layoutMap(); dirty(); });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", dirty);
+
+$("tllegend").innerHTML =
+  `<span><span class="sw" style="background:var(--line)"></span> in use</span>` +
+  (D.frag.t.length ? `<span><span class="sw" style="background:var(--keep)"></span> longest free run</span>` : "") +
+  `<span><span class="sw" style="background:var(--src)"></span> to sysmem</span>` +
+  `<span><span class="sw" style="background:var(--dst)"></span> back to vidmem</span>` +
+  `<span><span class="sw" style="background:var(--win)"></span> inside vidmem (compaction, a window for a contiguous buffer)</span>` +
+  (D.notes.some(n => n[1] === "mark") ? `<span class="warn">| a mark</span>` : "");
+buildSteps(); buildEvents(); layoutMap();
+if (steps.length) setT(steps[0].t1); else dirty();
+</script>
+</body>
+</html>

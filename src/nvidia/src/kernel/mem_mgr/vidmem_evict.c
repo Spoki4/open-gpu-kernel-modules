@@ -331,6 +331,232 @@ _vidmemEvictSetBusy(NvBool bBusy)
     _vidmemEvictBusyThread = self;
 }
 
+//
+// The map of vidmem: who holds each 64 KB frame of the PMA region user
+// allocations come from (0 free, 1 the driver itself or not known, else the
+// pid). Kept from the first allocation on, so that a recording starts from a
+// snapshot (`evict.sh map`) and follows every change after it (VMT_EXT_*,
+// vidmem_trace.h; the map of moves: local/trace/nvtrace.py map). The stores
+// take no lock: a frame has one owner from its allocation to its free, and
+// both notes are made while the caller owns it (after pmaAllocatePages(),
+// before pmaFreePages()).
+//
+NvU64 *vidmemPmaUsedMap(PMA *pPma, NvU64 *pBase, NvU64 *pFrames, NvU64 *pLargestFree); // video_mem.c
+void vidmemMapInit(OBJGPU *pGpu);
+void vidmemMapForget(PMA *pPma);
+void vidmemMapNote(PMA *pPma, NvBool bAlloc, const NvU64 *pPages, NvU64 count, NvU64 pageBytes);
+
+static PMA   *_vidmemMapPma;
+static NvU32 *_vidmemMapOwner;
+static NvU64  _vidmemMapBase, _vidmemMapFrames;
+static NvBool _vidmemMapFailed;
+// The move the engine is making, for the notes of its own thread.
+static NvU32  _vidmemMapMode, _vidmemMapPid, _vidmemMapWhy;
+
+static void
+_vidmemMapMove(NvU32 mode, NvU32 pid, NvU32 why)
+{
+    _vidmemMapMode = mode;
+    _vidmemMapPid  = pid;
+    _vidmemMapWhy  = why;
+}
+
+// First vidmem allocation of a client (vidmemConstruct(), locks held, may sleep).
+void
+vidmemMapInit(OBJGPU *pGpu)
+{
+    Heap  *pHeap = GPU_GET_HEAP(pGpu);
+    NvU64  base = 0, frames = 0, largest = 0, f;
+    NvU64 *pUsed;
+    NvU32 *pOwner;
+
+    if ((_vidmemMapOwner != NULL) || _vidmemMapFailed || (pHeap == NULL) || (pHeap->pPmaObject == NULL))
+        return;
+    pUsed = vidmemPmaUsedMap(pHeap->pPmaObject, &base, &frames, &largest);
+    if (pUsed == NULL)
+        return;
+    // 2^24 frames: 1 TB, far past any card (the runs are 32-bit frame numbers).
+    pOwner = ((frames != 0) && (frames <= (1ULL << 24))) ? portMemAllocNonPaged(frames * sizeof(NvU32)) : NULL;
+    if (pOwner == NULL)
+    {
+        _vidmemMapFailed = NV_TRUE;
+        NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: no memory for the map of vidmem (%llu frames)\n", frames);
+    }
+    else
+    {
+        // What was allocated before this: the driver's own.
+        for (f = 0; f < frames; f++)
+            pOwner[f] = (NvU32)((pUsed[f >> 6] >> (f & 63)) & 1);
+        _vidmemMapBase   = base;
+        _vidmemMapFrames = frames;
+        _vidmemMapPma    = pHeap->pPmaObject;
+        _vidmemMapOwner  = pOwner;
+    }
+    portMemFree(pUsed);
+}
+
+// pmaDestroy(): the region is gone (the adapter shut down); the next one starts anew.
+void
+vidmemMapForget(PMA *pPma)
+{
+    NvU32 *pOwner = _vidmemMapOwner;
+
+    if ((pPma == NULL) || (pPma != _vidmemMapPma))
+        return;
+    _vidmemMapOwner  = NULL;
+    _vidmemMapPma    = NULL;
+    _vidmemMapFrames = 0;
+    _vidmemMapFailed = NV_FALSE;
+    portMemFree(pOwner);
+}
+
+//
+// Pages of the region were allocated (after the fact) or are about to be
+// freed: `count` pages of pageBytes each. An allocation is noted for the
+// process that made it, inside the move engine for the process whose memory
+// moves; a free for whoever held the first frame.
+//
+void
+vidmemMapNote(PMA *pPma, NvBool bAlloc, const NvU64 *pPages, NvU64 count, NvU64 pageBytes)
+{
+    NvU32 *pOwner = _vidmemMapOwner;
+    NvU64  base = _vidmemMapBase, frames = _vidmemMapFrames, i;
+    NvU32  runs[2 * VMT_EXT_RUNS];
+    NvU32  n = 0, mode = 0, why = VMT_WHY_NONE, pid = 0, op = bAlloc ? VMT_EXT_ALLOC : VMT_EXT_FREE;
+    NvBool bEngine = _vidmemEvictIsBusyThread();
+    NvBool bTrace, bPid = NV_FALSE;
+
+    if ((pOwner == NULL) || (pPma == NULL) || (pPma != _vidmemMapPma) || (pPages == NULL))
+        return;
+    if (bEngine)
+    {
+        mode = _vidmemMapMode;
+        why  = _vidmemMapWhy;
+        pid  = _vidmemMapPid;
+        bPid = NV_TRUE;
+    }
+    else if (bAlloc)
+    {
+        pid  = osGetCurrentProcess();
+        bPid = NV_TRUE;
+    }
+    bTrace = osVidmemTraceExtOn();
+
+    for (i = 0; i < count; i++)
+    {
+        NvU64 f, k, e;
+
+        if (pPages[i] < base)
+            continue;
+        f = (pPages[i] - base) >> PMA_PAGE_SHIFT;
+        if (f >= frames)
+            continue;
+        k = NV_MIN(pageBytes >> PMA_PAGE_SHIFT, frames - f);
+        if (k == 0)
+            continue;
+        if (!bPid)
+        {
+            pid  = pOwner[f];
+            bPid = NV_TRUE;
+        }
+        for (e = f; e < f + k; e++)
+            pOwner[e] = bAlloc ? NV_MAX(pid, 1) : 0;
+        if (!bTrace)
+            continue;
+        // Pages come in rising or (top-down) falling order: one run while they touch.
+        if ((n != 0) && ((NvU64)runs[2 * n - 2] + runs[2 * n - 1] == f))
+        {
+            runs[2 * n - 1] += (NvU32)k;
+        }
+        else if ((n != 0) && (f + k == runs[2 * n - 2]))
+        {
+            runs[2 * n - 2]  = (NvU32)f;
+            runs[2 * n - 1] += (NvU32)k;
+        }
+        else
+        {
+            if (n == VMT_EXT_RUNS)
+            {
+                osVidmemTraceExt(op, mode, why, NV_MAX(pid, 1), runs, n);
+                n = 0;
+            }
+            runs[2 * n]     = (NvU32)f;
+            runs[2 * n + 1] = (NvU32)k;
+            n++;
+        }
+    }
+    if (bTrace && (n != 0))
+        osVidmemTraceExt(op, mode, why, NV_MAX(pid, 1), runs, n);
+}
+
+//
+// `evict.sh map`: the whole map into the trace, a stretch of one owner per
+// run. Checked against PMA's own frame map on the way: a frame in use there
+// and free here was allocated around the table (it becomes the driver's), one
+// free there and held here was freed around it; *pFixed counts both.
+//
+static void
+_vidmemMapDump(OBJGPU *pGpu, NvU64 *pUsedFrames, NvU64 *pFixed)
+{
+    Heap  *pHeap = GPU_GET_HEAP(pGpu);
+    NvU32 *pOwner = _vidmemMapOwner;
+    NvU64  base = 0, frames = 0, largest = 0, f, start = 0;
+    NvU64 *pUsed;
+    NvU32  runs[2 * VMT_EXT_RUNS];
+    NvU32  n = 0, cur = 0, runPid = 0;
+
+    *pUsedFrames = *pFixed = 0;
+    if ((pOwner == NULL) || (pHeap == NULL) || (pHeap->pPmaObject != _vidmemMapPma))
+        return;
+    pUsed = vidmemPmaUsedMap(_vidmemMapPma, &base, &frames, &largest);
+    if (pUsed == NULL)
+        return;
+    frames = NV_MIN(frames, _vidmemMapFrames);
+    runs[0] = (NvU32)(base >> PMA_PAGE_SHIFT);
+    runs[1] = (NvU32)frames;
+    osVidmemTraceExt(VMT_EXT_SNAP, 0, VMT_WHY_NONE, 0, runs, 1);
+    for (f = 0; f <= frames; f++)
+    {
+        NvU32 owner = 0;
+
+        if (f < frames)
+        {
+            NvBool bUsed = (pUsed[f >> 6] >> (f & 63)) & 1;
+
+            owner = pOwner[f];
+            if (bUsed != (owner != 0))
+            {
+                (*pFixed)++;
+                owner = pOwner[f] = bUsed ? 1 : 0;
+            }
+            *pUsedFrames += bUsed;
+        }
+        if ((f < frames) && (owner == cur))
+            continue;
+        if (cur != 0)
+        {
+            // One event per owner while its stretches follow each other.
+            if ((n == VMT_EXT_RUNS) || ((n != 0) && (runPid != cur)))
+            {
+                osVidmemTraceExt(VMT_EXT_HAVE, 0, VMT_WHY_NONE, runPid, runs, n);
+                n = 0;
+            }
+            runPid          = cur;
+            runs[2 * n]     = (NvU32)start;
+            runs[2 * n + 1] = (NvU32)(f - start);
+            n++;
+        }
+        cur   = owner;
+        start = f;
+    }
+    if (n != 0)
+        osVidmemTraceExt(VMT_EXT_HAVE, 0, VMT_WHY_NONE, runPid, runs, n);
+    runs[0] = (NvU32)*pUsedFrames;
+    runs[1] = (NvU32)*pFixed;
+    osVidmemTraceExt(VMT_EXT_SNAPEND, 0, VMT_WHY_NONE, 0, runs, 1);
+    portMemFree(pUsed);
+}
+
 static NvBool
 _vidmemEvictKindAllowed(OBJGPU *pGpu, MemoryManager *pMemoryManager, NvU32 kind)
 {
@@ -2156,6 +2382,7 @@ vidmemEvictRestoreOnAccess(Memory *pMemory)
     }
     portMemSet(_vidmemEvictPhaseNs, 0, sizeof(_vidmemEvictPhaseNs));
 
+    _vidmemMapMove(2, pChannels->vmtPid, VMT_WHY_ACCESS);
     _vidmemEvictSetBusy(NV_TRUE);
     status = _vidmemEvictSetChannels(pGpu, pChannels, NV_TRUE);
     if (status == NV_OK)
@@ -2439,6 +2666,7 @@ _vidmemEvictPidLocked
 
     EVICT_PRINTF("%s pid %u\n", (mode == 0) ? "dry" : VE_MODE_NAME(mode), pid);
     _vidmemEvictCurPid = pid;
+    _vidmemMapMove(mode, pid, _vidmemEvictWhy);
     pChannels->vmtPid = pid;
 
     for (ppClient = serverutilGetFirstClientUnderLock();
@@ -4131,6 +4359,13 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
               align >> 10, forPid, longest * 2, (bestCost << PMA_PAGE_SHIFT) >> 20);
     _vidmemEvictRangeLo = base + ((off + bestStart * VIDMEM_EVICT_CHUNK_FRAMES) << PMA_PAGE_SHIFT);
     _vidmemEvictRangeHi = _vidmemEvictRangeLo + (need << 21);
+    if (osVidmemTraceExtOn() && (base == _vidmemMapBase))
+    {
+        // The window cleared for a contiguous request of forPid (the moves that follow say why).
+        NvU32 w[2] = { (NvU32)(off + bestStart * VIDMEM_EVICT_CHUNK_FRAMES), (NvU32)(need * VIDMEM_EVICT_CHUNK_FRAMES) };
+
+        osVidmemTraceExt(VMT_EXT_WINDOW, 3, VMT_WHY_ALLOC, forPid, w, 1);
+    }
     for (i = 0; i < count; i++)
     {
         NvU64  moved = 0;
@@ -4445,6 +4680,15 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
     _vidmemEvictRangeLo     = base + ((off + lo * VIDMEM_EVICT_CHUNK_FRAMES) << PMA_PAGE_SHIFT);
     _vidmemEvictRangeHi     = base + ((off + hi * VIDMEM_EVICT_CHUNK_FRAMES) << PMA_PAGE_SHIFT);
     *pWindowMB = (hi - lo) << 1;
+    if (osVidmemTraceExtOn() && (base == _vidmemMapBase))
+    {
+        // The window, and the free run it must not break (when that is another place).
+        NvBool bKeep = (runStart >= hi) || (runStart + runLen <= lo);
+        NvU32  w[4] = { (NvU32)(off + lo * VIDMEM_EVICT_CHUNK_FRAMES), (NvU32)((hi - lo) * VIDMEM_EVICT_CHUNK_FRAMES),
+                        (NvU32)(off + runStart * VIDMEM_EVICT_CHUNK_FRAMES), (NvU32)(runLen * VIDMEM_EVICT_CHUNK_FRAMES) };
+
+        osVidmemTraceExt(VMT_EXT_WINDOW, 3, VMT_WHY_COMPACT, 0, w, bKeep ? 2 : 1);
+    }
     //
     // The step moves `stepMB` in all: a window is chosen by the frames in it,
     // and an allocation with a corner there moves whole (with 256 MB pieces
@@ -4705,6 +4949,7 @@ vidmemEvictBornAllocation(OBJGPU *pGpu, Memory *pMemory)
     }
     else
     {
+        _vidmemMapMove(1, (pRmClient != NULL) ? pRmClient->ProcID : 0, VMT_WHY_BORN);
         _vidmemEvictSetBusy(NV_TRUE);
         status = _vidmemEvictBegin(pGpu, pMemory->pMemDesc, pRefs, 0, &pState);
         if (status == NV_OK)
@@ -5126,7 +5371,19 @@ vidmemEvictProcess
         return status;
 
     // 12: move inside vidmem (problem #16), mode 3 of _vidmemEvictPidLocked().
-    if (mode == 18)
+    if (mode == 19)
+    {
+        NvU64 used = 0, fixed = 0;
+
+        _vidmemMapDump(pGpu, &used, &fixed);
+        if (_vidmemMapOwner == NULL)
+            EVICT_PRINTF("no map of vidmem (no allocation yet, or no memory for it)\n");
+        else
+            EVICT_PRINTF("map: %llu MB of %llu MB in use, %llu frames differed from the allocator's map%s\n",
+                         used >> (20 - PMA_PAGE_SHIFT), _vidmemMapFrames >> (20 - PMA_PAGE_SHIFT), fixed,
+                         osVidmemTraceExtOn() ? "" : "; not traced (nvidia_vidmem:vidmem_ext is off)");
+    }
+    else if (mode == 18)
     {
         _vidmemPlaceSides = (arg != 0);
         EVICT_PRINTF("while a game runs the others' new memory is placed from the %s of vidmem\n",

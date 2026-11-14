@@ -743,6 +743,16 @@ void osGetCurrentProcessName(char *ProcName, NvU32 Length)
     return os_get_current_process_name(ProcName, Length);
 }
 
+NvBool osVidmemTraceExtOn(void)
+{
+    return os_vidmem_trace_ext_on();
+}
+
+void osVidmemTraceExt(NvU32 op, NvU32 mode, NvU32 why, NvU32 pid, const NvU32 *pRuns, NvU32 numRuns)
+{
+    os_vidmem_trace_ext(op, mode, why, pid, pRuns, numRuns);
+}
+
 // Local patch: the process (thread group leader) name, for the vidmem user
 // reserve in mem_mgr/video_mem.c.
 void osGetCurrentProcessLeaderName(char *ProcName, NvU32 Length);

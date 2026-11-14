@@ -394,6 +394,50 @@ TRACE_EVENT(vidmem_hint,
               __print_symbolic(__entry->new_state, NV_VMT_HINT))
 );
 
+// Where memory lies in vidmem, for the map of moves (local/trace/nvtrace.py
+// map). Every change of the frames of the PMA region user allocations come
+// from: op=alloc / op=free with the process they are for and the frames as
+// runs (start, count; 64 KB frames from the region's base); inside the move
+// engine mode= and why= say which move (evict: to sysmem, restore: back,
+// move: to other vidmem pages) and pid= whose memory it is. A snapshot
+// (`evict.sh map`): op=snap with the region (base as a frame number, frames),
+// op=have per stretch of one owner (pid 1: the driver itself or not known),
+// op=snapend. op=window: a compaction step's window and, if any, the free run
+// it must keep.
+#define NV_VMT_EXT_OP                                                        \
+    { 0, "free" }, { 1, "alloc" }, { 2, "snap" }, { 3, "have" },             \
+    { 4, "snapend" }, { 5, "window" }
+#define NV_VMT_EXT_MODE { 0, "-" }, { 1, "evict" }, { 2, "restore" }, { 3, "move" }
+
+TRACE_EVENT(vidmem_ext,
+    TP_PROTO(u32 op, u32 mode, u32 why, u32 pid, const char *comm, const u32 *runs, u32 n),
+    TP_ARGS(op, mode, why, pid, comm, runs, n),
+    TP_STRUCT__entry(
+        __field(u32, op)
+        __field(u32, mode)
+        __field(u32, why)
+        __field(u32, pid)
+        __array(char, comm, TASK_COMM_LEN)
+        __field(u32, n)
+        __dynamic_array(u32, runs, 2 * n)
+    ),
+    TP_fast_assign(
+        __entry->op = op;
+        __entry->mode = mode;
+        __entry->why = why;
+        __entry->pid = pid;
+        memcpy(__entry->comm, comm, TASK_COMM_LEN);
+        __entry->n = n;
+        memcpy(__get_dynamic_array(runs), runs, 2 * n * sizeof(u32));
+    ),
+    TP_printk("op=%s mode=%s why=%s pid=%u comm=%s n=%u runs=%s",
+              __print_symbolic(__entry->op, NV_VMT_EXT_OP),
+              __print_symbolic(__entry->mode, NV_VMT_EXT_MODE),
+              __print_symbolic(__entry->why, NV_VMT_WHY, { 255, "-" }),
+              __entry->pid, __entry->comm, __entry->n,
+              __print_array(__get_dynamic_array(runs), 2 * __entry->n, sizeof(u32)))
+);
+
 #endif // !defined(_TRACE_NV_VIDMEM_H) || defined(TRACE_HEADER_MULTI_READ)
 
 #undef TRACE_INCLUDE_PATH

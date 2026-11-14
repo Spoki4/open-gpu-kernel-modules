@@ -18,12 +18,22 @@ for https://ui.perfetto.dev (open trace.json there; it stays in the browser).
         the same events as one line each, as they happen, plus VRAM every 2 s
   ./nvtrace.py report DIR [--gap-ms N] [--top N]
         summary.txt (printed) + trace.json (Perfetto)
+  ./nvtrace.py map DIR|TRACE [-o FILE] [--from T] [--to T] [--mangohud CSV]...
+        map.html: where each process's memory lay in vidmem at any moment of
+        the recording, and every move (to sysmem, back, compaction) with the
+        places it left and took; open it in a browser. T: seconds from the
+        start or HH:MM[:SS]. Needs a driver with the vidmem_ext events (the
+        recording starts and ends with a snapshot, `evict.sh map`); the
+        simulator writes the same trace (local/sim, -map FILE).
 
 Event fields (key=value) are documented in nv-vidmem-trace.h. Timestamps in
 the trace are seconds of CLOCK_MONOTONIC (trace_clock "mono").
 """
 
 import argparse
+import array
+import bisect
+import collections
 import ctypes
 import datetime
 import glob
@@ -39,6 +49,7 @@ import time
 
 TRACEFS = "/sys/kernel/tracing"
 INSTANCE = TRACEFS + "/instances/nvtrace"
+PIDFILE = "/run/nvtrace.pid"             # who records into INSTANCE
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_LOCAL = os.path.dirname(HERE)
 
@@ -156,9 +167,21 @@ class Tracer:
         if not os.path.isdir(TRACEFS + "/events/nvidia_vidmem"):
             sys.exit("nvtrace: no nvidia_vidmem events: is the patched module (with tracepoints) loaded?")
         if os.path.isdir(INSTANCE):
-            sys.exit(f"nvtrace: {INSTANCE} exists: another recording is running "
-                     f"(or a stale one: sudo rmdir {INSTANCE})")
+            # A recorder that was killed leaves its instance behind, and every
+            # recording after it then had no driver events (gamerec, 2026-11-14:
+            # three sessions in a row). It is stale unless its recorder lives.
+            owner = self.owner()
+            if owner:
+                sys.exit(f"nvtrace: another recording is running (pid {owner})")
+            print(f"nvtrace: removing the stale {INSTANCE}", file=sys.stderr)
+            try:
+                wfile(INSTANCE + "/tracing_on", "0")
+                wfile(INSTANCE + "/events/enable", "0")
+                os.rmdir(INSTANCE)
+            except OSError as e:
+                sys.exit(f"nvtrace: {INSTANCE} is left from a recording that is gone and cannot be removed: {e}")
         os.mkdir(INSTANCE)
+        wfile(PIDFILE, str(os.getpid()))
         wfile(INSTANCE + "/trace_clock", "mono")
         wfile(INSTANCE + "/buffer_size_kb", str(buf_kb))
         self.enabled = []
@@ -171,6 +194,15 @@ class Tracer:
                 print(f"nvtrace: event {ev} not available, skipped", file=sys.stderr)
         wfile(INSTANCE + "/tracing_on", "1")
 
+    @staticmethod
+    def owner():
+        """pid of the live recorder that holds INSTANCE, or 0."""
+        try:
+            pid = int(rfile(PIDFILE))
+            return pid if b"nvtrace" in open(f"/proc/{pid}/cmdline", "rb").read() else 0
+        except (OSError, ValueError):
+            return 0
+
     def marker(self, text):
         try:
             wfile(INSTANCE + "/trace_marker", text)
@@ -178,6 +210,10 @@ class Tracer:
             pass
 
     def close(self):
+        try:
+            os.unlink(PIDFILE)
+        except OSError:
+            pass
         try:
             wfile(INSTANCE + "/tracing_on", "0")
             for ev in self.enabled:
@@ -299,10 +335,17 @@ def cmd_record(a):
     except OSError:
         pass
     wfile(os.path.join(outdir, "status-start.txt"), evict_cmd("status"))
+    # The map of vidmem: a snapshot now, every change after it as it happens
+    # (vidmem_ext), a snapshot at the end to check the events against.
+    map_start = evict_cmd("map").strip()
     meta = {"start_mono": sync_mono / 1e9, "start": datetime.datetime.now().isoformat(timespec="seconds"),
+            "start_wall": time.time() - (mono_ns() - sync_mono) / 1e9, "map": map_start,
             "kernel": os.uname().release, "events": tr.enabled, "lock_us": a.lock_us,
             "cmd": a.cmd, "driver": rfile("/proc/driver/nvidia/version").splitlines()[0]
             if os.path.exists("/proc/driver/nvidia/version") else "?"}
+    # Now already: a recording that is still running can be read (map, report).
+    with open(os.path.join(outdir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=1)
     tr.marker("nvtrace: start")
     print(f"nvtrace: recording to {outdir} ({', '.join(tr.enabled)}); "
           f"{'until ' + ' '.join(a.cmd) + ' exits' if a.cmd else ('%d s' % a.duration if a.duration else 'Ctrl-C to stop')}",
@@ -351,6 +394,7 @@ def cmd_record(a):
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid, signal.SIGKILL)
 
+    meta["map_end"] = evict_cmd("map").strip()
     tr.marker("nvtrace: stop")
     meta["end_mono"] = mono_ns() / 1e9
     wfile(os.path.join(outdir, "status-end.txt"), evict_cmd("status"))
@@ -869,6 +913,292 @@ def perfetto(events, samples, klog, t0, path):
     with open(path, "w") as f:
         json.dump({"traceEvents": tr, "displayTimeUnit": "ms"}, f)
 
+# --------------------------------------------------------------------------
+# map: where memory lay in vidmem, and what each move took from where to where
+# --------------------------------------------------------------------------
+
+MAP_WHY = ["manual", "auto", "pressure", "alloc", "restore", "room", "idle-back", "hot", "access", "born",
+           "compact", "-"]
+MAP_MODE = {"-": 0, "evict": 1, "restore": 2, "move": 3}
+RUNS_RE = re.compile(r"runs=\{([^}]*)\}")
+COMM_RE = re.compile(r"\bcomm=(.*?) (?:n|why|old|kb|mode)=")      # a name may have spaces ("Isolated Web Co")
+
+
+def load_mangohud(path):
+    """(unix time of the log's start, from its name; [(elapsed s, frame time ms)])."""
+    m = re.search(r"_(\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d)\.csv$", path)
+    if not m:
+        return None, []
+    start = datetime.datetime.strptime(m.group(1), "%Y-%m-%d_%H-%M-%S").timestamp()
+    rows, cols = [], None
+    with open(path, errors="replace") as f:
+        for ln in f:
+            parts = ln.rstrip("\n").split(",")
+            if cols is None:
+                if "frametime" in parts and "elapsed" in parts:
+                    cols = (parts.index("frametime"), parts.index("elapsed"))
+                continue
+            try:
+                rows.append((int(parts[cols[1]]) / 1e9, float(parts[cols[0]])))
+            except (ValueError, IndexError):
+                pass
+    return start, rows
+
+
+def map_time(text, wall0):
+    """--from/--to: seconds from the start, or HH:MM[:SS] of the recording's day."""
+    if text is None:
+        return None
+    if ":" not in text:
+        return float(text)
+    if wall0 is None:
+        sys.exit("nvtrace: this trace has no wall clock, give --from/--to in seconds from the start")
+    day = datetime.datetime.fromtimestamp(wall0)
+    h, m, *sec = (int(x) for x in text.split(":"))
+    t = day.replace(hour=h, minute=m, second=sec[0] if sec else 0, microsecond=0)
+    if t.timestamp() < wall0 - 60:
+        t += datetime.timedelta(days=1)          # a recording across midnight
+    return t.timestamp() - wall0
+
+
+def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
+    """The data of map.html from a trace: the first snapshot (or the state at
+    t_from) as one event, then every change. Later snapshots are compared
+    with what the events built: a difference means lost events (`resync`)."""
+    procs = [{"pid": 0, "comm": "free", "peak": 0}, {"pid": 1, "comm": "driver", "peak": 0}]
+    index = {0: 0, 1: 1}
+    counts = [0, 0]
+
+    def proc(pid, comm):
+        i = index.get(pid)
+        if i is None:
+            i = index[pid] = len(procs)
+            procs.append({"pid": pid, "comm": comm or "-", "peak": 0})
+            counts.append(0)
+        elif comm and comm != "-" and i > 1:
+            procs[i]["comm"] = comm
+        return i
+
+    def why_i(name):
+        if name not in MAP_WHY:
+            MAP_WHY.append(name)
+        return MAP_WHY.index(name)
+
+    own = None                 # owner (index into procs) of every frame
+    frames = base_frame = 0
+    snap = None                # a snapshot being read: (ts, owners, changes that arrived meanwhile)
+    start_mono = meta.get("start_mono")
+    wall_at = (lambda ts: meta["start_wall"] + ts - start_mono) if "start_wall" in meta and start_mono else None
+    base = None                # trace time of t = 0: the first snapshot
+    t_out = None               # output starts here (base, or base + t_from)
+    ev = {"t": [], "k": [], "p": [], "m": [], "w": [], "r": []}
+    used = {"t": [], "mb": []}
+    frag = {"t": [], "longest": []}
+    moves, hints, notes, resync = [], [], [], []
+    before = 0                 # changes seen before the first snapshot
+    frame_mb = 1.0 / 16
+    last_ts = 0.0
+
+    def ms(ts):
+        return round((ts - base) * 1000, 3)
+
+    def emit(ts, k, p, m, w, r):
+        ev["t"].append(ms(ts)); ev["k"].append(k); ev["p"].append(p); ev["m"].append(m); ev["w"].append(w)
+        ev["r"].append(r)
+
+    def whole():
+        """The state as one event: (owner, start, count) per stretch."""
+        r, start, cur = [], 0, own[0] if frames else 0
+        for f in range(1, frames + 1):
+            o = own[f] if f < frames else -1
+            if o != cur:
+                if cur:
+                    r += [cur, start, f - start]
+                start, cur = f, o
+        return r
+
+    def change(arr, cnt, k, p, runs):
+        for j in range(0, len(runs), 2):
+            s, n = runs[j], runs[j + 1]
+            if s >= frames:
+                continue
+            n = min(n, frames - s)
+            if cnt is not None:
+                for o, c in collections.Counter(arr[s:s + n]).items():
+                    cnt[o] -= c
+                cnt[p if k else 0] += n
+            arr[s:s + n] = array.array("H", [p if k else 0]) * n
+
+    def note_used(ts):
+        if t_out is None or ts < t_out:
+            return
+        t = ms(ts)
+        mb = round((frames - counts[0]) * frame_mb, 1)
+        if used["t"] and t - used["t"][-1] < 20:
+            used["mb"][-1] = mb
+        else:
+            used["t"].append(t); used["mb"].append(mb)
+
+    with open(trace, errors="replace") as f:
+        for line in f:
+            if "vidmem_" not in line and "tracing_mark_write" not in line:
+                continue
+            e = parse_line(line)
+            if e is None:
+                continue
+            ts, name, fl = e["ts"], e["event"], e["f"]
+            m = COMM_RE.search(e["body"])
+            if m:
+                fl["comm"] = m.group(1)
+            last_ts = max(last_ts, ts)
+            if base is not None and t_to is not None and ts - base > t_to:
+                break
+            if name == "vidmem_ext":
+                m = RUNS_RE.search(e["body"])
+                runs = [int(x, 16) for x in m.group(1).split(",") if x] if m else []
+                op, pid = fl.get("op"), fi(fl, "pid")
+                if op == "snap":
+                    if len(runs) < 2 or runs[1] == 0:
+                        continue
+                    if own is not None and runs[1] != frames:
+                        sys.exit("nvtrace: the size of vidmem changed inside the trace (two GPUs?)")
+                    base_frame, frames = runs[0], runs[1]
+                    snap = (ts, array.array("H", [0]) * frames, [])
+                elif op == "have" and snap is not None:
+                    change(snap[1], None, 1, proc(pid, fl.get("comm")), runs)
+                elif op == "snapend" and snap is not None:
+                    sts, arr, late = snap
+                    snap = None
+                    for k, p, r in late:        # what changed while the snapshot was taken
+                        change(arr, None, k, p, r)
+                    if own is None:
+                        own = arr
+                        base = sts
+                        t_out = base + (t_from or 0)
+                    else:
+                        diff = sum(1 for a, b in zip(own, arr) if a != b)
+                        if t_out is not None and sts >= t_out and ev["t"]:
+                            resync.append([ms(sts), diff])
+                        if diff:
+                            own = arr
+                            if ev["t"]:
+                                emit(ts, 2, 0, 0, why_i("-"), whole())
+                    counts[:] = [0] * len(procs)
+                    for o, c in collections.Counter(own).items():
+                        counts[o] = c
+                    for i, c in enumerate(counts):
+                        procs[i]["peak"] = max(procs[i]["peak"], c)
+                    if not ev["t"] and ts >= t_out:
+                        emit(max(ts, t_out), 2, 0, 0, why_i("-"), whole())
+                    note_used(ts)
+                elif op in ("free", "alloc"):
+                    if own is None:
+                        before += 1
+                        continue
+                    k, p = int(op == "alloc"), proc(pid, fl.get("comm"))
+                    if snap is not None:
+                        snap[2].append((k, p, runs))
+                    change(own, counts, k, p, runs)
+                    procs[p]["peak"] = max(procs[p]["peak"], counts[p])
+                    if ts >= t_out:
+                        if not ev["t"]:
+                            emit(t_out, 2, 0, 0, why_i("-"), whole())
+                        emit(ts, k, p, MAP_MODE.get(fl.get("mode"), 0), why_i(fl.get("why", "-")), runs)
+                    note_used(ts)
+                elif op == "window" and own is not None and ts >= t_out and ev["t"]:
+                    emit(ts, 5, proc(pid, fl.get("comm")) if pid > 1 else 0, 3, why_i(fl.get("why", "-")), runs)
+                continue
+            if base is None or ts < t_out:
+                continue
+            if name == "vidmem_move":
+                op = {"evict": 1, "restore": 2, "move": 3}.get(fl.get("op"), 0)
+                if op:
+                    moves.append([ms(ts), round(fi(fl, "total_us") / 1000, 2), proc(fi(fl, "pid"), fl.get("comm")), op,
+                                  why_i(fl.get("why", "-")), fi(fl, "kb"), fi(fl, "allocs"), fi(fl, "failed")])
+            elif name == "vidmem_hint":
+                hints.append([ms(ts), proc(fi(fl, "pid"), fl.get("comm")), fl.get("new", "-")])
+            elif name == "vidmem_frag":
+                if not frag["t"] or ms(ts) - frag["t"][-1] >= 20:
+                    frag["t"].append(ms(ts)); frag["longest"].append(fi(fl, "longest_mb"))
+            elif name == "vidmem_makeroom":
+                if fi(fl, "us") >= 5000 or not fi(fl, "ok"):
+                    notes.append([ms(ts), "room", f"{fl.get('comm')} waited {fi(fl, 'us') / 1000:.0f} ms for room "
+                                  f"for {fi(fl, 'kb') >> 10} MB" + ("" if fi(fl, "ok") else ": none made")])
+            elif name == "vidmem_reserve":
+                if fl.get("outcome") == "denied":
+                    notes.append([ms(ts), "denied", f"{fl.get('comm')} was denied {fi(fl, 'kb') >> 10} MB"])
+            elif name == "tracing_mark_write":
+                m = re.search(r"gamerec: mark (\d+) ?(.*)", e["body"])
+                if m:
+                    notes.append([ms(ts), "mark", f"mark {m.group(1)}: {m.group(2)}".rstrip(": ")])
+
+    if own is None:
+        sys.exit("nvtrace: no snapshot of vidmem in this trace (vidmem_ext events): recorded with a driver "
+                 "older than the map, or the driver had no allocation yet")
+    if not ev["t"]:
+        if base + (t_from or 0) > last_ts:
+            sys.exit("nvtrace: --from is past the end of the trace")
+        emit(t_out, 2, 0, 0, why_i("-"), whole())
+    wall0 = wall_at(base) if wall_at else None
+    ft = {"t": [], "ms": []}
+    if wall0 is not None:
+        for start, frames_list in mangohud:      # (unix time of the log's start, [(elapsed s, ms)])
+            for el, dur in frames_list:
+                t = (start + el - wall0) * 1000
+                if ev["t"][0] <= t <= ms(last_ts):
+                    ft["t"].append(round(t, 1)); ft["ms"].append(round(dur, 2))
+        order = sorted(range(len(ft["t"])), key=ft["t"].__getitem__)
+        ft = {"t": [ft["t"][i] for i in order], "ms": [ft["ms"][i] for i in order]}
+    return {"title": title, "frames": frames, "base_frame": base_frame, "frame_kb": 64, "procs": procs,
+            "why": MAP_WHY, "ev": ev, "moves": moves, "hints": hints, "notes": sorted(notes), "used": used,
+            "frag": frag, "frametimes": ft, "resync": resync, "t_first": ev["t"][0], "t_last": ms(last_ts),
+            "wall0": wall0, "before_first_snapshot": before}
+
+
+def write_map(data, out):
+    html = rfile(os.path.join(HERE, "map.html"))
+    blob = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
+    wfile(out, html.replace("__DATA__", blob))
+    lost = sum(r[1] for r in data["resync"])
+    # A move whose frames are in the trace: a change made by the move engine for the same process inside it.
+    ev, placed, kinds = data["ev"], 0, [0, 0, 0, 0]
+    for t, dur, p, op, *_ in data["moves"]:
+        kinds[op] += 1
+        i = bisect.bisect_left(ev["t"], t - dur - 2)
+        while i < len(ev["t"]) and ev["t"][i] <= t + 0.5:
+            if ev["k"][i] in (0, 1) and ev["m"][i] and ev["p"][i] == p:
+                placed += 1
+                break
+            i += 1
+    print(f"map: {out} ({os.path.getsize(out) >> 10} KB): {data['frames'] >> 4} MB of vidmem, "
+          f"{len(ev['t'])} changes, {len(data['procs']) - 2} processes\n"
+          f"map: moves {len(data['moves'])} (to sysmem {kinds[1]}, back {kinds[2]}, inside vidmem {kinds[3]}), "
+          f"{placed} with their frames, {ev['k'].count(5)} windows\n"
+          + (f"map: {len(data['resync'])} later snapshot(s), {lost} frames differed from the events"
+             if data["resync"] else "map: no later snapshot to check the events against"))
+    return lost
+
+
+def make_map(path, out=None, title=None, t_from=None, t_to=None, mangohud=()):
+    """map.html for a recording's directory or a trace file; returns the
+    frames that later snapshots found different from the events."""
+    trace = os.path.join(path, "trace.txt") if os.path.isdir(path) else path
+    if not os.path.exists(trace):
+        sys.exit(f"nvtrace: no trace at {trace}")
+    d = os.path.dirname(os.path.abspath(trace))
+    meta = {}
+    if os.path.exists(os.path.join(d, "meta.json")):
+        with open(os.path.join(d, "meta.json")) as f:
+            meta = json.load(f)
+    wall0 = meta.get("start_wall")
+    logs = [x for x in (load_mangohud(p) for p in mangohud) if x[0] is not None]
+    data = build_map(trace, meta, title or os.path.basename(d), map_time(t_from, wall0), map_time(t_to, wall0), logs)
+    return write_map(data, out or os.path.join(d, "map.html"))
+
+
+def cmd_map(a):
+    make_map(a.path, a.out, a.title, a.t_from, a.t_to, a.mangohud or [])
+
 
 def cmd_report(a):
     text, events, samples, klog, t0 = build_report(a.dir, a.gap_ms, a.top)
@@ -898,8 +1228,15 @@ def main():
     rp.add_argument("dir")
     rp.add_argument("--gap-ms", type=float, default=25, help="a frame interval longer than this is a gap")
     rp.add_argument("--top", type=int, default=12)
+    mp = sub.add_parser("map")
+    mp.add_argument("path", help="a recording's directory, or a trace file")
+    mp.add_argument("-o", "--out", help="default: map.html next to the trace")
+    mp.add_argument("--from", dest="t_from", help="seconds from the start, or HH:MM[:SS]")
+    mp.add_argument("--to", dest="t_to")
+    mp.add_argument("--mangohud", action="append", help="a MangoHud log of the session (frame times on the timeline)")
+    mp.add_argument("--title")
     a = ap.parse_args()
-    {"record": cmd_record, "mark": cmd_mark, "live": cmd_live, "report": cmd_report}[a.sub](a)
+    {"record": cmd_record, "mark": cmd_mark, "live": cmd_live, "report": cmd_report, "map": cmd_map}[a.sub](a)
 
 
 if __name__ == "__main__":

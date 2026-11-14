@@ -172,6 +172,7 @@ static NvU32 _vidmemUserReserveMB = NV_U32_MAX; // NV_U32_MAX: registry not read
 NvBool vidmemIsReserveExemptName(const char *name);
 NvBool vidmemUserReserveBoundRangeAny(PMA *pPma, NvU64 pageSize, NvU64 *pBegin, NvU64 *pEnd);
 void vidmemEvictAutoInit(OBJGPU *pGpu, NvU32 reserveMB);
+void vidmemMapInit(OBJGPU *pGpu);
 void vidmemEvictNoteBlock(PMA *pPma);
 NV_STATUS vidmemEvictNoteDupBar1(MEMORY_DESCRIPTOR *pMemDesc);
 NvBool vidmemEvictWantBorn(OBJGPU *pGpu, RmClient *pRmClient, NV_MEMORY_ALLOCATION_PARAMS *pAllocData);
@@ -645,6 +646,7 @@ _vidmemCheckUserReserve
                       data32);
         vidmemEvictAutoInit(pGpu, data32);
     }
+    vidmemMapInit(pGpu);
     reserveMB = _vidmemUserReserveMB;
 
     if ((pHeap == NULL) || (pHeap->pPmaObject == NULL))

@@ -471,11 +471,13 @@ nv_procfs_write_vidmem_evict(
         mode = 17;
     else if (strcmp(cmd, "placesides") == 0)
         mode = 18;
+    else if (strcmp(cmd, "map") == 0)
+        mode = 19;
     else
         return -EINVAL;
 
     pid = 0;
-    if (mode != 3)
+    if ((mode != 3) && (mode != 19))
     {
         if (arg == NULL)
             return -EINVAL;
