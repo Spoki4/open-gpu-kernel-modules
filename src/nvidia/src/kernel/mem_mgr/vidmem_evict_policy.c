@@ -51,11 +51,68 @@ static const char * const _vidmemEvictNeverNames[] =
 // Moves made by the policy (a second client walk in a step only if any, problem #1).
 static NvU32 _vidmemPolicyMoves;
 
+static NvU32 _vidmemBounces;
+static NvU64 _vidmemBounceBytes;
+
+//
+// A move out (mode 1) or back (mode 2) of `moved` bytes of `pid`: what undoes
+// a move of the other direction made less than VIDMEM_EVICT_BOUNCE_SEC ago
+// was copied twice for nothing (host, 2026-11-12 00:42: 1.5 GB of Chrome out,
+// 869 MB back two seconds later, 975 MB out again, found by reading the log).
+//
+static void
+_veNoteMove(NvU32 mode, NvU32 pid, NvU64 moved)
+{
+    VIDMEM_EVICT_ACTIVITY *pAct;
+    NvU64  nowNs = osGetMonotonicTimeNs(), undone;
+    NvU64 *pDoneNs, *pDoneBytes, *pOtherNs, *pOtherBytes;
+
+    if ((moved == 0) || ((mode != 1) && (mode != 2)))
+        return;
+    pAct        = _vidmemActivityFind(pid, NV_TRUE);
+    pDoneNs     = (mode == 1) ? &pAct->outNs     : &pAct->backNs;
+    pDoneBytes  = (mode == 1) ? &pAct->outBytes  : &pAct->backBytes;
+    pOtherNs    = (mode == 1) ? &pAct->backNs    : &pAct->outNs;
+    pOtherBytes = (mode == 1) ? &pAct->backBytes : &pAct->outBytes;
+
+    if (VE_AGO_NS(nowNs, *pOtherNs) >= VIDMEM_EVICT_BOUNCE_SEC * 1000000000ULL)
+        *pOtherBytes = 0;
+    if (VE_AGO_NS(nowNs, *pDoneNs) >= VIDMEM_EVICT_BOUNCE_SEC * 1000000000ULL)
+        *pDoneBytes = 0;
+    undone = NV_MIN(moved, *pOtherBytes);
+    if (undone != 0)
+    {
+        *pOtherBytes       -= undone;
+        pAct->bounces++;
+        pAct->bounceBytes  += 2 * undone;
+        _vidmemBounces++;
+        _vidmemBounceBytes += 2 * undone;
+    }
+    *pDoneBytes += moved - undone;
+    *pDoneNs     = nowNs;
+}
+
+void
+vepBounces(NvU32 pid, NvU32 *pCount, NvU64 *pBytes)
+{
+    VIDMEM_EVICT_ACTIVITY *pAct = (pid != 0) ? _vidmemActivityFind(pid, NV_FALSE) : NULL;
+
+    *pCount = (pid == 0) ? _vidmemBounces     : ((pAct != NULL) ? pAct->bounces     : 0);
+    *pBytes = (pid == 0) ? _vidmemBounceBytes : ((pAct != NULL) ? pAct->bounceBytes : 0);
+}
+
 static NV_STATUS
 _veMove(OBJGPU *pGpu, NvU32 mode, NvU32 pid, NvU64 *pMovedBytes)
 {
+    NvU64     moved = 0;
+    NV_STATUS status;
+
     _vidmemPolicyMoves++;
-    return vepPlatMovePid(pGpu, mode, pid, pMovedBytes);
+    status = vepPlatMovePid(pGpu, mode, pid, &moved);
+    if (pMovedBytes != NULL)
+        *pMovedBytes = moved;
+    _veNoteMove(mode, pid, moved);
+    return status;
 }
 
 //
@@ -626,6 +683,14 @@ _vidmemEvictHintFree(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
             if (pAct->outForPid == pPick->pid)
                 pAct->outForPid = 0;
             pAct->roomSinceNs = 0;
+            //
+            // "Drawing steadily" (step 1b) is about what it does once it is
+            // out: the frames it drew until a moment ago, as a visible
+            // window, said nothing about that and brought it back in the
+            // step it was moved out in (host, 2026-11-12 00:42, Chrome
+            // covered by the window the user switched to).
+            //
+            pAct->drawingSinceNs = 0;
         }
         avail = vepPlatAvailMB(pGpu);
     }
@@ -776,8 +841,19 @@ _vidmemEvictKeepForFgMB(VIDMEM_EVICT_PROC *pProcs, NvU32 count)
             continue;
         if (pProcs[i].evictedBytes != 0)
             return VIDMEM_EVICT_KEEP_BLOCKED;
-        if (_vidmemEvictIsGame(&pProcs[i]) && (_vidmemFgHeadroomMB != 0))
-            return NV_MAX((NvU64)_vidmemFgHeadroomMB, VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HYST_MB);
+        //
+        // Its headroom and a piece more, game or not: the headroom is
+        // refilled for any focused window (vepHeadroomRun()), so whatever
+        // came back leaving less went out again at the window's next
+        // allocation. Only a game counted here, and next to any other focus
+        // the low mark (512 MB) was enough to come back: Chrome, 1.5 GB out
+        // for Claude's headroom, got 869 MB back two seconds later, gave 975
+        // again and got 264 back (host, 2026-11-12 00:42; any amount below
+        // headroom - 512 MB went round like that).
+        //
+        if (_vidmemFgHeadroomMB != 0)
+            return NV_MAX((NvU64)_vidmemFgHeadroomMB + VIDMEM_EVICT_HINT_HYST_MB,
+                          VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HYST_MB);
     }
     return VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HYST_MB;
 }
@@ -828,7 +904,7 @@ vepHotRestoreKeepMB(NvU32 pid)
         return NV_U64_MAX;
     if ((pAct != NULL) && _vidmemEvictInFgHold(pAct, osGetMonotonicTimeNs()))
         return NV_U64_MAX;
-    // A game's headroom when one is focused; else a piece needs only a margin.
+    // The focused window's headroom when there is one; else a piece needs only a margin.
     return (_vidmemLastKeepMB > VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HYST_MB) ?
            _vidmemLastKeepMB : VIDMEM_EVICT_RESTORE_MARGIN_MB;
 }

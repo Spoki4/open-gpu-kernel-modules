@@ -89,7 +89,7 @@ sudo ./local/install.sh stock            # back to the stock modules; then reboo
 ## Control: evict.sh
 
 ```bash
-sudo ./local/evict.sh status             # the policy's state, fragmentation, per process: vram, ram, window state
+sudo ./local/evict.sh status             # the policy's state, fragmentation, bounces (moves undone within a minute), per process: vram, ram, window state
 sudo ./local/evict.sh dry chrome         # what of a process could move, and why the rest cannot
 sudo ./local/evict.sh evict|restore|move <pid|chrome|name>   # by hand: to sysmem, back, to other vidmem pages
 sudo ./local/evict.sh auto on|off|hints  # the automatic policy (hints, the default: only with window hints)
@@ -229,6 +229,7 @@ cd local/tests
 ./compact-test.sh [120 4096 fg]  # background compaction lengthens the free run (fg: out of the focused window too;
                                  # CHUNK_MB=64|128: with blocks the size a game holds)
 ./fgown-test.sh                # the focused app gets an allocation nobody can make room for
+./bounce-test.sh               # an app covered by the window just focused gives its headroom and stays out (no out-back-out)
 ./fragchurn.sh                 # fragments vidmem like a long session
 ./momc-probe.sh                # a probe: do the GPU's access counters report accesses to vidmem?
 ../watchdog.sh --stall 300 -- CMD   # any long run: WATCHDOG STALL/TIMEOUT instead of waiting forever

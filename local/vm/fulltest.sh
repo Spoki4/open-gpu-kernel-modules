@@ -19,6 +19,7 @@
 #   compactbig   compact-test.sh     the same with 128 MB blocks, as a game on the other monitor holds
 #   compactbigfg compact-test.sh fg  the same with 64 MB blocks of the window in focus
 #   fgown        fgown-test.sh       the focused app gets memory nobody can make room for (#7)
+#   bounce       bounce-test.sh      an app covered by the focused window gives its headroom and stays out
 #   nvtest       vmtest.sh all       the whole bench (15 scenarios; S, #5-#13, R)
 #   desktop      the guest's Plasma session under fragchurn with moves: compaction and
 #                windows now also move buffers the compositor maps (evict.sh
@@ -131,6 +132,7 @@ stage compactfg 180 900 'COMPACTTEST PASS' "./compact-test.sh 120 4096 fg"
 stage compactbig 180 900 'COMPACTTEST PASS' "CHUNK_MB=128 ./compact-test.sh 120 4096"
 stage compactbigfg 180 900 'COMPACTTEST PASS' "CHUNK_MB=64 ./compact-test.sh 120 4096 fg"
 stage fgown 180 600 'FGOWNTEST PASS' "./fgown-test.sh"
+stage bounce 180 600 'BOUNCETEST PASS' "./bounce-test.sh"
 vmt nvtest --no-build --no-reload all
 
 # The real session: kwin and plasmashell with their window buffers, vidmem
