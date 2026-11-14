@@ -293,7 +293,14 @@ local/vm/vm.sh win stop && local/vm/vm.sh start
 `local/cloud/setup.sh` and `setup-desktop.sh` prepare an Ubuntu machine with
 a passed-through NVIDIA GPU (build dependencies, the modules, NVIDIA's
 userspace of the same release, a headless KWin and Chrome) so that
-`tests/nvtest.sh` and the memory tests run there over ssh.
+`tests/nvtest.sh` and the memory tests run there over ssh. Everything in one
+run, on the machine itself, with the tree's modules loaded and nobody logged
+in (the stages that need the guest's Plasma session or Steam are left out):
+
+```bash
+export NVT_CHROME_FLAGS="--enable-unsafe-webgpu --enable-features=Vulkan"
+nohup local/vm/fulltest.sh --here >~/fulltest.out 2>&1 &
+```
 
 ## Results so far
 
