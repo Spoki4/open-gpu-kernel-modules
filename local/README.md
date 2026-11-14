@@ -304,11 +304,27 @@ a passed-through NVIDIA GPU (build dependencies, the modules, NVIDIA's
 userspace of the same release, a headless KWin and Chrome) so that
 `tests/nvtest.sh` and the memory tests run there over ssh. Everything in one
 run, on the machine itself, with the tree's modules loaded and nobody logged
-in (the stages that need the guest's Plasma session or Steam are left out):
+in:
 
 ```bash
 export NVT_CHROME_FLAGS="--enable-unsafe-webgpu --enable-features=Vulkan"
 nohup local/vm/fulltest.sh --here >~/fulltest.out 2>&1 &
+```
+
+The stages `desktop` and `game` are skipped there unless a Plasma session is
+up: `local/cloud/plasma-session.sh start` runs KWin on a virtual output of
+the GPU with plasmashell and the window hints script, no monitor needed (its
+windows hold a few MB of vidmem, far less than on a real screen). For `game`
+install Steam from Valve's steam.deb (`steamdeps --dry-run` lists the packages
+it wants), start it with `plasma-session.sh run steam-test steam`, and log in
+by the QR code that `plasma-session.sh shot FILE.png` shows (the user scans
+it; it changes every half a minute). Proton for every title is
+`CompatToolMapping` `"0"` in Steam's config.vdf; the game's first start
+compiles shaders for some ten minutes on four cores, so start it once by hand
+(`tests/game-start.sh`) before the stage. Then:
+
+```bash
+local/vm/fulltest.sh --here --no-build --only desktop,game
 ```
 
 ## Results so far

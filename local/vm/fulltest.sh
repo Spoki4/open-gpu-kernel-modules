@@ -33,8 +33,9 @@
 #
 # On a rented machine (local/cloud/), run there, with this tree's modules loaded
 # and nobody logged in: local/vm/fulltest.sh --here. No VM is involved; the
-# bench runs scenario by scenario (stages nv-*), and the stages that need the
-# guest's Plasma session or Steam (desktop, game) are left out.
+# bench runs scenario by scenario (stages nv-*). The stages desktop and game
+# run when cloud/plasma-session.sh has a session up (and Steam is logged in
+# in it), and are skipped otherwise.
 #
 # Not here: pressing "start benchmark" in the game (input is the user's), see
 # problem #16.
@@ -50,7 +51,7 @@ while [[ $# -gt 0 ]]; do
         --only) only=$2; shift 2 ;;
         --no-build) build=0; shift ;;
         --no-game) game=0; shift ;;
-        --here) here=1; game=0; shift ;;
+        --here) here=1; shift ;;
         *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
     esac
 done
@@ -170,9 +171,9 @@ fi
 
 # The real session: kwin and plasmashell with their window buffers, vidmem
 # churned around them, compaction on. They must be the same processes after.
-(( here )) || stage desktop 240 900 'DESKTOP PASS' "
+stage desktop 240 900 'DESKTOP PASS' "
     k0=\$(pgrep -x kwin_wayland | head -1); p0=\$(pgrep -x plasmashell | head -1)
-    [[ -n \$k0 ]] || { echo 'DESKTOP FAIL no Plasma session in the guest'; exit 0; }
+    [[ -n \$k0 && -n \$p0 ]] || { echo 'DESKTOP $( ((here)) && echo SKIP || echo FAIL) no Plasma session on the machine'; exit 0; }
     T0=\$(date '+%F %T')
     s0=\$(sudo -n ../evict.sh status | grep -o 'background compaction.*')
     ./fragchurn.sh 150 moves 7 | tail -6
