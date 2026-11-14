@@ -6,7 +6,7 @@
 # say nothing). Ends with a table and
 #   FULLTEST PASS|FAIL <failed stages>      exit 0 on PASS
 #
-#   local/vm/fulltest.sh [--from STAGE] [--only STAGE[,STAGE...]] [--no-build] [--no-game]
+#   local/vm/fulltest.sh [--from STAGE] [--only STAGE[,STAGE...]] [--no-build] [--no-game] [--here]
 #
 # Stages, in order:
 #   smoke        vmtest.sh integrity (build, reload, evict/restore keeps the content)
@@ -29,6 +29,12 @@
 #                checked whole). SKIP when Steam is not logged in (the user does that).
 #   momcprobe    momc-probe.sh       a probe, not a check: do access counters report accesses
 #                                    to vidmem (I5)? The answer is in the PASS line
+#
+# On a rented machine (local/cloud/), run there, with this tree's modules loaded
+# and nobody logged in: local/vm/fulltest.sh --here. No VM is involved; the
+# bench runs scenario by scenario (stages nv-*), and the stages that need the
+# guest's Plasma session or Steam (desktop, game) are left out.
+#
 # Not here: pressing "start benchmark" in the game (input is the user's), see
 # problem #16.
 #
@@ -36,13 +42,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 ROOT=$PWD
-from= only= build=1 game=1
+from= only= build=1 game=1 here=0
 while [[ $# -gt 0 ]]; do
     case $1 in
         --from) from=$2; shift 2 ;;
         --only) only=$2; shift 2 ;;
         --no-build) build=0; shift ;;
         --no-game) game=0; shift ;;
+        --here) here=1; game=0; shift ;;
         *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
     esac
 done
@@ -51,7 +58,12 @@ flock -n 8 || { echo "FULLTEST FAIL another fulltest.sh is running" >&2; exit 1;
 mkdir -p local/stress-logs
 log=local/stress-logs/fulltest-$(date +%F_%H%M%S).log
 say() { echo "$*" | tee -a "$log"; }
-gssh() { timeout "${GSSH_T:-60}" local/vm/vm.sh ssh "$@" 2>/dev/null | tr -d '\r'; }
+# The machine under test: the guest over ssh, or (--here) this one.
+if (( here )); then
+    gssh() { timeout "${GSSH_T:-60}" bash -c "$*" 2>/dev/null; }
+else
+    gssh() { timeout "${GSSH_T:-60}" local/vm/vm.sh ssh "$@" 2>/dev/null | tr -d '\r'; }
+fi
 BAD='Xid|BUG:|Oops|general protection|kernel panic|soft lockup|hung task'
 NOISE="$BAD|can.t update VA|[Aa]ssert|not remade|move copy failed"
 CLEAN="cd '$ROOT/local/tests' && { ./nvt-session.sh stop; pkill -f '[n]vt-'; pkill -x gbm-hog; pkill -f '^[.]/sddm-greeter'; pkill -f '[f]ragchurn'; pkill -f '[c]ontig'; pkill -f '[c]ompact-test'; : | sudo -n tee /proc/driver/nvidia/vidmem_hints; } >/dev/null 2>&1; true"
@@ -81,12 +93,17 @@ stage() { # NAME STALL MAX PASSRE GUESTCMD
     say; say "== $name ($(date +%T))"
     t0=$(gssh "date '+%F %T'")
     out=$(mktemp)
-    local/watchdog.sh --stall "$stall" --max "$max" --on-kill "timeout 60 '$ROOT/local/vm/vm.sh' ssh \"$CLEAN\"" -- \
-        local/vm/vm.sh ssh "cd '$ROOT/local/tests' && $cmd" 2>&1 | grep --line-buffered -v '^Pseudo-terminal' | tee -a "$log" >"$out"
+    if (( here )); then
+        local/watchdog.sh --stall "$stall" --max "$max" --on-kill "$CLEAN" -- \
+            bash -c "cd '$ROOT/local/tests' && $cmd" 2>&1 | tee -a "$log" >"$out"
+    else
+        local/watchdog.sh --stall "$stall" --max "$max" --on-kill "timeout 60 '$ROOT/local/vm/vm.sh' ssh \"$CLEAN\"" -- \
+            local/vm/vm.sh ssh "cd '$ROOT/local/tests' && $cmd" 2>&1 | grep --line-buffered -v '^Pseudo-terminal' | tee -a "$log" >"$out"
+    fi
     rc=${PIPESTATUS[0]}
     line=$(grep -E "$passre|FAIL|WATCHDOG (STALL|TIMEOUT)" "$out" | tail -1)
-    if grep -qE "^${name^^} SKIP" "$out"; then
-        record "$name" SKIP "$(grep -E "^${name^^} SKIP" "$out" | tail -1)"
+    if grep -qE "^(${name^^}|NVTEST [a-z0-9-]+) SKIP" "$out"; then
+        record "$name" SKIP "$(grep -E "^(${name^^}|NVTEST [a-z0-9-]+) SKIP" "$out" | tail -1)"
     elif grep -qE 'WATCHDOG (STALL|TIMEOUT)' "$out"; then
         record "$name" FAIL "watchdog: $(grep -E 'WATCHDOG (STALL|TIMEOUT)' "$out" | head -1)"
     elif grep -qE "$passre" "$out" && ! grep -q ' FAIL' "$out"; then
@@ -96,6 +113,9 @@ stage() { # NAME STALL MAX PASSRE GUESTCMD
     fi
     rm -f "$out"
     gssh "sudo journalctl -k --since '$t0' --no-pager | grep -E '$NOISE' | tail -5" | sed 's/^/  kernel: /' | tee -a "$log"
+    # For reading afterwards (the log only): the policy's state and what compaction said during the stage.
+    { gssh "cd '$ROOT/local' && sudo -n ./evict.sh status | sed -n '1,/^pid /p'"
+      gssh "sudo journalctl -k --since '$t0' --no-pager | grep -oE 'vidmem evict: (compaction|move pid).*' | tail -80"; } | sed 's/^/  | /' >>"$log"
     health "$t0" || true
     GSSH_T=90 gssh "$CLEAN" || true
 }
@@ -113,14 +133,17 @@ vmt() { # NAME ARGS...: a vmtest.sh run as a stage
     [[ -n $t0 ]] && { health "$t0" || true; }
 }
 
-say "FULLTEST $(git log -1 --format='%h %s')$(git diff --quiet HEAD -- src kernel-open local || echo ' + working tree')"
-if [[ $(local/vm/vm.sh status 2>/dev/null) != running:* ]]; then
+say "FULLTEST $(git log -1 --format='%h %s' 2>/dev/null)$(git diff --quiet HEAD -- src kernel-open local 2>/dev/null || echo ' + working tree')$( ((here)) && echo ' (on this machine)')"
+if (( here )); then
+    [[ -e /proc/driver/nvidia/vidmem_hints ]] || { say "FULLTEST FAIL the modules loaded here are not this tree's (no vidmem_hints)"; exit 1; }
+elif [[ $(local/vm/vm.sh status 2>/dev/null) != running:* ]]; then
     say "guest not running: starting it"
     local/vm/vm.sh start >>"$log" 2>&1 && timeout 300 local/vm/vm.sh wait >>"$log" 2>&1 ||
         { say "FULLTEST FAIL the guest did not start (host in vm mode? sudo local/vm/mode.sh vm, reboot)"; exit 1; }
 fi
 
-if (( build )); then vmt smoke integrity; else vmt smoke --no-build integrity; fi
+if (( here )); then stage smoke 240 900 '^NVTEST integrity PASS' "NVTEST_FORCE=1 ./nvtest.sh integrity"
+elif (( build )); then vmt smoke integrity; else vmt smoke --no-build integrity; fi
 gssh "cd '$ROOT/local' && sudo -n ./evict.sh status | sed -n '1,4p'" | sed 's/^/  /' | tee -a "$log"
 
 stage tools 300 900 'TOOLS OK' "../build.sh tools >/tmp/build-tools.log 2>&1 && echo TOOLS OK || { tail -5 /tmp/build-tools.log; echo TOOLS FAIL; }"
@@ -133,11 +156,19 @@ stage compactbig 180 900 'COMPACTTEST PASS' "CHUNK_MB=128 ./compact-test.sh 120 
 stage compactbigfg 180 900 'COMPACTTEST PASS' "CHUNK_MB=64 ./compact-test.sh 120 4096 fg"
 stage fgown 180 600 'FGOWNTEST PASS' "./fgown-test.sh"
 stage bounce 180 600 'BOUNCETEST PASS' "./bounce-test.sh"
-vmt nvtest --no-build --no-reload all
+if (( here )); then
+    # Scenario by scenario: one that fails does not take the rest with it.
+    for sc in active "chrome 5 anim" "chrome 3 idle" "webgpu 5" occlusion "switch 5" "fgprio 3 idle" "fgprio 2 anim" \
+              "game 30" fgback focus vaflip comproom ctxroom; do
+        stage "nv-${sc// /-}" 480 1500 '^NVTEST [a-z0-9-]+ PASS' "NVTEST_FORCE=1 ./nvtest.sh $sc"
+    done
+else
+    vmt nvtest --no-build --no-reload all
+fi
 
 # The real session: kwin and plasmashell with their window buffers, vidmem
 # churned around them, compaction on. They must be the same processes after.
-stage desktop 240 900 'DESKTOP PASS' "
+(( here )) || stage desktop 240 900 'DESKTOP PASS' "
     k0=\$(pgrep -x kwin_wayland | head -1); p0=\$(pgrep -x plasmashell | head -1)
     [[ -n \$k0 ]] || { echo 'DESKTOP FAIL no Plasma session in the guest'; exit 0; }
     T0=\$(date '+%F %T')
