@@ -9,7 +9,7 @@ before it goes to the test VM and the host.
 ```
 make                       # ./sim
 ./run-tests.sh [-v]        # every scenario in scenarios/
-./sim [-v] [-cmp PID[,PID]] [-set KNOB=VALUE]... SCENARIO
+./sim [-v] [-cmp PID[,PID]] [-set KNOB=VALUE]... [-map FILE] SCENARIO
 ./replay.py RECORDING [--from HH:MM[:SS]] [--to HH:MM[:SS]] [--expect "HH:MM:SS METRIC PID OP VALUE"]... [-o FILE]
 ```
 
@@ -19,6 +19,11 @@ process once a minute (replays only). At the end: per process what sat in
 sysmem while it was focused / visible (MB*s), moves out and back, failed
 restores, ping-pong (out and back within 4 s), denials, and how long its own
 allocations waited for moves.
+
+`-map FILE` (scenarios with `set layout 1`) writes the layout and every move
+as the driver's trace does; `../trace/nvtrace.py map FILE` turns it into the
+same page a recording gives: who holds which 2 MB cell at any moment, what
+each compaction step moved from where to where.
 
 ## How the driver and the simulator share the policy
 

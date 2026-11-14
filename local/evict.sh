@@ -14,6 +14,8 @@
 #                                               # script reports window visibility)
 #   sudo ./evict.sh shared  <pid|chrome|name>   # who else holds this process's shared vidmem
 #   sudo ./evict.sh trace   on|off              # log every remap (VA ranges) to the kernel log
+#   sudo ./evict.sh map                         # a snapshot of who holds which frames of vidmem into the
+#                                               # trace (nvidia_vidmem:vidmem_ext; nvtrace.py map)
 #   sudo ./evict.sh trace-lock US               # RM lock waits/holds >= US traced (tracepoint
 #                                               # nvidia_vidmem:rm_lock, local/trace/nvtrace.py)
 #   sudo ./evict.sh windows on|off              # also evict window buffers (default off)
@@ -36,14 +38,14 @@
 set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "evict.sh: run with sudo" >&2; exit 1; }
-usage() { echo "usage: sudo $0 status | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows|moveshared|fgown|compactfg|compactbig|placesides on|off | quiesce 0..4 | compact MB | trace-lock US" >&2; exit 2; }
+usage() { echo "usage: sudo $0 status | map | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows|moveshared|fgown|compactfg|compactbig|placesides on|off | quiesce 0..4 | compact MB | trace-lock US" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 
 mode=$1
 case $mode in
-    status)
+    status|map)
         [[ $# -eq 1 ]] || usage
-        cmd="status"
+        cmd="$mode"
         ;;
     hot)
         [[ $# -eq 2 ]] || usage

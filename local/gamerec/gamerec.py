@@ -45,6 +45,11 @@ local/game-logs/<id>/            yours: frame times, screenshots, summary
   ./gamerec.sh hud [on|off]         show / hide MangoHud (toggle), also in running games
   ./gamerec.sh steam                restart Steam so every Vulkan game gets MangoHud
   ./gamerec.sh report [DIR]         summary: marks, problems, frame times
+  ./gamerec.sh map [DIR] [--from T] [--to T]
+                                    map.html: where every process's memory lay in
+                                    vidmem at any moment, each move with the places
+                                    it left and took (local/trace/nvtrace.py map);
+                                    also while the recording runs
 
 MangoHud logs only games that load it: either `gamerec.sh steam` once (Steam
 started with MANGOHUD=1 and our config file), or per game in Steam launch
@@ -499,7 +504,12 @@ def cmd_auto(a):
         d = prepare_user_dir(rid, False)
         send("start", id=rid, auto=True)
         if wait_for(lambda: (state() or {}).get("id") == rid, 15):
-            notify("recording started")
+            # A part that cannot start dies in the first seconds (nvtrace: a stale trace instance).
+            if wait_for(lambda: (state() or {}).get("dead"), 4):
+                notify("recording started WITHOUT " + ", ".join(state().get("dead", [])) +
+                       f" (local/game-logs/{rid}/system/*.out)")
+            else:
+                notify("recording started")
         else:
             finish_user_dir(d)
             notify("recording did not start (journalctl -u gamerec)")
@@ -551,6 +561,8 @@ def cmd_status(a):
     st = state()
     print(f"recording: {st['id']} ({'auto' if st.get('auto') else 'by hand'}, since {st.get('started')})"
           if st else "recording: none")
+    if st and st.get("dead"):
+        print(f"  parts that died: {', '.join(st['dead'])} (local/game-logs/{st['id']}/system/*.out)")
     last = rjson(LAST)
     if last:
         print(f"last: {last.get('id')}")
@@ -737,6 +749,8 @@ class Collector:
                 f.write(f"screenshot: local/game-logs/{self.rid}/{m['shot']}\n")
         if self.patched:
             self.run_to(os.path.join(md, "evict-status.txt"), [EVICT, "status"])
+            # A snapshot of the map into the trace: `gamerec.sh map` checks the events against it.
+            self.run_to(os.path.join(md, "evict-status.txt"), [EVICT, "map"], mode="a")
         self.run_to(os.path.join(md, "nvidia-smi.txt"), ["nvidia-smi"])
         self.run_to(os.path.join(md, "nvidia-smi.txt"),
                     ["nvidia-smi", "-q", "-d", "MEMORY,UTILIZATION,PERFORMANCE,CLOCK,POWER,TEMPERATURE"], mode="a")
@@ -1013,6 +1027,9 @@ def cmd_daemon(a):
                                             t=float(req.get("t") or time.time()),
                                             shot=shot if isinstance(shot, str) and re.fullmatch(r"shots/[\w.-]+", shot)
                                             else None))
+            if "c" in cur and cur["c"].parts.get("dead", []) != cur["st"].get("dead", []):
+                cur["st"]["dead"] = list(cur["c"].parts["dead"])     # for `status` and the start notice
+                wjson(STATE, cur["st"])
             if "t" in cur and not cur["t"].is_alive():
                 wjson(LAST, {"id": cur["st"]["id"], "dir": cur["c"].d})
                 os.unlink(STATE)
@@ -1162,14 +1179,27 @@ def report(d, quiet=False):
     return "\n" + text
 
 
-def cmd_report(a):
-    d = a.dir
+def recording_dir(d):
     if d is None:
         ds = sorted(x for x in glob.glob(os.path.join(LOGS, "2*")) if os.path.isdir(x))
         if not ds:
             sys.exit("gamerec: no recordings in " + LOGS)
         d = ds[-1]
-    report(d)
+    return d
+
+
+def cmd_report(a):
+    report(recording_dir(a.dir))
+
+
+def cmd_map(a):
+    d = recording_dir(a.dir)
+    sysd = os.path.join(d, "system") if os.path.isdir(os.path.join(d, "system")) else d
+    sys.path.insert(0, os.path.dirname(NVTRACE))
+    import nvtrace
+    logs = sorted(f for f in glob.glob(os.path.join(d, "mangohud", "*.csv")) if not f.endswith("_summary.csv"))
+    nvtrace.make_map(os.path.join(sysd, "nvtrace"), os.path.join(d, "map.html"), os.path.basename(d.rstrip("/")),
+                     a.t_from, a.t_to, logs)
 
 
 def main():
@@ -1193,6 +1223,10 @@ def main():
     sub.add_parser("steam")
     rp = sub.add_parser("report")
     rp.add_argument("dir", nargs="?")
+    mp = sub.add_parser("map")
+    mp.add_argument("dir", nargs="?", help="default: the last recording")
+    mp.add_argument("--from", dest="t_from", help="HH:MM[:SS], or seconds from the start")
+    mp.add_argument("--to", dest="t_to")
     sub.add_parser("install")
     sub.add_parser("uninstall")
     dm = sub.add_parser("_daemon")
@@ -1203,7 +1237,7 @@ def main():
     dm.add_argument("--evict-trace", action="store_true")
     a = ap.parse_args()
     {"record": cmd_record, "auto": cmd_auto, "mark": cmd_mark, "stop": cmd_stop, "status": cmd_status,
-     "hotkey": cmd_hotkey, "hud": cmd_hud, "steam": cmd_steam, "report": cmd_report,
+     "hotkey": cmd_hotkey, "hud": cmd_hud, "steam": cmd_steam, "report": cmd_report, "map": cmd_map,
      "install": cmd_install, "uninstall": cmd_uninstall, "_daemon": cmd_daemon}[a.cmd](a)
 
 

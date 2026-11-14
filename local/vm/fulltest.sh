@@ -201,6 +201,8 @@ if (( game )); then
         pkill -f '[b]1_benchmark' ; sleep 3; (steam -shutdown >/dev/null 2>&1 &) ; sleep 8
         if [[ \$alive == 1 && \$bad == 0 ]]; then echo GAME PASS; else echo GAME FAIL; fi"
 fi
+# The map of vidmem: the driver's own account of every frame against the allocator's, over two tests that move memory.
+stage map 240 900 'MAPTEST PASS' "./map-test.sh"
 # Last: counters nobody has run on this GPU; whatever they do, the checks are over.
 stage momcprobe 120 300 'MOMCPROBE PASS' "./momc-probe.sh"
 

@@ -148,6 +148,7 @@ The driver emits tracepoints (system `nvidia_vidmem`, free while off;
 | `vidmem_hint` | a window state change from the KWin script | - |
 | `vidmem_frag` | how fragmented free vidmem is: free in whole 2 MB chunks and in holes, longest free run, runs of 32/128 MB or more; every ~10 s (`at=tick`) and after each move batch with the longest run before it (`evict.sh status` prints the same line) | - |
 | `rm_lock` | an RM API/GPU lock wait or hold over `trace-lock` us (default 1000), where it was taken (symbol), who held it | the waiting thread |
+| `vidmem_ext` | where memory lies: every allocation and free of frames of vidmem (64 KB each, as runs of start and count) with the process they are for; inside a move `mode=` evict / restore / move and `why=`; `op=window`: the window a compaction step or a contiguous request clears; `op=snap` .. `have` .. `snapend`: a snapshot of the whole map (`evict.sh map`) | - |
 
 `local/trace/nvtrace.py` records them together with Xids (`nvidia:nvidia_dev_xid`),
 the compositor's page flips (`drm:drm_vblank_event_delivered`: a gap in
@@ -160,9 +161,33 @@ events that overlapped them, and writes a timeline for ui.perfetto.dev.
 sudo ./local/trace/nvtrace.py record -d 60             # or: record -- ./local/tests/nvt-game ... (runs as you)
 sudo ./local/trace/nvtrace.py mark "stutter"           # while recording: a marker (bind to a hotkey)
 ./local/trace/nvtrace.py report local/trace-logs/<dir> # summary.txt + trace.json (open in ui.perfetto.dev)
+./local/trace/nvtrace.py map local/trace-logs/<dir>    # map.html: the map of vidmem over the recording
 sudo ./local/trace/nvtrace.py live                     # the events one line each, as they happen
 sudo ./local/evict.sh trace-lock 500                   # lock waits/holds traced from 500 us
 ```
+
+### The map of vidmem
+
+`nvtrace.py map` (for a session: `gamerec.sh map`) writes one HTML page, to
+open in a browser: vidmem as a grid of 2 MB cells coloured by the process
+that holds them, a timeline of the memory in use, the longest free run, the
+moves and the game's frame times, and a cursor to drag or to step from move
+to move (arrow keys). At a move the cells it left are crossed in red, the
+ones it took are framed in green, with the window a compaction step was
+clearing and the free run it had to keep; the panel says whose memory, why,
+how much and how long. `--from` / `--to` cut a part out of a long session.
+
+The driver keeps the owner of every frame (a table of 4 bytes per 64 KB,
+filled where PMA hands pages out and takes them back, so the driver's own
+memory and UVM's are in it too) and traces each change; a recording starts
+and ends with a snapshot of the table, and every mark adds one. The page is
+built from the first snapshot and the changes after it, and each later
+snapshot is compared with the result: a difference means the trace lost
+events, and the page says so. `evict.sh map` also compares the table with
+the allocator's own frame map and reports the frames that differ (0 unless
+something was allocated around the table). The simulator writes the same
+events (`sim -map FILE`), so a policy change shows on the same page before
+it runs on a GPU. `local/tests/map-test.sh` checks both.
 
 ## Recording a gaming session
 
@@ -189,6 +214,7 @@ sudo ./local/gamerec.sh install         # once, and again after changing gamerec
 ./local/gamerec.sh mark "stutter after alt-tab"   # or the hotkey
 ./local/gamerec.sh status               # service, running recording
 ./local/gamerec.sh report               # summary of the last recording
+./local/gamerec.sh map [--from 21:40 --to 21:45]   # the map of vidmem of the last recording -> game-logs/<id>/map.html
 ```
 
 Output: `local/game-logs/<date_time>/` (frame times, screenshots, summary)
@@ -362,6 +388,13 @@ run). Sides change where the desktop's memory is placed while a game runs:
 the compositor's contiguous buffers then share the bottom of vidmem with it
 (`nvtest` comproom and scanout-churn are the checks; `evict.sh placesides
 off` is the way back).
+
+The map of vidmem (2026-11-15) is built and has never been loaded on a GPU:
+the owner table in the allocation path and the `vidmem_ext` events are new
+code every allocation and free passes through. `tests/map-test.sh` (stage
+`map`) is the check; the page and its reader have run on the simulator's
+traces only. `gamerec.sh map` needs this driver on the host and the service
+installed again (`sudo ./local/gamerec.sh install`).
 
 ## Numbers cited in the code
 

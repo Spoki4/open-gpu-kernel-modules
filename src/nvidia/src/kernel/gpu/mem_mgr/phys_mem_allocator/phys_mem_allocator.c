@@ -406,6 +406,10 @@ pmaNumaOfflined(PMA *pPma)
 }
 
 
+// Local patch: the map of vidmem, see mem_mgr/vidmem_evict.c.
+void vidmemMapNote(PMA *pPma, NvBool bAlloc, const NvU64 *pPages, NvU64 count, NvU64 pageBytes);
+void vidmemMapForget(PMA *pPma);
+
 void
 pmaDestroy(PMA *pPma)
 {
@@ -416,6 +420,7 @@ pmaDestroy(PMA *pPma)
     {
         return;
     }
+    vidmemMapForget(pPma);   // local patch: the map of vidmem
 
     NV_ASSERT(pmaStateCheck(pPma));
 
@@ -606,6 +611,43 @@ _pmaAllocatePagesImpl
 NvBool vidmemUserReservePmaRange(PMA *pPma, NvU64 pageSize, NvU64 *pBegin, NvU64 *pEnd);
 NvBool vidmemPmaTopDown(PMA *pPma);
 
+static NV_STATUS
+_pmaAllocatePagesPlaced
+(
+    PMA                    *pPma,
+    NvLength                allocationCount,
+    NvU64                   pageSize,
+    PMA_ALLOCATION_OPTIONS *allocationOptions,
+    NvU64                  *pPages
+);
+
+// Local patch: every allocation is noted in the map of vidmem.
+NV_STATUS
+pmaAllocatePages
+(
+    PMA                    *pPma,
+    NvLength                allocationCount,
+    NvU64                   pageSize,
+    PMA_ALLOCATION_OPTIONS *allocationOptions,
+    NvU64                  *pPages
+)
+{
+    NV_STATUS status = _pmaAllocatePagesPlaced(pPma, allocationCount, pageSize, allocationOptions, pPages);
+
+    if ((status == NV_OK) && (pPma != NULL) && (allocationOptions != NULL) && (pPages != NULL))
+    {
+        // A contiguous one is one stretch from pPages[0]; a partial one has fewer pages than asked.
+        NvU64 got = (allocationOptions->flags & PMA_ALLOCATE_ALLOW_PARTIAL) ?
+                    NV_MIN(allocationOptions->numPagesAllocated, allocationCount) : allocationCount;
+
+        if (allocationOptions->flags & PMA_ALLOCATE_CONTIGUOUS)
+            vidmemMapNote(pPma, NV_TRUE, pPages, 1, got * pageSize);
+        else
+            vidmemMapNote(pPma, NV_TRUE, pPages, got, pageSize);
+    }
+    return status;
+}
+
 //
 // Local patch: allocations without an address range get the range above the
 // vidmem user reserve block unless the caller is exempt from the reserve
@@ -615,8 +657,8 @@ NvBool vidmemPmaTopDown(PMA *pPma);
 // Works on a copy of the options so callers that reuse theirs are not
 // affected.
 //
-NV_STATUS
-pmaAllocatePages
+static NV_STATUS
+_pmaAllocatePagesPlaced
 (
     PMA                    *pPma,
     NvLength                allocationCount,
@@ -1478,6 +1520,9 @@ pmaFreePages
     NV_ASSERT(pPma != NULL);
     NV_ASSERT(pageCount != 0);
     NV_ASSERT(pPages != NULL);
+
+    // Local patch: the map of vidmem, while the caller still owns the pages.
+    vidmemMapNote(pPma, NV_FALSE, pPages, pageCount, size);
 
     if (pageCount != 1)
     {

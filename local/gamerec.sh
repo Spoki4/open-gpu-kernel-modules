@@ -8,5 +8,6 @@
 #   ./gamerec.sh auto start|end      from GameMode's hook: records while GameMode is on
 #   ./gamerec.sh mark [TEXT]         mark a problem (hotkey Meta+Ctrl+M)
 #   ./gamerec.sh hud [on|off]        show / hide MangoHud (hotkey Meta+Ctrl+H)
+#   ./gamerec.sh map [DIR]           map.html: the map of vidmem and its moves over the recording
 #   ./gamerec.sh hotkey | steam | stop | status | report [DIR]
 exec python3 "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/gamerec/gamerec.py" "$@"
