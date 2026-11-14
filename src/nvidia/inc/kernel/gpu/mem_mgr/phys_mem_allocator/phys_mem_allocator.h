@@ -99,6 +99,12 @@ typedef struct SCRUB_NODE SCRUB_NODE;
 // Note: Will need additional bits/field if PMA_MAX_LOCALIZED_REGION_COUNT is increased.
 #define PMA_ALLOCATE_LOCALIZED_UGPU0        NVBIT(14)
 #define PMA_ALLOCATE_LOCALIZED_UGPU1        NVBIT(15)
+//
+// Local patch (not a UVM flag, pmaAllocatePages() takes it off before PMA
+// proper sees it): this allocation is not placed top-down, see
+// mem_mgr/video_mem.c and vepPlaceLow().
+//
+#define PMA_ALLOCATE_LOCAL_BOTTOM_UP        NVBIT(31)
 
 // Output flags
 #define PMA_ALLOCATE_RESULT_IS_ZERO         NVBIT(0)

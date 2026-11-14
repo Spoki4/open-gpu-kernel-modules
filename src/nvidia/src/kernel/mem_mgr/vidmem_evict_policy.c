@@ -184,6 +184,8 @@ NvU32  _vidmemHighMB = 2560;
 NvU64  _vidmemLastPressureNs;
 NvU32  _vidmemCompactRunMB = VIDMEM_EVICT_COMPACT_RUN_MB;
 NvU32  _vidmemCompactBig = 1;          // the step follows who pays for it (0: 32 MB for everyone)
+NvU32  _vidmemPlaceSides = 1;
+static NvU64 _vidmemGameSideNs;       // a game held vidmem at this policy step (0: at none yet)
 static NvU64 _vidmemCompactRestNs;   // no compaction step before this (monotonic ns)
 static NvU32 _vidmemCompactIdleSteps; // steps in a row that had nothing to do (the rest doubles)
 static NvU32 _vidmemCompactFgPid;     // the focus at the last step (a change ends the rest)
@@ -1216,6 +1218,24 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
 // apart: the run at its 1056 MB, 640 MB free elsewhere, and eight more steps
 // moved 600 MB of the game into a second window that could never be longer.
 //
+#define VE_HINT_GAME_SIDE (VE_HINT_LAUNCHED_GAME | VE_HINT_FULLSCREEN)
+
+// A game held vidmem at one of the last two policy steps (a step may come late).
+NvBool
+vepGameSideNow(void)
+{
+    return _vidmemHintsActive() && (_vidmemGameSideNs != 0) &&
+           (VE_AGO_NS(osGetMonotonicTimeNs(), _vidmemGameSideNs) < 3 * VIDMEM_EVICT_TICK_SEC * 1000000000ULL);
+}
+
+NvBool
+vepPlaceLow(NvU32 pid, const char *name)
+{
+    if (!_vidmemPlaceSides || !vepGameSideNow())
+        return NV_FALSE;
+    return !(_vidmemHint(pid, NULL) & VE_HINT_GAME_SIDE) && !_vidmemEvictIsNeverName(name);
+}
+
 static void
 _veContigAskAge(NvU64 nowNs)
 {
@@ -1412,6 +1432,8 @@ vepPolicyStep(OBJGPU *pGpu)
         {
             if ((VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) && _vidmemEvictIsGame(&pProcs[i]))
                 _vidmemFgIsGame = NV_TRUE;
+            if ((pProcs[i].hint & VE_HINT_GAME_SIDE) && (pProcs[i].vidmemBytes != 0))
+                _vidmemGameSideNs = nowNs;
         }
         _vidmemEvictUpdateReclaimable(pProcs, count, nowNs);
         _vidmemEvictPolicyHints(pGpu, pProcs, count, nowNs);
