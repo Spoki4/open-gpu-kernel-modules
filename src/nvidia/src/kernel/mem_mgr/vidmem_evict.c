@@ -3710,6 +3710,13 @@ vidmemEvictWantBorn(OBJGPU *pGpu, RmClient *pRmClient, NV_MEMORY_ALLOCATION_PARA
     return blockFree >= pAllocData->size + (128ULL << 20);
 }
 
+// See vepNoteContig(): vidmemConstruct() tells of every contiguous allocation it is asked for.
+void
+vidmemEvictNoteContig(NvU64 size)
+{
+    vepNoteContig(size);
+}
+
 // See vepBackgroundCushion().
 NvU64
 vidmemEvictBackgroundCushion(RmClient *pRmClient)
@@ -4198,9 +4205,9 @@ static NvU64 _vidmemCompactSeenUsed;
 
 NvU64
 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB, NvU64 fgStepMB,
-               NvU64 wantMB, NvU64 *pWindowMB)
+               NvU64 *pWindowMB)
 {
-    NvU64   budgetMB = stepMB;
+    NvU64   budgetMB = stepMB, wantMB = 0;
     Heap   *pHeap = GPU_GET_HEAP(pGpu);
     PMA    *pPma = (pHeap != NULL) ? pHeap->pPmaObject : NULL;
     NvU64   base = 0, frames = 0, largest = 0, words, chunks, off, c, f;
@@ -4246,13 +4253,7 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
             cur = 0;
         }
     }
-    //
-    // The run wanted: the knob, or three quarters of what is free when that
-    // is more. A fixed 1 GB was "reached" on a desktop with 10.6 GB free in 88
-    // runs, the longest 1.2 GB, and room for a 32 MB buffer of the compositor
-    // then took moving 137 MB (2026-11-10, nvtest focus and comproom failed).
-    //
-    wantMB = NV_MAX(wantMB, (freeChunks << 1) * 3 / 4);
+    wantMB = vepCompactWantMB(freeChunks << 1);
     // Long enough already, or nothing free elsewhere to gather (and to move into).
     if ((runLen << 1) >= wantMB)
         goto done;
@@ -4755,11 +4756,14 @@ _vidmemEvictPrintBlock(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
                      _vidmemCompRoomMovedMB, _vidmemCompRoomMaxNs / 1000);
         EVICT_PRINTF("windows cleared for contiguous allocations: %llu MB moved inside vidmem; "
                      "background compaction: keeps a free run of %u MB, %u steps, %llu MB moved%s; "
-                     "allocations of up to %u MB move (%u MB of the window in focus)\n",
+                     "allocations of up to %u MB move (%u MB of the window in focus); "
+                     "with a game in focus a run of %llu MB is enough (the biggest contiguous request of the last %u min: %llu MB)\n",
                      _vidmemContigInVidmemMB, _vidmemCompactRunMB, _vidmemCompactSteps, _vidmemCompactMovedMB,
                      _vidmemCompactFg ? "" : "; not the window in focus",
                      _vidmemCompactBig ? VIDMEM_EVICT_COMPACT_BIG_STEP_MB : VIDMEM_EVICT_COMPACT_STEP_MB,
-                     _vidmemCompactBig ? VIDMEM_EVICT_COMPACT_FG_STEP_MB : VIDMEM_EVICT_COMPACT_STEP_MB);
+                     _vidmemCompactBig ? VIDMEM_EVICT_COMPACT_FG_STEP_MB : VIDMEM_EVICT_COMPACT_STEP_MB,
+                     NV_MAX(vepCompactNeedMB() * VIDMEM_EVICT_COMPACT_NEED_TIMES, (NvU64)VIDMEM_EVICT_COMPACT_NEED_MIN_MB),
+                     VIDMEM_EVICT_COMPACT_NEED_SEC / 60, vepCompactNeedMB());
         EVICT_PRINTF("compaction saw (MB): in use %llu; movable %llu; compositor %llu, foreground %llu, "
                      "movable with a pause of the compositor %llu, bigger than a step %llu, refused %llu\n",
                      _vidmemCompactSeenUsed >> 20, _vidmemCompactSeen[VC_MOVABLE] >> 20,

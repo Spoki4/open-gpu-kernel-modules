@@ -192,6 +192,7 @@ static NvU64 _vidmemLastPmaAlign;
 static NvBool _vidmemLastPmaContig;
 static NvU64  _vidmemLastPmaBytes;
 NvU64 vidmemEvictBackgroundCushion(RmClient *pRmClient);
+void vidmemEvictNoteContig(NvU64 size);
 void vidmemEvictKeepFgHeadroom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size);
 NvU64 vidmemEvictReclaimableFor(RmClient *pRmClient);
 NV_STATUS vidmemEvictBornAllocation(OBJGPU *pGpu, Memory *pMemory);
@@ -956,6 +957,9 @@ retry_alloc:
     _vidmemLastPmaAlign  = allocOptions.alignment;   // local patch
     _vidmemLastPmaContig = bContig;
     _vidmemLastPmaBytes  = (NvU64)pageCount * pageSize;
+    // What background compaction keeps a free run for (vepCompactWantMB()).
+    if (bContig)
+        vidmemEvictNoteContig(_vidmemLastPmaBytes);
     status = pmaAllocatePages(pPma, pageCount, pageSize, &allocOptions,
                               pAllocRequest->pPmaAllocInfo->pageArray);
     if (NV_OK != status)

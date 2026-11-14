@@ -43,7 +43,10 @@ These patches do the same inside the driver.
   compacts vidmem a little at a time so the longest free run stays long. A
   step moves whole allocations: of the window in focus those up to 96 MB (a
   pause of about 9 ms), of the others up to 256 MB, and 256 MB in all (96 MB
-  while a game is in focus).
+  while a game is in focus). The run it gathers: three quarters of the free
+  memory, 1 GB at least; while a game is in focus only three times the
+  biggest contiguous buffer asked for in the last half hour (256 MB at
+  least), every step being a pause of the game.
 - **Does not keep a fixed reserve** for the compositor any more (the first
   approach, `RmVidmemUserReserveMB`, still there and off by default).
 - Fixes found on the way in NVIDIA's own code: a channel group leaked on GSP
@@ -93,7 +96,7 @@ sudo ./local/evict.sh status             # the policy's state, fragmentation, bo
 sudo ./local/evict.sh dry chrome         # what of a process could move, and why the rest cannot
 sudo ./local/evict.sh evict|restore|move <pid|chrome|name>   # by hand: to sysmem, back, to other vidmem pages
 sudo ./local/evict.sh auto on|off|hints  # the automatic policy (hints, the default: only with window hints)
-sudo ./local/evict.sh compact MB         # background compaction keeps a free run of MB (0: off)
+sudo ./local/evict.sh compact MB         # background compaction keeps a free run of MB or 3/4 of the free memory (0: off)
 sudo ./local/evict.sh compactfg on|off   # ... also out of the focused window's memory
 sudo ./local/evict.sh compactbig on|off  # ... in allocations of up to 256 MB (96 MB of the focus); off: 32 MB
 sudo ./local/evict.sh moveshared on|off  # window buffers shared with the compositor may move inside vidmem

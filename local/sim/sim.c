@@ -528,8 +528,9 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
 //
 #define SIM_CHUNK_FRAMES 32       // 2 MB in the 64 KB frames the driver counts
 NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB, NvU64 fgStepMB,
-                     NvU64 wantMB, NvU64 *pWindowMB)
+                     NvU64 *pWindowMB)
 {
+    NvU64   wantMB;
     NvU64   freeChunks = 0, runStart = 0, runLen, lo = 0, hi = 0, c, doneKB = 0, keepLo = 0, keepHi = 0;
     NvU32  *pCost;
     Alloc **byId;
@@ -543,7 +544,7 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
     if (!gLayout)
         return 0;
     runLen = layLongest(&freeChunks, &runStart);
-    wantMB = NV_MAX(wantMB, (freeChunks << 1) * 3 / 4);
+    wantMB = vepCompactWantMB(freeChunks << 1);
     if (((runLen << 1) >= wantMB) || (runLen == 0) || (freeChunks < runLen + (stepMB >> 1) + 16))
         return 0;
 
@@ -737,6 +738,8 @@ static void simAlloc(Proc *p, NvU64 kb, int movable, int contig)
     int   ok, born = 0;
 
     ctxBegin(p, "alloc");
+    if (contig)
+        vepNoteContig(size);
     if (p->exempt)
     {
         // The compositor: never turned away; others move out until it fits.

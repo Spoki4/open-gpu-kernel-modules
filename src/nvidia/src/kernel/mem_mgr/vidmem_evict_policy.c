@@ -190,6 +190,9 @@ static NvU32 _vidmemCompactFgPid;     // the focus at the last step (a change en
 static NvU64 _vidmemCompactTryNs;     // the last step that looked for something to move
 static NvU64 _vidmemCompactWindowMB;  // the window the last moving step worked on
 static NvU32 _vidmemCompactStalled;   // moving steps in a row whose window did not grow
+// The biggest contiguous request in this half of VIDMEM_EVICT_COMPACT_NEED_SEC and in the one before.
+static NvU64 _vidmemContigAskBytes[2];
+static NvU64 _vidmemContigAskNs;      // when this half began
 static NvU32 _vidmemCompactRunSeenMB; // the knob at the last step (a new value: try at once)
 NvU32  _vidmemBusiestPid;          // updated every tick
 NvU64  _vidmemBusiestSinceNs;      // since when it is the busiest without a break
@@ -1213,6 +1216,54 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
 // apart: the run at its 1056 MB, 640 MB free elsewhere, and eight more steps
 // moved 600 MB of the game into a second window that could never be longer.
 //
+static void
+_veContigAskAge(NvU64 nowNs)
+{
+    NvU64 halfNs = (NvU64)VIDMEM_EVICT_COMPACT_NEED_SEC * 1000000000ULL / 2;
+
+    if (VE_AGO_NS(nowNs, _vidmemContigAskNs) < halfNs)
+        return;
+    // Two halves ago is forgotten; after a long silence both are.
+    _vidmemContigAskBytes[1] = (VE_AGO_NS(nowNs, _vidmemContigAskNs) < 2 * halfNs) ? _vidmemContigAskBytes[0] : 0;
+    _vidmemContigAskBytes[0] = 0;
+    _vidmemContigAskNs       = nowNs;
+}
+
+void
+vepNoteContig(NvU64 size)
+{
+    _veContigAskAge(osGetMonotonicTimeNs());
+    _vidmemContigAskBytes[0] = NV_MAX(_vidmemContigAskBytes[0], size);
+}
+
+NvU64
+vepCompactNeedMB(void)
+{
+    _veContigAskAge(osGetMonotonicTimeNs());
+    return NV_ALIGN_UP64(NV_MAX(_vidmemContigAskBytes[0], _vidmemContigAskBytes[1]), 1ULL << 20) >> 20;
+}
+
+NvU64
+vepCompactWantMB(NvU64 freeMB)
+{
+    NvU64 wantMB;
+
+    if (_vidmemCompactRunMB == 0)
+        return 0;
+    //
+    // The knob, or three quarters of what is free when that is more. A fixed
+    // 1 GB was "reached" on a desktop with 10.6 GB free in 88 runs, the
+    // longest 1.2 GB, and room for a 32 MB buffer of the compositor then took
+    // moving 137 MB (2026-11-10, nvtest focus and comproom failed).
+    //
+    wantMB = NV_MAX((NvU64)_vidmemCompactRunMB, freeMB * VIDMEM_EVICT_COMPACT_FREE_PCT / 100);
+    // Next to a game no more than the requests seen need (vidmem_evict_policy.h).
+    if (_vidmemFgIsGame)
+        wantMB = NV_MIN(wantMB, NV_MAX(vepCompactNeedMB() * VIDMEM_EVICT_COMPACT_NEED_TIMES,
+                                       (NvU64)VIDMEM_EVICT_COMPACT_NEED_MIN_MB));
+    return wantMB;
+}
+
 NvBool
 vepCompactWindow(const NvU32 *pCost, NvU64 chunks, NvU64 runStart, NvU64 runLen, NvU64 budgetFrames,
                  NvU64 *pLo, NvU64 *pHi)
@@ -1359,7 +1410,7 @@ vepPolicyStep(OBJGPU *pGpu)
             }
             _vidmemEvictWhy = VMT_WHY_COMPACT;
             _vidmemCompactTryNs = nowNs;
-            movedMB = vepPlatCompact(pGpu, pProcs, count, stepMB, fgStepMB, _vidmemCompactRunMB, &windowMB);
+            movedMB = vepPlatCompact(pGpu, pProcs, count, stepMB, fgStepMB, &windowMB);
             if ((movedMB != 0) && (windowMB > _vidmemCompactWindowMB))
             {
                 // Getting somewhere.
