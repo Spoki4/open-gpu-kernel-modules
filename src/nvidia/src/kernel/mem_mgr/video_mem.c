@@ -957,8 +957,15 @@ retry_alloc:
     _vidmemLastPmaAlign  = allocOptions.alignment;   // local patch
     _vidmemLastPmaContig = bContig;
     _vidmemLastPmaBytes  = (NvU64)pageCount * pageSize;
-    // What background compaction keeps a free run for (vepCompactWantMB()).
-    if (bContig)
+    //
+    // What background compaction keeps a free run for (vepCompactWantMB()):
+    // those that fail without one, not the ones tried again as non-contiguous
+    // below.
+    //
+    if (bContig &&
+        !(FLD_TEST_DRF(OS32, _ATTR, _PHYSICALITY, _ALLOW_NONCONTIGUOUS, pAllocData->attr) ||
+          (FLD_TEST_DRF(OS32, _ATTR, _PHYSICALITY, _DEFAULT, pAllocData->attr) &&
+           pHeap->getProperty(pHeap, PDB_PROP_HEAP_NONCONTIG_ALLOC_BY_DEFAULT))))
         vidmemEvictNoteContig(_vidmemLastPmaBytes);
     status = pmaAllocatePages(pPma, pageCount, pageSize, &allocOptions,
                               pAllocRequest->pPmaAllocInfo->pageArray);
