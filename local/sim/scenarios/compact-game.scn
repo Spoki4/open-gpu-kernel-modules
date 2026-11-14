@@ -41,13 +41,16 @@ act 12557 0 30
 act 2617 2 4
 expect free - >= 1600
 expect longest - <= 300              # as that evening: 260 MB with 1.9 GB free
+alloc 2617 192 contig                # the browser's biggest buffer of that evening
+free 2617 192
 
-mark the game in focus: its 64 MB blocks move, 96 MB a step; its 256 MB blocks are walls 1.1 GB apart
+mark the game in focus: its 64 MB blocks move, 96 MB a step, until three such buffers fit and no further
 at 150
-expect compact_steps - >= 10
+expect compact_steps - >= 4
 expect compact_pause 12557 <= 11     # 96 MB at 10 MB/ms
-expect longest - >= 900
-expect longest - <= 1150             # no further between two walls
+expect longest - >= 576
+expect longest - <= 700              # not the 1056 MB between two of its 256 MB blocks
+expect compact_moved 12557 <= 720    # it was 1280 MB in 20 steps, for a run of 1056 MB nobody asked for
 
 mark a look at the browser: the rest ends at once, the game gives its 256 MB blocks, 256 MB a step
 hint 12557 v full

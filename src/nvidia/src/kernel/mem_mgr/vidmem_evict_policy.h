@@ -61,6 +61,19 @@
 // goes wherever the allocator puts it, the next window may be over it.
 //
 #define VIDMEM_EVICT_COMPACT_STALL_STEPS 16
+//
+// The run compaction gathers while a game is in focus: room for the biggest
+// contiguous buffer anybody asked for in the last NEED_SEC, NEED_TIMES over
+// (a page asks for several), NEED_MIN_MB when nobody did. Not the three
+// quarters of the free memory that are wanted next to any other window: every
+// step is a pause of the game, and what the run is for is those buffers (host,
+// 2026-11-11: Chrome's were 130-192 MB, the target 1.4 GB of the 1.9 GB free,
+// never reached between the game's blocks).
+//
+#define VIDMEM_EVICT_COMPACT_NEED_SEC    1800
+#define VIDMEM_EVICT_COMPACT_NEED_TIMES  3
+#define VIDMEM_EVICT_COMPACT_NEED_MIN_MB 256
+#define VIDMEM_EVICT_COMPACT_FREE_PCT    75
 extern NvU32 _vidmemCompactRunMB;
 extern NvU32 _vidmemCompactBig;
 // A chunk of the cost map of vepCompactWindow() that holds a frame nobody can move.
@@ -289,11 +302,19 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
 // other vidmem pages. Whose memory: anyone's but the compositor's. Whole
 // allocations move: one of the window in focus up to `fgStepMB`, of the
 // others up to `stepMB`, bigger ones count as fixed; `stepMB` in all per
-// step. Nothing to do when the run already has `wantMB`. Returns the MB moved
-// (0: nothing to do or nothing possible now); *pWindowMB: the window it
-// worked on (0: none), for the policy to see whether the steps get anywhere.
+// step. Nothing to do when the run already has what vepCompactWantMB() says
+// for the free memory there is. Returns the MB moved (0: nothing to do or
+// nothing possible now); *pWindowMB: the window it worked on (0: none), for
+// the policy to see whether the steps get anywhere.
 NvU64  vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB, NvU64 fgStepMB,
-                      NvU64 wantMB, NvU64 *pWindowMB);
+                      NvU64 *pWindowMB);
+// The free run compaction wants with `freeMB` free in whole 2 MB chunks (0:
+// compaction is off), as of the last policy step.
+NvU64  vepCompactWantMB(NvU64 freeMB);
+// A contiguous allocation of `size` bytes was asked for (granted or not).
+void   vepNoteContig(NvU64 size);
+// The biggest one asked for lately, in MB (0: none), for the status.
+NvU64  vepCompactNeedMB(void);
 // The window for a step, shared by the driver and the simulator. pCost: per
 // 2 MB chunk the frames in use that may move (0: free), VEP_COMPACT_FIXED
 // when it holds one that may not; the longest free run is `runLen` chunks
