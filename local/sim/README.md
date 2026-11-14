@@ -79,7 +79,7 @@ One command per line, `#` starts a comment. Times are seconds from the start.
 | `at T` | run until T (steps every 2 s with autotick) |
 | `step` | a policy step now (what a hint change triggers) |
 | `mark TEXT` | a line in the output |
-| `expect METRIC PID\|- OP VALUE` | a check: `vid`, `evicted`, `sys` (= evicted), `evicts`, `moved_out` (MB copied out in all), `restores`, `restorefails`, `windows` (contiguous windows cleared for it), `pingpong`, `denied`, `denied_mb`, `born`, `stallmax`, `sysfg_mbs`, `free`, `longest` (MB, the longest free run), `compact_steps`, `compact_idle` (steps that moved / found nothing), `compact_pause` (ms, the longest pause a step gave the process), `compact_moved`; OP `<= >= < > ==` |
+| `expect METRIC PID\|- OP VALUE` | a check: `vid`, `evicted`, `sys` (= evicted), `evicts`, `moved_out` (MB copied out in all), `restores`, `restorefails`, `windows` (contiguous windows cleared for it), `pingpong`, `bounces` and `bounce_mb` (the driver's own count: moves undone within a minute, MB copied for nothing), `denied`, `denied_mb`, `born`, `stallmax`, `sysfg_mbs`, `free`, `longest` (MB, the longest free run), `compact_steps`, `compact_idle` (steps that moved / found nothing), `compact_pause` (ms, the longest pause a step gave the process), `compact_moved`; OP `<= >= < > ==` |
 | `rec PID VRAM RAM` | recorded values for `-cmp` (replays) |
 | `clock UNIX_S` | wall clock at time 0 (output shows HH:MM:SS) |
 

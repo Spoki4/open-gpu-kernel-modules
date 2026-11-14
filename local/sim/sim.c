@@ -1060,6 +1060,13 @@ static double metric(const char *m, Proc *p)
     if (strcmp(m, "restorefails") == 0) return p->restoreFails;
     if (strcmp(m, "windows") == 0)    return p->windows;
     if (strcmp(m, "pingpong") == 0)   return p->pingpong;
+    if (strcmp(m, "bounces") == 0 || strcmp(m, "bounce_mb") == 0)   // the driver's own count (vepBounces())
+    {
+        NvU32 n; NvU64 bytes;
+
+        vepBounces(p->pid, &n, &bytes);
+        return (strcmp(m, "bounces") == 0) ? (double)n : (double)(bytes >> 20);
+    }
     if (strcmp(m, "denied") == 0)     return p->denied;
     if (strcmp(m, "born") == 0)       return p->born;
     if (strcmp(m, "stallmax") == 0)   return p->maxStallMs;

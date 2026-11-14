@@ -102,7 +102,18 @@ typedef struct
     NvU64 contigFailNs;   // monotonic ns when no window could be cleared for its contiguous buffer (0: not)
     NvU32 outForPid;      // the foreground when the policy last moved it out (0: there was none)
     NvU64 roomSinceNs;    // monotonic ns since when it would fit back with room to spare (0: it would not)
+    NvU64 outNs, outBytes;   // the policy's moves out in the last VIDMEM_EVICT_BOUNCE_SEC: the last one, bytes not yet back
+    NvU64 backNs, backBytes; // and its moves back: the last one, bytes not yet out again
+    NvU32 bounces;           // moves that undid one of the other direction made less than that long ago
+    NvU64 bounceBytes;       // bytes copied there and back for nothing by them
 } VIDMEM_EVICT_ACTIVITY;
+
+//
+// Memory the policy moved one way and back the other within this long was
+// copied twice for nothing (vepBounces(), `evict.sh status`): the number a
+// change of the rules is judged by.
+//
+#define VIDMEM_EVICT_BOUNCE_SEC 60
 
 //
 // A contiguous buffer this big comes back through a cleared window, one a
@@ -214,6 +225,8 @@ VIDMEM_EVICT_ACTIVITY *_vidmemActivityFind(NvU32 pid, NvBool bCreate);
 NvU32  _vidmemActivityIdleSec(NvU32 pid);
 NvU32  _vidmemActivityRecent(NvU32 pid);
 void   _vidmemEvictNoteRestoreOnAccess(NvU32 pid);
+// Moves undone within VIDMEM_EVICT_BOUNCE_SEC and the bytes they copied, of `pid` (0: of everyone, since load).
+void   vepBounces(NvU32 pid, NvU32 *pCount, NvU64 *pBytes);
 NvBool _vidmemEvictIsNeverName(const char *name);
 NvU32  _vidmemEvictGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs);
 NvU32  _vidmemEvictBusiestPid(VIDMEM_EVICT_PROC *pProcs, NvU32 count);

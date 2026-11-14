@@ -4954,6 +4954,14 @@ _vidmemEvictStatus(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
     EVICT_PRINTF("window hints: %s; could give up %llu MB to visible apps, %llu MB to the foreground (added to their budgets)\n",
                  _vidmemHintsActive() ? "on (policy follows window visibility)" : "off (GPU samples)",
                  _vidmemReclaimableBytes >> 20, _vidmemReclaimableFgBytes >> 20);
+    {
+        NvU32 bounces;
+        NvU64 bounceBytes;
+
+        vepBounces(0, &bounces, &bounceBytes);
+        EVICT_PRINTF("bounces: %u moves undone by the policy within %u s, %llu MB copied for nothing (per process: flags)\n",
+                     bounces, VIDMEM_EVICT_BOUNCE_SEC, bounceBytes >> 20);
+    }
     EVICT_PRINTF("%-8s %-16s %7s %7s %8s %7s %7s %-7s %s\n",
                  "pid", "name", "vram_mb", "ram_mb", "evict_mb", "idle_s", "samples", "window", "flags");
 
@@ -4970,15 +4978,21 @@ _vidmemEvictStatus(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
             nvDbgSnprintf(idleStr, sizeof(idleStr), "%u", idle);
 
         static const char * const hintNames[] = { "-", "hidden", "visible", "fg" };
-        char hintStr[16];
+        char hintStr[16], bounceStr[48];
+        NvU32 bounces;
+        NvU64 bounceBytes;
 
         nvDbgSnprintf(hintStr, sizeof(hintStr), "%s%s", hintNames[VE_HINT_STATE(pProcs[i].hint) & 3],
                       (pProcs[i].hint & VE_HINT_INHERITED) ? "^" : "");
-        EVICT_PRINTF("%-8u %-16.16s %7llu %7llu %8llu %7s %7u %-7s %s%s\n",
+        vepBounces(pProcs[i].pid, &bounces, &bounceBytes);
+        bounceStr[0] = '\0';
+        if (bounces != 0)
+            nvDbgSnprintf(bounceStr, sizeof(bounceStr), "bounces=%u/%lluMB ", bounces, bounceBytes >> 20);
+        EVICT_PRINTF("%-8u %-16.16s %7llu %7llu %8llu %7s %7u %-7s %s%s%s\n",
                      pProcs[i].pid, pProcs[i].name,
                      pProcs[i].vidmemBytes >> 20, pProcs[i].evictedBytes >> 20,
                      pProcs[i].eligibleBytes >> 20, idleStr, _vidmemActivityRecent(pProcs[i].pid), hintStr,
-                     pProcs[i].bNever ? "never " : "",
+                     pProcs[i].bNever ? "never " : "", bounceStr,
                      (pProcs[i].pid == _vidmemBusiestPid) ? "busiest" : "");
     }
 

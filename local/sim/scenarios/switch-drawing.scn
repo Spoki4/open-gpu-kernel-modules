@@ -1,0 +1,64 @@
+# host 2026-11-12 00:42 (recording 20261111_194240): the user switched from the
+# game to Claude. Chrome, covered by it a moment ago and drawing until then,
+# gave 1.5 GB in five pieces for Claude's headroom, got 869 MB back two
+# seconds later ("drawing again, not visible"), gave 975 MB again and got 264
+# back: 3.6 GB of copies and a dozen pauses of 20-40 ms in four seconds, at
+# the moment the user starts to work with the window.
+#   - the headroom (2112 MB) is kept for any focused window, while what comes
+#     back by itself left only the low mark (1280 MB) free unless the focus
+#     was a game: whatever went out for the headroom and was smaller than the
+#     difference came straight back and went out again;
+#   - "drawing steadily" was counted from before it was moved out, so the
+#     frames Chrome drew as a visible window brought it back as a hidden one.
+cap 11000
+proc 1614 kwin_wayland old
+proc 1625 plasmashell old
+proc 5000 Wow.exe old chunk=64
+proc 7000 chrome old chunk=32
+proc 9000 claude-desktop old chunk=16
+
+hint 1625 v
+hint 5000 f launched
+hint 7000 v
+hint 9000 h
+act 1614 0 4
+act 1625 0 4
+act 5000 0 30
+act 7000 0 6
+act 9000 300 0
+target 1614 280 0.75
+target 1625 480 0.4
+target 5000 6000 0.75
+target 7000 2400 0.8
+place 9000 300 484 0.9
+at 20
+
+mark the user switches to Claude, its window covers Chrome; Claude gets its memory back and grows
+hint 9000 f
+hint 5000 v
+hint 7000 h
+act 9000 0 8
+step
+target 9000 900 0.9 spread=3      # below 1 GB: not what the policy takes for a game
+at 24
+expect sys 9000 == 0
+expect evicted 7000 > 0          # the headroom came from the window just covered
+
+mark Chrome draws on for twelve seconds (a page finishing its work) while Claude grows a little more, then stops
+at 32
+target 9000 980 0.9 spread=4
+at 36
+act 7000 30 0
+at 80
+expect restores 7000 == 0        # nothing came back to go out again
+expect pingpong 7000 == 0
+expect bounce_mb 7000 == 0       # the number `evict.sh status` shows
+expect evicts 7000 < 6
+
+mark the user looks at Chrome again: all of it is back at once
+hint 7000 f
+hint 9000 v
+act 7000 0 6
+step
+at 84
+expect sys 7000 == 0
