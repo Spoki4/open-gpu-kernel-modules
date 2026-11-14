@@ -1264,9 +1264,26 @@ vepCompactWantMB(NvU64 freeMB)
     return wantMB;
 }
 
+//
+// And what is in the window must fit into the free chunks outside it (and
+// outside the run, when the window is apart from it and the run is kept):
+// the window grows step after step, and without this it grew past all the
+// free memory there is. The simulator, placing memory as the driver does:
+// 1698 MB free, the run at 1168 MB, the window 1952 MB with 250 MB to move
+// and 2 MB free outside it; every step after that found "no room", and the
+// run stayed 100 MB short of what was wanted.
+//
+// What a window costs is what the step will copy: an allocation moves whole,
+// so one with a corner in the window brings the rest of itself (pOwners: per
+// chunk the allocation of more than a chunk that holds most of it, and how
+// much of that allocation is in the chunk). Counted by the frames inside
+// only, the window above ended on the edge of a 256 MB block of the game:
+// 2 MB of it inside, no room for 256 MB outside, and no shorter window was
+// tried. pOwners NULL: by the frames inside, as before.
+//
 NvBool
-vepCompactWindow(const NvU32 *pCost, NvU64 chunks, NvU64 runStart, NvU64 runLen, NvU64 budgetFrames,
-                 NvU64 *pLo, NvU64 *pHi)
+vepCompactWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, NvU64 chunks, NvU64 chunkFrames,
+                 NvU64 runStart, NvU64 runLen, NvU64 budgetFrames, NvU64 *pLo, NvU64 *pHi)
 {
     NvU64 seg = 0, best = 0, bestCost = 0, lo = 0, hi = 0, freeChunks = 0, c;
 
@@ -1274,22 +1291,57 @@ vepCompactWindow(const NvU32 *pCost, NvU64 chunks, NvU64 runStart, NvU64 runLen,
         freeChunks += (pCost[c] == 0);
     for (c = 0; c <= chunks; c++)
     {
-        NvU64 l, r, cost;
+        NvU64 l, r, cost, drag, freeIn;
 
         if ((c < chunks) && (pCost[c] != VEP_COMPACT_FIXED))
             continue;
         if ((c - seg > runLen) &&
             (((runStart >= seg) && (runStart < c)) || (freeChunks - NV_MIN(freeChunks, runLen) > runLen)))
         {
-            for (l = r = seg, cost = 0; r < c; r++)
+            for (l = r = seg, cost = 0, drag = 0, freeIn = 0; r <= c; r++)
             {
-                cost += pCost[r];
-                while (cost > budgetFrames)
-                    cost -= pCost[l++];
-                if ((cost != 0) && ((r + 1 - l > best) || ((r + 1 - l == best) && (cost < bestCost))))
+                NvU32 o;
+
+                // Past the stretch: only takes the chunks left out of the window (pCount back to zeros).
+                if (r < c)
+                {
+                    cost   += pCost[r];
+                    freeIn += (pCost[r] == 0);
+                    o = (pOwners != NULL) ? pOwners->pOwner[r] : 0;
+                    if (o != 0)
+                    {
+                        if (pOwners->pCount[o]++ == 0)
+                            drag += pOwners->pFrames[o];
+                        drag -= NV_MIN(drag, (NvU64)pOwners->pOwn[r]);
+                    }
+                }
+                for (;;)
+                {
+                    // Free chunks for what moves out: not in the window, not in the run when it is kept.
+                    NvBool bKeep = (runStart >= r + 1) || (runStart + runLen <= l);
+                    NvU64  room = freeChunks - freeIn;
+
+                    room -= bKeep ? NV_MIN(room, runLen) : 0;
+                    if ((l > r) || (l == c) ||
+                        ((r < c) && (cost + drag <= budgetFrames) && (cost + drag <= room * chunkFrames)))
+                        break;
+                    cost   -= pCost[l];
+                    freeIn -= (pCost[l] == 0);
+                    o = (pOwners != NULL) ? pOwners->pOwner[l] : 0;
+                    if (o != 0)
+                    {
+                        drag += pOwners->pOwn[l];
+                        if (--pOwners->pCount[o] == 0)
+                            drag -= NV_MIN(drag, (NvU64)pOwners->pFrames[o]);
+                    }
+                    l++;
+                }
+                if ((l > r) || (r == c))
+                    continue;
+                if ((cost != 0) && ((r + 1 - l > best) || ((r + 1 - l == best) && (cost + drag < bestCost))))
                 {
                     best     = r + 1 - l;
-                    bestCost = cost;
+                    bestCost = cost + drag;
                     lo       = l;
                     hi       = r + 1;
                 }

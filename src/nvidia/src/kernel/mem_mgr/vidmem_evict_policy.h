@@ -318,9 +318,22 @@ NvU64  vepCompactNeedMB(void);
 // The window for a step, shared by the driver and the simulator. pCost: per
 // 2 MB chunk the frames in use that may move (0: free), VEP_COMPACT_FIXED
 // when it holds one that may not; the longest free run is `runLen` chunks
-// at `runStart`. NV_TRUE: chunks [*pLo, *pHi).
-NvBool vepCompactWindow(const NvU32 *pCost, NvU64 chunks, NvU64 runStart, NvU64 runLen, NvU64 budgetFrames,
-                        NvU64 *pLo, NvU64 *pHi);
+// at `runStart`; a chunk is `chunkFrames` frames. pOwners (or NULL): the
+// allocations of more than a chunk that may move, numbered from 1; pOwner[c]
+// is the one holding most of chunk c (0: none) with pOwn[c] of its frames
+// there, pFrames[n] is all of allocation n, pCount[n] is scratch, zeros
+// before and after. NV_TRUE: chunks [*pLo, *pHi).
+typedef struct
+{
+    const NvU32 *pOwner;
+    const NvU32 *pOwn;
+    const NvU32 *pFrames;
+    NvU32       *pCount;
+} VEP_COMPACT_OWNERS;
+// Allocations numbered at most; the rest count by their frames in the window only.
+#define VEP_COMPACT_MAX_OWNERS 8192
+NvBool vepCompactWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, NvU64 chunks, NvU64 chunkFrames,
+                        NvU64 runStart, NvU64 runLen, NvU64 budgetFrames, NvU64 *pLo, NvU64 *pHi);
 // Total evicted bytes right now (the engine's count).
 extern NvU64 _vidmemEvictBytes;
 // kwin_wayland / Xwayland (video_mem.c).

@@ -77,6 +77,8 @@ static int    gHintsActive;
 static int    gVerbose;
 static double gCopyGBs = 3.5;     // copy speed of a move (2026-11-06 CoD: 494 MB in 139 ms)
 static double gFrag = 1.0;        // share of free memory in free 2 MB chunks
+static int    gCompactOwners = 1; // the compaction window is charged for whole allocations (knob "compact_whole")
+static int    gPlaceTop = 1;      // non-contiguous allocations fill the layout from the top (knob "place_top")
 static NvU64  gLongestMB;         // longest free run (0: no limit): a bigger contiguous buffer comes back only into a cleared window
 // The layout (knob "layout"): which allocation holds each 2 MB chunk, 0 free.
 static int    gLayout;
@@ -248,10 +250,17 @@ static int layOpen(NvU64 c, NvU64 aLo, NvU64 aHi, NvU64 bLo, NvU64 bHi)
     return (gChunk[c] == 0) && !((c >= aLo) && (c < aHi)) && !((c >= bLo) && (c < bHi));
 }
 
-// Places `a` outside [aLo, aHi) and [bLo, bHi); 0: no room there.
-static int layPlace(Alloc *a, NvU64 aLo, NvU64 aHi, NvU64 bLo, NvU64 bHi)
+//
+// Places `a` outside [aLo, aHi) and [bLo, bHi); 0: no room there. Where, as
+// the driver does it (how): a new or restored allocation from the top
+// (LAY_TOP, every non-contiguous one since 2026-11-04) or from the bottom
+// (LAY_LOW: a contiguous one into the first run that holds it); one moved inside vidmem into the smallest free
+// run that holds it, else the lowest free chunks (LAY_FIT, _vidmemRelocate()).
+//
+enum { LAY_LOW, LAY_TOP, LAY_FIT };
+static int layPlace(Alloc *a, int how, NvU64 aLo, NvU64 aHi, NvU64 bLo, NvU64 bHi)
 {
-    NvU64 need = (a->kb + 2047) >> 11, c, run = 0, open = 0;
+    NvU64 need = (a->kb + 2047) >> 11, c, run = 0, open = 0, bestEnd = 0, bestLen = 0;
 
     if (!gLayout || (a->where != W_VID) || (need == 0))
         return 1;
@@ -274,11 +283,36 @@ static int layPlace(Alloc *a, NvU64 aLo, NvU64 aHi, NvU64 bLo, NvU64 bHi)
             }
         }
     }
+    else if (how == LAY_FIT)
+    {
+        for (c = 0; c <= gChunks; c++)
+        {
+            if ((c < gChunks) && layOpen(c, aLo, aHi, bLo, bHi))
+            {
+                run++;
+                continue;
+            }
+            if ((run >= need) && ((bestLen == 0) || (run < bestLen)))
+            {
+                bestLen = run;
+                bestEnd = c;
+            }
+            run = 0;
+        }
+        if (bestLen != 0)
+        {
+            for (c = bestEnd - bestLen; need != 0; c++, need--)
+                gChunk[c] = a->id;
+            return 1;
+        }
+    }
     for (c = 0; (c < gChunks) && (need != 0); c++)
     {
-        if (layOpen(c, aLo, aHi, bLo, bHi))
+        NvU64 x = ((how == LAY_TOP) && !a->contig) ? gChunks - 1 - c : c;
+
+        if (layOpen(x, aLo, aHi, bLo, bHi))
         {
-            gChunk[c] = a->id;
+            gChunk[x] = a->id;
             need--;
         }
     }
@@ -287,7 +321,7 @@ static int layPlace(Alloc *a, NvU64 aLo, NvU64 aHi, NvU64 bLo, NvU64 bHi)
 
 static void layPlaceNew(Proc *p, Alloc *a)
 {
-    if (!layPlace(a, 0, 0, 0, 0))
+    if (!layPlace(a, gPlaceTop ? LAY_TOP : LAY_LOW, 0, 0, 0, 0))
     {
         fprintf(stderr, "%s:%d: layout: no free 2 MB chunks for %llu KB of %s (sizes in whole chunks?)\n",
                 gScenario, gLine, (unsigned long long)a->kb, p->name);
@@ -532,7 +566,8 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
 {
     NvU64   wantMB;
     NvU64   freeChunks = 0, runStart = 0, runLen, lo = 0, hi = 0, c, doneKB = 0, keepLo = 0, keepHi = 0;
-    NvU32  *pCost;
+    NvU32  *pCost, *pOwner, *pOwn, *pFrames, *pCount;
+    VEP_COMPACT_OWNERS owners;
     Alloc **byId;
     Proc  **procOf;
     NvU8   *inWin;
@@ -549,6 +584,10 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
         return 0;
 
     pCost  = calloc(gChunks, sizeof(*pCost));
+    pOwner = calloc(gChunks, sizeof(*pOwner));
+    pOwn   = calloc(gChunks, sizeof(*pOwn));
+    pFrames = calloc(gNextId + 1, sizeof(*pFrames));
+    pCount  = calloc(gNextId + 1, sizeof(*pCount));
     byId   = calloc(gNextId, sizeof(*byId));
     procOf = calloc(gNextId, sizeof(*procOf));
     inWin  = calloc(gNextId, 1);
@@ -570,8 +609,20 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
             continue;
         pCost[c] = (SIM_VICTIM(procOf[id]) && byId[id]->movable && (byId[id]->kb <= SIM_LIMIT_KB(procOf[id]))) ?
                    SIM_CHUNK_FRAMES : VEP_COMPACT_FIXED;
+        // More than a chunk: the window pays for all of it (the allocation's id is its number).
+        if ((pCost[c] != VEP_COMPACT_FIXED) && (byId[id]->kb > 2048))
+        {
+            pOwner[c]   = id;
+            pOwn[c]     = SIM_CHUNK_FRAMES;
+            pFrames[id] = (NvU32)(((byId[id]->kb + 2047) >> 11) * SIM_CHUNK_FRAMES);
+        }
     }
-    if (!vepCompactWindow(pCost, gChunks, runStart, runLen, (stepMB << 20) >> 16, &lo, &hi))
+    owners.pOwner  = pOwner;
+    owners.pOwn    = pOwn;
+    owners.pFrames = pFrames;
+    owners.pCount  = pCount;
+    if (!vepCompactWindow(pCost, gCompactOwners ? &owners : NULL, gChunks, SIM_CHUNK_FRAMES, runStart, runLen,
+                          (stepMB << 20) >> 16, &lo, &hi))
     {
         gCompactIdle++;
         if (gVerbose)
@@ -614,7 +665,7 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
                 NvU32 oldId = a->id;
                 NvU64 x;
 
-                if (!layPlace(a, lo, hi, keepLo, keepHi))
+                if (!layPlace(a, LAY_FIT, lo, hi, keepLo, keepHi))
                 {
                     failed++;
                     continue;
@@ -657,6 +708,10 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
     }
 done:
     free(pCost);
+    free(pOwner);
+    free(pOwn);
+    free(pFrames);
+    free(pCount);
     free(byId);
     free(procOf);
     free(inWin);
@@ -1117,6 +1172,8 @@ static int setKnob(const char *k, const char *v)
     else if (strcmp(k, "layout") == 0)       gLayout = (int)d;
     else if (strcmp(k, "compact") == 0)      _vidmemCompactRunMB = (NvU32)d;
     else if (strcmp(k, "compact_big") == 0)  _vidmemCompactBig = (NvU32)d;
+    else if (strcmp(k, "place_top") == 0)    gPlaceTop = (int)d;
+    else if (strcmp(k, "compact_whole") == 0) gCompactOwners = (int)d;
     else return 0;
     return 1;
 }
