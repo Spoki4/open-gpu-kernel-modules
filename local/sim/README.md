@@ -48,7 +48,9 @@ the clock from `vidmem_evict_sim.h`.
 - Activity (idle seconds, engine samples) and window hints are inputs, as
   the driver would have sampled them.
 - With `set layout 1` allocations have places: each holds whole 2 MB chunks,
-  the lowest free ones. Background compaction then runs as in the driver:
+  placed as the driver places them (a non-contiguous one from the top, a
+  contiguous one in the first free run from the bottom, one moved inside
+  vidmem in the smallest free run that holds it). Background compaction then runs as in the driver:
   the same window search (`vepCompactWindow()` in the policy file), whole
   allocations moved out of the window, the owner's piece size and the step's
   total, no new chunks in the window or in the run that is kept. `mix` lays
@@ -66,7 +68,7 @@ One command per line, `#` starts a comment. Times are seconds from the start.
 | command | |
 |---|---|
 | `cap MB` | vidmem for processes |
-| `set KNOB VALUE` | `fg_headroom`, `bg_cushion`, `auto`, `low`, `high` (policy registry knobs), `fg_own` (problem #7, 1/0), `copy_gbs`, `frag`, `longest` (MB, longest free run: a bigger contiguous allocation comes back from sysmem only into a window the policy had cleared; 0: no limit), `autotick` (policy step every 2 s, default 1), `hints`, `layout` (1: allocations have places), `compact` (MB, the free run compaction keeps), `compact_big` (0: compaction moves allocations of 32 MB at most, as before problem #17) |
+| `set KNOB VALUE` | `fg_headroom`, `bg_cushion`, `auto`, `low`, `high` (policy registry knobs), `fg_own` (problem #7, 1/0), `copy_gbs`, `frag`, `longest` (MB, longest free run: a bigger contiguous allocation comes back from sysmem only into a window the policy had cleared; 0: no limit), `autotick` (policy step every 2 s, default 1), `hints`, `layout` (1: allocations have places), `compact` (MB, the free run compaction keeps), `compact_big` (0: compaction moves allocations of 32 MB at most, as before problem #17), `compact_whole` (0: the compaction window is charged for the frames inside it only, as before), `place_top` (0: every allocation takes the lowest free chunks; 1, the default: non-contiguous ones from the top, as the driver) |
 | `proc PID NAME [old] [never] [exempt] [chunk=MB]` | a process; `old`: seen long before the start; kwin_wayland/Xwayland are the compositor |
 | `hint PID f\|v\|h\|- [inh] [other] [full] [launched]` | window hint (focused, visible, hidden, none), inherited from a parent (of another app), has a fullscreen window, started by Steam/GameMode |
 | `act PID IDLE_S\|- SAMPLES` | GPU activity: seconds since its last work (`-` never), engine samples in the last ~10 s |

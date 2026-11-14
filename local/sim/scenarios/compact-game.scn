@@ -58,6 +58,7 @@ hint 2617 f
 act 2617 0 20
 at 170
 expect longest - >= 1270             # three quarters of what is free, 20 s after the switch
+                                     # (`-set compact_whole=0`: stuck at 1168 MB, the window ends inside a 256 MB block)
 expect compact_pause 12557 <= 27     # 256 MB at 10 MB/ms
 expect compact_pause 2617 <= 11      # the browser is the focus now: its pieces are the small ones
 expect evicts 12557 == 0             # compaction moves inside vidmem only

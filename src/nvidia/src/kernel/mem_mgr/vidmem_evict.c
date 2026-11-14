@@ -4198,6 +4198,59 @@ _vidmemCompactVictim(VIDMEM_EVICT_PROC *p, NvBool bFgToo)
            (portStringCompare(p->name, "Xwayland", NV_PROC_NAME_MAX_LENGTH) != 0);
 }
 
+//
+// For vepCompactWindow(): allocation `idx` becomes the owner of every 2 MB
+// chunk it holds more frames of than the owner so far. pTmp: a count per
+// chunk, zeros before and after.
+//
+static void
+_vidmemCompactOwn(MEMORY_DESCRIPTOR *pMemDesc, NvU32 idx, NvU32 *pOwner, NvU32 *pOwn, NvU32 *pTmp,
+                  NvU64 base, NvU64 off, NvU64 chunks)
+{
+    PMA_ALLOC_INFO *pInfo = pMemDesc->pPmaAllocInfo;
+    NvU64 pageBytes, n, i, f, end;
+    NvU32 pass;
+
+    if (pInfo == NULL)
+        return;
+    n         = pInfo->bContig ? 1 : pInfo->pageCount;
+    pageBytes = pInfo->bContig ? pInfo->allocSize : pInfo->pageSize;
+    for (pass = 0; pass < 2; pass++)
+    {
+        for (i = 0; i < n; i++)
+        {
+            NvU64 a = pInfo->pageArray[i];
+
+            if (a < base)
+                continue;
+            f   = NV_MAX((a - base) >> PMA_PAGE_SHIFT, off);
+            end = (a - base + pageBytes) >> PMA_PAGE_SHIFT;
+            while (f < end)
+            {
+                NvU64 c = (f - off) / VIDMEM_EVICT_CHUNK_FRAMES;
+                NvU64 next = NV_MIN(end, off + (c + 1) * VIDMEM_EVICT_CHUNK_FRAMES);
+
+                if (c >= chunks)
+                    break;
+                if (pass == 0)
+                {
+                    pTmp[c] += (NvU32)(next - f);
+                }
+                else if (pTmp[c] != 0)
+                {
+                    if (pTmp[c] > pOwn[c])
+                    {
+                        pOwner[c] = idx;
+                        pOwn[c]   = pTmp[c];
+                    }
+                    pTmp[c] = 0;
+                }
+                f = next;
+            }
+        }
+    }
+}
+
 // What the last step saw in vidmem, by why it could or could not move (bytes).
 enum { VC_MOVABLE, VC_DESKTOP, VC_FG, VC_SHARED, VC_BIG, VC_REFUSED, VC_COUNT };
 static NvU64 _vidmemCompactSeen[VC_COUNT];
@@ -4214,9 +4267,10 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
     NvU64   runStart = 0, runLen = 0, cur = 0, freeChunks = 0;
     NvU64   budgetFrames = (budgetMB << 20) >> PMA_PAGE_SHIFT, lo, hi;
     NvU64  *pUsed, *pMovable = NULL, movedMB = 0;
-    NvU32  *pCost = NULL;
+    NvU32  *pCost = NULL, *pOwner = NULL, *pOwnerFrames = NULL;
+    VEP_COMPACT_OWNERS owners = {0};
     VIDMEM_EVICT_MAPREF *pRefs = NULL;
-    NvU32   i, victims = 0;
+    NvU32   i, victims = 0, numOwners = 0;
     const char *why = "";
 
     *pWindowMB = 0;
@@ -4231,9 +4285,15 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
     pMovable = portMemAllocNonPaged(words * sizeof(NvU64));
     pCost    = portMemAllocNonPaged(NV_MAX(chunks, 1) * sizeof(NvU32));
     pRefs    = portMemAllocNonPaged(sizeof(*pRefs) * VIDMEM_EVICT_MAX_MAPPINGS);
-    if ((pMovable == NULL) || (pCost == NULL) || (pRefs == NULL) || (chunks == 0))
+    // Who holds each chunk, the frames it has there, a scratch count; per allocation its frames and a scratch count.
+    pOwner       = portMemAllocNonPaged(NV_MAX(chunks, 1) * 3 * sizeof(NvU32));
+    pOwnerFrames = portMemAllocNonPaged((VEP_COMPACT_MAX_OWNERS + 1) * 2 * sizeof(NvU32));
+    if ((pMovable == NULL) || (pCost == NULL) || (pRefs == NULL) || (pOwner == NULL) || (pOwnerFrames == NULL) ||
+        (chunks == 0))
         goto done;
     portMemSet(pMovable, 0, words * sizeof(NvU64));
+    portMemSet(pOwner, 0, chunks * 3 * sizeof(NvU32));
+    portMemSet(pOwnerFrames, 0, (VEP_COMPACT_MAX_OWNERS + 1) * 2 * sizeof(NvU32));
 
     // Frames in use per chunk for now; the longest free run.
     for (c = 0; c < chunks; c++)
@@ -4328,6 +4388,13 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
                 else
                     _vidmemCompactSeen[VC_MOVABLE] += bytes;
                 (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pMovable, base, frames);
+                // It moves whole: the window is charged for all of it (vepCompactWindow()).
+                if ((bytes > (2ULL << 20)) && (numOwners < VEP_COMPACT_MAX_OWNERS))
+                {
+                    pOwnerFrames[++numOwners] = (NvU32)(bytes >> PMA_PAGE_SHIFT);
+                    _vidmemCompactOwn(pMemory->pMemDesc, numOwners, pOwner, pOwner + chunks, pOwner + 2 * chunks,
+                                      base, off, chunks);
+                }
             }
         }
     }
@@ -4347,7 +4414,12 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
     }
 
     // The window this step clears (vepCompactWindow(), shared with the simulator).
-    (void)vepCompactWindow(pCost, chunks, runStart, runLen, budgetFrames, &lo, &hi);
+    owners.pOwner  = pOwner;
+    owners.pOwn    = pOwner + chunks;
+    owners.pFrames = pOwnerFrames;
+    owners.pCount  = pOwnerFrames + VEP_COMPACT_MAX_OWNERS + 1;
+    (void)vepCompactWindow(pCost, &owners, chunks, VIDMEM_EVICT_CHUNK_FRAMES, runStart, runLen, budgetFrames,
+                           &lo, &hi);
     if (hi == lo)
     {
         why = "no stretch longer than the run is free of memory that cannot be moved now";
@@ -4403,6 +4475,8 @@ done:
     portMemFree(pMovable);
     portMemFree(pCost);
     portMemFree(pRefs);
+    portMemFree(pOwner);
+    portMemFree(pOwnerFrames);
     return movedMB;
 }
 
