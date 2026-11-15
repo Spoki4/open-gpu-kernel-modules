@@ -77,6 +77,7 @@ kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font: i
     <label class="chk"><input type="checkbox" id="f2" checked>back</label>
     <label class="chk"><input type="checkbox" id="f3" checked>inside vidmem</label>
   </span>
+  <label class="chk" title="show each move as it goes: the blocks fly from where they were to where they are put"><input type="checkbox" id="anim" checked>animate moves</label>
   <span class="dim"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> moves, <kbd>space</kbd> play, wheel on the timeline zooms, drag scrubs</span>
 </header>
 <main>
@@ -96,6 +97,7 @@ kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font: i
         <span><span class="sw" style="border:2px solid var(--dst)"></span> arrived here</span>
         <span><span class="sw" style="border:2px solid var(--win)"></span> window being cleared</span>
         <span><span class="sw" style="border:2px dashed var(--keep)"></span> free run kept</span>
+        <span>&#8594; from where to where</span>
       </div>
     </div>
   </div>
@@ -207,14 +209,29 @@ function stepAt(t) {                   // the step the cursor is in or has just 
 // ---- what the step at the cursor moved: marks per frame (1 left, 2 arrived) ----
 const mark = new Uint8Array(F);
 let markStep = -2, win = null;
+// The same as flows: {p, sc: cells left, dc: cells taken}; a move inside
+// vidmem has both (the new place is allocated, then the old one freed), one
+// to sysmem only sc, one back only dc.
+let flows = [];
+function cellsOf(r) {
+  const out = [];
+  let last = -1;
+  for (let j = 0; j < r.length; j += 2) {
+    const c1 = Math.ceil((r[j] + r[j + 1]) / CF);
+    for (let c = Math.floor(r[j] / CF); c < c1; c++) { if (c !== last) out.push(c); last = c; }
+  }
+  return out;
+}
 function buildMarks(si) {
   if (si === markStep) return;
   markStep = si;
   mark.fill(0);
   win = null;
+  flows = [];
   if (si < 0) return;
   const s = steps[si];
   const a = upper(E.t, s.t0 - 2), b = upper(E.t, s.t1 + 0.5);
+  const took = new Map(), left = new Map();     // per process: places waiting for their other end
   for (let i = a; i < b; i++) {
     const k = E.k[i], r = E.r[i];
     if (k === 5) win = r;
@@ -222,6 +239,18 @@ function buildMarks(si) {
     for (let j = 0; j < r.length; j += 2) {
       const e = r[j] + r[j + 1];
       for (let f = r[j]; f < e; f++) mark[f] |= k ? 2 : 1;
+    }
+    const p = E.p[i], c = cellsOf(r);
+    if (E.m[i] !== 3) { flows.push(k ? { p, sc: [], dc: c } : { p, sc: c, dc: [] }); continue; }
+    const mine = k ? took : left, other = (k ? left : took).get(p);
+    if (other && other.length) {
+      const o = other.shift();
+      if (k) o.dc = c; else o.sc = c;
+    } else {
+      const fl = k ? { p, sc: [], dc: c } : { p, sc: c, dc: [] };
+      flows.push(fl);
+      if (!mine.has(p)) mine.set(p, []);
+      mine.get(p).push(fl);
     }
   }
   // The window of a compaction step is traced just before its first move.
@@ -256,7 +285,7 @@ function layoutMap() {
   mapC.width = Math.round(w * dpr);
   mapC.height = Math.round((rows * ch + 4) * dpr);
 }
-function drawMap() {
+function drawMap(u) {                  // u: how far the move at the cursor has got (0..1), null: it is over
   const g = mctx, rows = Math.ceil(NCH / COLS), SEG = 4, sf = CF / SEG, sw = cw / SEG;
   const free = css("--free"), bg = css("--panel"), dim = css("--dim");
   const colors = P.map((p, i) => pcolor(i));
@@ -290,7 +319,7 @@ function drawMap() {
     g.fillRect(x + cw - 1, y, 1, ch - 1);
   }
   // What the move at the cursor took away and brought.
-  if (markStep >= 0) {
+  if (markStep >= 0 && u == null) {
     const src = css("--src"), dst = css("--dst");
     for (let c = 0; c < NCH; c++) {
       let m = 0;
@@ -310,6 +339,61 @@ function drawMap() {
   if (win) {
     span(win[0], win[1], css("--win"), []);
     if (win.length >= 4) span(win[2], win[3], css("--keep"), [4, 3]);
+  }
+  if (markStep >= 0) flow(u);
+  // The move itself: the map shows the moment before it, the blocks go from
+  // their old cells to the new ones (to sysmem: fade away, back: fade in).
+  function flow(u) {
+    const src = css("--src"), dst = css("--dst"), ink = css("--ink");
+    const X = c => LEFT + (c % COLS) * cw, Y = c => 2 + Math.floor(c / COLS) * ch;
+    const e = u == null ? 1 : u < 0.5 ? 2 * u * u : 1 - 2 * (1 - u) * (1 - u);
+    if (u != null) {
+      g.lineWidth = 1.5;
+      for (const fl of flows) {
+        for (const c of fl.sc) {
+          g.globalAlpha = 0.85 * e; g.fillStyle = free; g.fillRect(X(c), Y(c), cw - 1, ch - 1);
+          g.globalAlpha = 1; g.strokeStyle = src; g.strokeRect(X(c) + 1, Y(c) + 1, cw - 3, ch - 3);
+        }
+        for (const c of fl.dc) {
+          if (!fl.sc.length) { g.globalAlpha = e; g.fillStyle = colors[fl.p]; g.fillRect(X(c), Y(c), cw - 1, ch - 1); }
+          g.globalAlpha = 1; g.strokeStyle = dst; g.strokeRect(X(c) + 1, Y(c) + 1, cw - 3, ch - 3);
+        }
+      }
+    }
+    // An arrow per allocation moved, from the middle of the old place to the middle of the new one.
+    for (const fl of flows) {
+      if (!fl.sc.length || !fl.dc.length) continue;
+      const a = fl.sc[fl.sc.length >> 1], b = fl.dc[fl.dc.length >> 1];
+      const x0 = X(a) + cw / 2, y0 = Y(a) + ch / 2;
+      const x1 = x0 + (X(b) + cw / 2 - x0) * e, y1 = y0 + (Y(b) + ch / 2 - y0) * e;
+      const len = Math.hypot(x1 - x0, y1 - y0);
+      if (len < 2) continue;
+      const ux = (x1 - x0) / len, uy = (y1 - y0) / len, h = Math.min(9, len);
+      for (const [color, wdt] of [[bg, 4], [ink, 1.5]]) {
+        g.strokeStyle = g.fillStyle = color; g.lineWidth = wdt;
+        g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1 - ux * h * 0.6, y1 - uy * h * 0.6); g.stroke();
+        g.beginPath(); g.moveTo(x1, y1);
+        g.lineTo(x1 - ux * h - uy * h * 0.45, y1 - uy * h + ux * h * 0.45);
+        g.lineTo(x1 - ux * h + uy * h * 0.45, y1 - uy * h - ux * h * 0.45);
+        g.closePath(); g.fill(); if (wdt > 2) g.stroke();
+      }
+      g.beginPath(); g.arc(x0, y0, 2.5, 0, 7); g.fillStyle = ink; g.fill();
+    }
+    if (u == null) return;
+    let total = 0;
+    for (const fl of flows) if (fl.dc.length) total += fl.sc.length;
+    const stride = Math.max(1, Math.ceil(total / 1500));
+    g.lineWidth = 1;
+    for (const fl of flows) {
+      if (!fl.sc.length || !fl.dc.length) continue;
+      g.fillStyle = colors[fl.p]; g.strokeStyle = ink;
+      for (let k = 0; k < fl.sc.length; k += stride) {
+        const a = fl.sc[k], b = fl.dc[Math.min(fl.dc.length - 1, Math.floor(k * fl.dc.length / fl.sc.length))];
+        const x = X(a) + (X(b) - X(a)) * e, y = Y(a) + (Y(b) - Y(a)) * e;
+        g.fillRect(x, y, cw - 1, ch - 1);
+        g.strokeRect(x + 0.5, y + 0.5, cw - 2, ch - 2);
+      }
+    }
   }
   function span(f0, n, color, dash) {    // an outline along the cells of frames [f0, f0 + n), row by row
     let c0 = Math.floor(f0 / CF);
@@ -493,22 +577,46 @@ function drawEvents() {
   if (key === evShown) return;
   evShown = key;
   $("events").innerHTML = evList.slice(a, b).map((e, k) =>
-    `<div class="ev${a + k === lo - 1 ? " cur" : ""}" data-t="${e.t}"><time>${clock(e.t).split("  ")[0]}</time>` +
+    `<div class="ev${a + k === lo - 1 ? " cur" : ""}" data-t="${e.t}" data-step="${e.step == null ? -1 : e.step}"><time>${clock(e.t).split("  ")[0]}</time>` +
     `<span class="${e.note === "mark" ? "warn" : ""}">${esc(e.text)}</span></div>`).join("") ||
     `<span class="dim">no moves in this recording</span>`;
 }
-$("events").addEventListener("click", ev => { const d = ev.target.closest(".ev"); if (d) { stop(); setT(+d.dataset.t); } });
+$("events").addEventListener("click", ev => {
+  const d = ev.target.closest(".ev");
+  if (!d) return;
+  stop();
+  if (+d.dataset.step >= 0) go(+d.dataset.step); else setT(+d.dataset.t);
+});
 
 // ---- the loop ----
 let need = false;
 function dirty() { if (!need) { need = true; requestAnimationFrame(render); } }
+let anim = null;     // the move being shown: {si, at, dur, u, resume}
 function render() {
   need = false;
-  seekIndex(upper(E.t, T));
-  const si = stepAt(T);
+  // While a move is shown the map stays at the moment before it.
+  seekIndex(upper(E.t, anim ? steps[anim.si].t0 - 2 : T));
+  const si = anim ? anim.si : stepAt(T);
   buildMarks(si);
   $("clock").textContent = clock(T);
-  drawMap(); drawTimeline(); drawNow(); drawStep(si); drawEvents();
+  drawMap(anim ? anim.u : null); drawTimeline(); drawNow(); drawStep(si); drawEvents();
+}
+function go(i, resume) {               // to step i: shown as it goes, or straight to its end
+  if (!$("anim").checked) { setT(steps[i].t1); return false; }
+  anim = { si: i, at: 0, dur: +$("speed").value >= 30 ? 350 : 1100, u: 0, resume: !!resume };
+  setT(steps[i].t0);
+  requestAnimationFrame(animTick);
+  return true;
+}
+function animTick(ts) {
+  const a = anim;
+  if (!a) return;
+  if (!a.at) a.at = ts;
+  a.u = Math.min(1, (ts - a.at) / a.dur);
+  if (a.u < 1) { dirty(); requestAnimationFrame(animTick); return; }
+  anim = null;
+  setT(steps[a.si].t1);
+  if (a.resume && playing) { lastTs = ts; requestAnimationFrame(tick); }
 }
 function setT(t) {
   T = Math.max(T0, Math.min(T1, t));
@@ -521,15 +629,23 @@ function jump(dir) {
   let i = 0;
   if (dir > 0) { while (i < steps.length && steps[i].t1 <= T + 0.01) i++; if (i === steps.length) return; }
   else { i = steps.length - 1; while (i >= 0 && steps[i].t1 >= T - 0.01) i--; if (i < 0) return; }
-  setT(steps[i].t1);
+  go(i);
 }
 let playing = 0, lastTs = 0;
-function stop() { playing = 0; $("play").innerHTML = "&#9654; play"; }
+function stop() {
+  playing = 0; $("play").innerHTML = "&#9654; play";
+  if (anim) { const a = anim; anim = null; setT(steps[a.si].t1); }    // a move half shown: it is over
+}
 function tick(ts) {
-  if (!playing) return;
+  if (!playing || anim) return;
   const dt = Math.min(100, ts - lastTs);
   lastTs = ts;
-  setT(T + dt * +$("speed").value);
+  const nt = T + dt * +$("speed").value;
+  // A move on the way: show it, then go on from its end.
+  let lo = 0, hi = steps.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (steps[m].t1 <= T) lo = m + 1; else hi = m; }
+  if (lo < steps.length && steps[lo].t0 <= nt && go(lo, true)) return;
+  setT(nt);
   if (T >= T1) { stop(); return; }
   requestAnimationFrame(tick);
 }
@@ -540,7 +656,7 @@ $("play").onclick = () => {
 };
 $("prev").onclick = () => jump(-1);
 $("next").onclick = () => jump(1);
-for (const id of ["f1", "f2", "f3"]) $(id).onchange = () => { buildSteps(); buildEvents(); markStep = -2; dirty(); };
+for (const id of ["f1", "f2", "f3"]) $(id).onchange = () => { stop(); buildSteps(); buildEvents(); markStep = -2; dirty(); };
 addEventListener("keydown", ev => {
   if (ev.target.tagName === "SELECT" || ev.target.tagName === "INPUT") return;
   if (ev.key === "ArrowLeft") { jump(-1); ev.preventDefault(); }
@@ -558,7 +674,7 @@ $("tllegend").innerHTML =
   `<span><span class="sw" style="background:var(--win)"></span> inside vidmem (compaction, a window for a contiguous buffer)</span>` +
   (D.notes.some(n => n[1] === "mark") ? `<span class="warn">| a mark</span>` : "");
 buildSteps(); buildEvents(); layoutMap();
-if (steps.length) setT(steps[0].t1); else dirty();
+if (steps.length) go(0); else dirty();
 </script>
 </body>
 </html>
