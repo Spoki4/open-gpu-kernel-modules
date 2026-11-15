@@ -450,6 +450,7 @@ function drawNow() {
     `<tr><td>free</td><td class="n">${freeMB.toFixed(0)} MB</td></tr>` +
     `<tr><td>free in whole 2 MB chunks</td><td class="n">${freeChunks * 2} MB</td></tr>` +
     `<tr><td>longest free run</td><td class="n">${best * 2} MB</td></tr></table>` +
+    (D.inferred ? `<div class="warn">no snapshot in this trace: the start is inferred from the events; frames nothing happened to are shown as "not known" (free or held, the trace does not tell)</div>` : "") +
     (D.resync.some(r => r[1]) ? `<div class="warn">the trace lost events: ${D.resync.filter(r => r[1]).length} later snapshot(s) differed from what the events had built (${D.resync.reduce((a, r) => a + r[1], 0)} frames)</div>` : "") +
     (D.resync.length && !D.resync.some(r => r[1]) ? `<div class="dim">${D.resync.length} later snapshot(s) agree with the events</div>` : "");
   const hint = new Map();

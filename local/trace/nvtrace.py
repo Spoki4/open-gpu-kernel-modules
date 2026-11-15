@@ -961,6 +961,58 @@ def map_time(text, wall0):
     return t.timestamp() - wall0
 
 
+MAP_UNKNOWN = 0xffffffff       # "pid" of frames nothing is known about (a trace without a snapshot)
+
+
+def map_infer(trace):
+    """The map at the start of a trace that has no snapshot, from its own
+    events: a frame whose first event frees it was held by that process, one
+    whose first event allocates it was free; frames with no event stay not
+    known. Returns (time of the first event, frames, [(pid, comm, start, n)])."""
+    first, held, seen, top = None, [], bytearray(), 0
+
+    def untouched(s, end):
+        k = s
+        while k < end:
+            if seen[k]:
+                k += 1
+                continue
+            z = k
+            while z < end and not seen[z]:
+                z += 1
+            yield k, z - k
+            k = z
+
+    with open(trace, errors="replace") as f:
+        for line in f:
+            if "vidmem_ext" not in line or ("op=free" not in line and "op=alloc" not in line):
+                continue
+            e = parse_line(line)
+            m = RUNS_RE.search(e["body"]) if e else None
+            if not m:
+                continue
+            if first is None:
+                first = e["ts"]
+            c = COMM_RE.search(e["body"])
+            runs = [int(x, 16) for x in m.group(1).split(",") if x]
+            for j in range(0, len(runs) - 1, 2):
+                s, n = runs[j], runs[j + 1]
+                if s + n > top:
+                    top = s + n
+                    seen.extend(bytes(top - len(seen)))
+                if e["f"].get("op") == "free":
+                    for k, cnt in untouched(s, s + n):
+                        held.append((fi(e["f"], "pid"), c.group(1) if c else "-", k, cnt))
+                seen[s:s + n] = b"\x01" * n
+    if first is None:
+        return None
+    frames = (top + 31) & ~31                   # whole 2 MB chunks: the size itself is not in the trace
+    seen.extend(bytes(frames - len(seen)))
+    for k, cnt in untouched(0, frames):
+        held.append((MAP_UNKNOWN, "not known", k, cnt))
+    return first, frames, held
+
+
 def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
     """The data of map.html from a trace: the first snapshot (or the state at
     t_from) as one event, then every change. Later snapshots are compared
@@ -1038,6 +1090,26 @@ def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
             used["mb"][-1] = mb
         else:
             used["t"].append(t); used["mb"].append(mb)
+
+    inferred = False
+    with open(trace, errors="replace") as f:
+        has_snap = any("op=snapend" in line for line in f)
+    if not has_snap:
+        # No snapshot (the driver refused it, or the recording was cut): the
+        # start is what the events themselves tell.
+        got = map_infer(trace)
+        if got is not None:
+            inferred = True
+            base, frames, held = got
+            t_out = base + (t_from or 0)
+            own = array.array("H", [0]) * frames
+            for pid, comm, s, n in held:
+                change(own, None, 1, proc(pid, comm), [s, n])
+            counts[:] = [0] * len(procs)
+            for o, c in collections.Counter(own).items():
+                counts[o] = c
+            for i, c in enumerate(counts):
+                procs[i]["peak"] = max(procs[i]["peak"], c)
 
     with open(trace, errors="replace") as f:
         for line in f:
@@ -1152,7 +1224,7 @@ def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
     return {"title": title, "frames": frames, "base_frame": base_frame, "frame_kb": 64, "procs": procs,
             "why": MAP_WHY, "ev": ev, "moves": moves, "hints": hints, "notes": sorted(notes), "used": used,
             "frag": frag, "frametimes": ft, "resync": resync, "t_first": ev["t"][0], "t_last": ms(last_ts),
-            "wall0": wall0, "before_first_snapshot": before}
+            "wall0": wall0, "before_first_snapshot": before, "inferred": inferred}
 
 
 def write_map(data, out):
@@ -1174,6 +1246,8 @@ def write_map(data, out):
           f"{len(ev['t'])} changes, {len(data['procs']) - 2} processes\n"
           f"map: moves {len(data['moves'])} (to sysmem {kinds[1]}, back {kinds[2]}, inside vidmem {kinds[3]}), "
           f"{placed} with their frames, {ev['k'].count(5)} windows\n"
+          + ("map: no snapshot in the trace: the start is inferred from the events, frames with no event are "
+             "shown as not known\n" if data.get("inferred") else "")
           + (f"map: {len(data['resync'])} later snapshot(s), {lost} frames differed from the events"
              if data["resync"] else "map: no later snapshot to check the events against"))
     return lost
