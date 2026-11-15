@@ -503,6 +503,21 @@ _vidmemEvictBusiestPid(VIDMEM_EVICT_PROC *pProcs, NvU32 count)
 // and then was brought back and moved out again six times (ping-pong).
 //
 #define VIDMEM_EVICT_STEADY_SEC    6
+//
+// A window that is shown and takes this many of the engine samples of the
+// last ~10 s (about a seventh of the GPU's time) while part of its memory is
+// in sysmem is not a frame now and then: it draws from sysmem in earnest and
+// slows everybody down. It comes back after one policy step of that, and the
+// focus's headroom does not hold it out (host, 2026-11-15 19:03: Chrome,
+// playing on monitor 2, gave 572 MB to a screenshot picker that covered both
+// monitors for 2.5 s; shown again it drew from sysmem for 45 s, 11-15 GB/s
+// of PCIe, the game at 2-7 frames a second, because 2787 MB free were 89 MB
+// short of "its memory + the headroom + hysteresis"). The headroom refill
+// does not take it again while it draws (VE_LEVEL_FG_IDLE), so it does not
+// go round; a light one (a terminal, 0-4 samples next to a game) costs
+// nothing in sysmem and waits for the headroom as before (problem #6).
+//
+#define VIDMEM_EVICT_HEAVY_SAMPLES 8
 // Margin on top of what a restore of a non-foreground process needs.
 
 //
@@ -1101,23 +1116,28 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
         VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(pProcs[i].pid, NV_TRUE);
         NvU64 needMB = pProcs[i].evictedBytes >> 20;
         NvBool bVisible = (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_VISIBLE);
+        NvBool bHeavy   = bVisible && (pAct->recentSamples >= VIDMEM_EVICT_HEAVY_SAMPLES);
+        NvU64  steadyNs = (bHeavy ? VIDMEM_EVICT_TICK_SEC : VIDMEM_EVICT_STEADY_SEC) * 1000000000ULL;
+        // A heavy one leaves the low mark free, not the focus's headroom (VIDMEM_EVICT_HEAVY_SAMPLES).
+        NvU64  leaveMB  = bHeavy ? NV_MIN(keepMB, (NvU64)(VIDMEM_EVICT_HINT_LOW_MB + VIDMEM_EVICT_HINT_HYST_MB)) :
+                                   keepMB;
 
         if ((pProcs[i].evictedBytes == 0) || pProcs[i].bNever ||
             (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) ||
             (pAct->drawingSinceNs == 0) ||
-            (VE_AGO_NS(nowNs, pAct->drawingSinceNs) < VIDMEM_EVICT_STEADY_SEC * 1000000000ULL) ||
+            (VE_AGO_NS(nowNs, pAct->drawingSinceNs) < steadyNs) ||
             _vidmemEvictInFgHold(pAct, nowNs))
             continue;
         if (bVisible)
         {
             avail = vepPlatAvailMB(pGpu);
             if (avail + _vidmemEvictFreeableMB(pProcs, count, pProcs[i].pid, VE_LEVEL_HIDDEN, nowNs) <
-                needMB + keepMB)
+                needMB + leaveMB)
                 continue;
             _vidmemEvictWhy = VMT_WHY_ROOM;
-            avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + keepMB,
+            avail = _vidmemEvictHintFree(pGpu, pProcs, count, needMB + leaveMB,
                                          pProcs[i].pid, VE_LEVEL_HIDDEN, "drawing again");
-            if (avail < needMB + keepMB)
+            if (avail < needMB + leaveMB)
                 continue;
         }
         else if (vepPlatAvailMB(pGpu) < needMB + keepMB)
@@ -1125,7 +1145,8 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
             continue;
         }
         NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: restoring %s (pid %u, drawing again, %s, %llu MB)\n",
-                  pProcs[i].name, pProcs[i].pid, bVisible ? "visible" : "not visible", needMB);
+                  pProcs[i].name, pProcs[i].pid,
+                  bHeavy ? "visible and busy on the GPU" : (bVisible ? "visible" : "not visible"), needMB);
         if (bVisible)
             (void)_vidmemEvictContigWindow(pGpu, pProcs, count, i, VE_LEVEL_HIDDEN, nowNs);
         _vidmemEvictWhy = VMT_WHY_RESTORE;
