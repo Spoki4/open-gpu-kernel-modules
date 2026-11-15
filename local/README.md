@@ -175,7 +175,9 @@ moves and the game's frame times, and a cursor to drag or to step from move
 to move (arrow keys). At a move the cells it left are crossed in red, the
 ones it took are framed in green, with the window a compaction step was
 clearing and the free run it had to keep; the panel says whose memory, why,
-how much and how long. `--from` / `--to` cut a part out of a long session.
+how much and how long. Stepping to a move plays it: the map goes back to the
+moment before it and the blocks fly from the old place to the new one, an
+arrow per allocation ("animate moves" turns that off). `--from` / `--to` cut a part out of a long session.
 
 The driver keeps the owner of every frame (a table of 4 bytes per 64 KB,
 filled where PMA hands pages out and takes them back, so the driver's own
