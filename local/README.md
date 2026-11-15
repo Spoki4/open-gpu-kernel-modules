@@ -35,7 +35,10 @@ These patches do the same inside the driver.
   as much of its own older memory goes to sysmem.
 - **Brings memory back** when its window is shown again and there is room,
   the focused window first; nothing returns to others while the focus still
-  has memory in sysmem.
+  has memory in sysmem. The focus keeps a headroom free (2 GB) and the others
+  wait for it, except a shown window that takes a good share of the GPU from
+  sysmem: that one slows the focus more than a short headroom does and comes
+  back after one policy step.
 - **Fights fragmentation.** Scanout and some browser buffers must be
   physically contiguous, and a long session leaves gigabytes free in pieces
   of a few MB. A contiguous request gets a window cleared for it by moving
@@ -402,6 +405,13 @@ run). Sides change where the desktop's memory is placed while a game runs:
 the compositor's contiguous buffers then share the bottom of vidmem with it
 (`nvtest` comproom and scanout-churn are the checks; `evict.sh placesides
 off` is the way back).
+
+A screenshot next to the game (host, 2026-11-15 19:03): the picker covered
+both monitors for 2.5 s, Chrome gave 572 MB for its headroom and, shown
+again, drew from sysmem for 45 s with the game at 2-7 frames a second.
+Replayed in the simulator (`sim/scenarios/screenshot.scn` and the recording
+itself) it now comes back 2.4 s after the picker closes; the 5 s it is out
+remain, and the change has not run on a GPU.
 
 The map of vidmem runs on the host since 2026-11-15 (a game session of
 several hours: every later snapshot agreed with the events, the table with

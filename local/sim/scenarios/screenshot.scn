@@ -1,0 +1,72 @@
+# host 2026-11-15 19:03 (recording 20261115_165356): a screenshot next to the
+# game. Spectacle's region picker covers both monitors for 2.5 s, so every
+# window under it counts as hidden; its buffers ask for the focus's headroom
+# and Chrome, playing on monitor 2 until that moment, gives 572 MB. The picker
+# closes, Chrome is visible again and draws from sysmem: 11-15 GB/s of PCIe,
+# the card at 167 W instead of 334, the game at 2-7 frames a second, every RM
+# call 300 ms. Chrome did not come back for 45 s (until it was clicked):
+# 2787 MB were free and "its memory + the focus's headroom + hysteresis" is
+# 2876. A window that is shown and takes a good share of the GPU from sysmem
+# costs the focus far more than a headroom short of its mark.
+cap 11000
+proc 1614 kwin_wayland old
+proc 1625 plasmashell old
+proc 5000 Wow.exe old chunk=64
+proc 7000 chrome old chunk=32
+proc 2094 ghostty old chunk=8
+proc 9000 claude-desktop old chunk=16
+
+hint 1625 v
+hint 5000 f launched full
+hint 7000 v
+hint 2094 v
+hint 9000 h
+act 1614 0 4
+act 1625 0 4
+act 5000 0 40
+act 7000 0 4
+act 2094 1 0
+act 9000 300 0
+target 1614 280 0.75
+target 1625 480 0.4
+target 5000 6800 0.75
+target 7000 1045 0.8
+target 2094 240 0.7
+place 9000 110 283 0.9
+at 20
+expect sys 7000 == 0
+
+mark the region picker covers both monitors
+proc 4009 spectacle chunk=32
+hint 4009 f full
+hint 5000 h launched full
+hint 7000 h
+hint 2094 h
+hint 1625 h
+step
+target 4009 320 0.9
+at 22
+expect evicted 7000 > 0          # as recorded: it gave for the picker's headroom
+
+mark the picker closes: the game is in focus again, Chrome and the terminal are shown; Chrome draws from sysmem
+free 4009 320
+hint 4009 -
+hint 5000 f launched full
+hint 7000 v
+hint 2094 v
+hint 1625 v
+act 7000 0 12
+act 2094 1 0
+step
+at 24
+act 7000 0 14
+at 28
+expect sys 7000 == 0             # back within a few seconds, not 45
+expect restores 7000 == 1
+
+mark the game streams on with less than its headroom free; Chrome keeps playing
+target 5000 7000 0.75 spread=20
+at 90
+expect sys 7000 == 0
+expect evicts 7000 == 2          # the two pieces for the picker, and not out again
+expect sys 5000 == 0
