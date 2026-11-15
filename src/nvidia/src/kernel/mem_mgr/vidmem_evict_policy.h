@@ -324,6 +324,9 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
 // the policy to see whether the steps get anywhere.
 NvU64  vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB, NvU64 fgStepMB,
                       NvU64 *pWindowMB);
+// What a step of background compaction moves now (vepPlatCompact()'s stepMB
+// and fgStepMB), as of the last policy step.
+void   vepCompactSteps(NvU64 *pStepMB, NvU64 *pFgStepMB);
 // The free run compaction wants with `freeMB` free in whole 2 MB chunks (0:
 // compaction is off), as of the last policy step.
 NvU64  vepCompactWantMB(NvU64 freeMB);

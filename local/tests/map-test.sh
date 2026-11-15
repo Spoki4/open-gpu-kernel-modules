@@ -33,6 +33,7 @@ out=$(../trace/nvtrace.py map "$T/sim" 2>&1); echo "$out" | sed 's/^/  sim: /'
     fail "moves without their frames"
 [[ $(num "$WINDOWS") -ge 5 ]] || fail "no compaction windows"
 grep -q '"comm":"game"' "$T/sim/map.html" || fail "no process names in the page"
+grep -q '"pins":\[.*\["refused","fixed"\]' "$T/sim/map.html" || fail "what cannot move is not in the simulator's page"
 
 # The last arrival of a move lost: the snapshot at the end must show it.
 last=$(grep -n 'op=alloc mode=move' "$T/sim/trace.txt" | tail -1 | cut -d: -f1)
@@ -45,6 +46,8 @@ cat >"$T/kern/trace.txt" <<'EOF'
  Isolated Web Co-4242    [003] ..... 100.000100: vidmem_ext: op=snap mode=- why=- pid=0 comm=- n=1 runs={0x800,0x400}
  Isolated Web Co-4242    [003] ..... 100.000110: vidmem_ext: op=have mode=- why=- pid=1 comm=- n=1 runs={0x0,0x40}
  Isolated Web Co-4242    [003] ..... 100.000120: vidmem_ext: op=have mode=- why=- pid=4242 comm=Isolated Web Co n=2 runs={0x40,0x20,0x100,0x20}
+ Isolated Web Co-4242    [003] ..... 100.000125: vidmem_ext: op=pin mode=other why=- pid=0 comm=- n=1 runs={0x0,0x40}
+ Isolated Web Co-4242    [003] ..... 100.000126: vidmem_ext: op=pin mode=refused why=- pid=0 comm=cpu-mapped n=1 runs={0x40,0x10}
  Isolated Web Co-4242    [003] ..... 100.000130: vidmem_ext: op=snapend mode=- why=- pid=0 comm=- n=1 runs={0x80,0x0}
      kworker/3:1-77      [003] ..... 101.000000: vidmem_ext: op=free mode=evict why=pressure pid=4242 comm=Isolated Web Co n=1 runs={0x100,0x20}
      kworker/3:1-77      [003] ..... 101.004000: vidmem_move: op=evict pid=4242 comm=Isolated Web Co why=pressure kb=2048 allocs=1 failed=0 shared=0 channels=2 total_us=4100 quiesce_us=900 sysalloc_us=100 copy_us=2000 remap_us=500 pma_us=100 sysfree_us=0
@@ -57,6 +60,8 @@ out=$(../trace/nvtrace.py map "$T/kern" 2>&1)
 [[ $(num "$DIFF") == 0 && $(num "$OUT") == 1 && $(num "$PLACED") == 1 ]] ||
     fail "the kernel's lines were not read: $out"
 grep -q '"comm":"Isolated Web Co"' "$T/kern/map.html" || fail "a process name with spaces was cut"
+grep -q '"pins":\[\["other",""\],\["refused","cpu-mapped"\]\]' "$T/kern/map.html" ||
+    fail "the kernel's pins were not read: $(grep -o '"pins":[^}]*' "$T/kern/map.html" | head -c 200)"
 
 if [[ ${1:-} != sim ]]; then
     if ! ls /proc/driver/nvidia/gpus/*/vidmem_evict >/dev/null 2>&1; then
@@ -77,6 +82,9 @@ if [[ ${1:-} != sim ]]; then
         [[ ${to:-0} -ge 1 && ${back:-0} -ge 1 && ${in:-0} -ge 1 ]] || fail "the tests made no moves of each kind ($to out, $back back, $in inside)"
         [[ $(num "$PLACED") == $(num "$MOVES") ]] || fail "moves without their frames"
         [[ $(num "$WINDOWS") -ge 1 ]] || fail "no compaction window in the trace"
+        grep -q 'what compaction could not move is told at' <<<"$out" || fail "the snapshots tell no pins"
+        grep -q '"map_end": "map: .*background compaction now (MB): could move' "$T/rec/meta.json" ||
+            fail "evict.sh map does not say what compaction cannot move"
         sudo journalctl -k --since "-4min" --no-pager | grep -qE 'Xid|BUG:|Oops|general protection' && fail "kernel log"
         cp "$T/rec/map.html" /tmp/map-test.html 2>/dev/null && echo "  the page: /tmp/map-test.html"
     fi

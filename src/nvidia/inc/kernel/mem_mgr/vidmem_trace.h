@@ -68,11 +68,20 @@ void   osVidmemTrace(NvU32 type, NvU32 pid, const NvU64 *pArgs);
 #define VMT_EXT_HAVE    3   // snapshot: frames of one owner
 #define VMT_EXT_SNAPEND 4
 #define VMT_EXT_WINDOW  5   // a compaction step: the window it clears, then the free run it keeps (if any)
+#define VMT_EXT_PIN     6   // snapshot: frames background compaction could not move now (mode: VMT_PIN_*)
 #define VMT_EXT_RUNS    64
 #define VMT_WHY_NONE    255 // not a move
+// VMT_EXT_PIN: why not (in the place of the move's mode).
+#define VMT_PIN_DESKTOP 8   // the compositor's or the X server's: their pause is everyone's pause
+#define VMT_PIN_FG      9   // of the window in focus while compaction leaves it alone (evict.sh compactfg off)
+#define VMT_PIN_BIG     10  // an allocation bigger than a step moves
+#define VMT_PIN_REFUSED 11  // the move engine cannot move it (the reason of _vidmemEvictCheck() comes with it)
+#define VMT_PIN_OTHER   12  // no user allocation holds it: the driver's own (page tables, channels, kernel clients)
 
 NvBool osVidmemTraceExtOn(void);
 void   osVidmemTraceExt(NvU32 op, NvU32 mode, NvU32 why, NvU32 pid, const NvU32 *pRuns, NvU32 numRuns);
+// VMT_EXT_PIN: `reason` is printed where the other events have the process name.
+void   osVidmemTracePin(NvU32 kind, const char *reason, const NvU32 *pRuns, NvU32 numRuns);
 
 // Lock waits/holds shorter than this are not traced (evict.sh trace-lock US).
 extern NvU64 vidmemTraceLockNs;

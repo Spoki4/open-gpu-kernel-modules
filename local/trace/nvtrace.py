@@ -1038,7 +1038,11 @@ def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
 
     own = None                 # owner (index into procs) of every frame
     frames = base_frame = 0
-    snap = None                # a snapshot being read: (ts, owners, changes that arrived meanwhile)
+    snap = None                # a snapshot being read: (ts, owners, changes that arrived meanwhile, pins or None)
+    # What compaction could not move at the last snapshot (op=pin): per frame
+    # an index into `pins` + 1, 0 once the frame has changed hands since.
+    pin = None
+    pins = []                  # [kind, the move engine's reason or ""]
     start_mono = meta.get("start_mono")
     wall_at = (lambda ts: meta["start_wall"] + ts - start_mono) if "start_wall" in meta and start_mono else None
     base = None                # trace time of t = 0: the first snapshot
@@ -1057,6 +1061,28 @@ def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
     def emit(ts, k, p, m, w, r):
         ev["t"].append(ms(ts)); ev["k"].append(k); ev["p"].append(p); ev["m"].append(m); ev["w"].append(w)
         ev["r"].append(r)
+
+    def pin_i(kind, reason):
+        key = [kind or "-", reason if kind == "refused" and reason and reason != "-" else ""]
+        if key not in pins:
+            pins.append(key)
+        return pins.index(key) + 1
+
+    def pins_whole():
+        """The pins as one event: (kind, start, count) per stretch."""
+        r, start, cur = [], 0, pin[0] if frames else 0
+        for f in range(1, frames + 1):
+            o = pin[f] if f < frames else -1
+            if o != cur:
+                if cur:
+                    r += [cur, start, f - start]
+                start, cur = f, o
+        return r
+
+    def emit_state(ts):
+        emit(ts, 2, 0, 0, why_i("-"), whole())
+        if pin is not None:
+            emit(ts, 6, 0, 0, why_i("-"), pins_whole())
 
     def whole():
         """The state as one event: (owner, start, count) per stretch."""
@@ -1080,6 +1106,11 @@ def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
                     cnt[o] -= c
                 cnt[p if k else 0] += n
             arr[s:s + n] = array.array("H", [p if k else 0]) * n
+
+    def unpin(arr, runs):
+        for j in range(0, len(runs), 2):
+            s, n = runs[j], min(runs[j + 1], max(0, frames - runs[j]))
+            arr[s:s + n] = array.array("B", [0]) * n
 
     def note_used(ts):
         if t_out is None or ts < t_out:
@@ -1135,14 +1166,23 @@ def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
                     if own is not None and runs[1] != frames:
                         sys.exit("nvtrace: the size of vidmem changed inside the trace (two GPUs?)")
                     base_frame, frames = runs[0], runs[1]
-                    snap = (ts, array.array("H", [0]) * frames, [])
+                    snap = [ts, array.array("H", [0]) * frames, [], None]
                 elif op == "have" and snap is not None:
                     change(snap[1], None, 1, proc(pid, fl.get("comm")), runs)
+                elif op == "pin" and snap is not None:
+                    if snap[3] is None:
+                        snap[3] = array.array("B", [0]) * frames
+                    code = pin_i(fl.get("mode"), fl.get("comm"))
+                    for j in range(0, len(runs), 2):
+                        s, n = runs[j], min(runs[j + 1], max(0, frames - runs[j]))
+                        snap[3][s:s + n] = array.array("B", [code]) * n
                 elif op == "snapend" and snap is not None:
-                    sts, arr, late = snap
+                    sts, arr, late, parr = snap
                     snap = None
                     for k, p, r in late:        # what changed while the snapshot was taken
                         change(arr, None, k, p, r)
+                        if parr is not None:
+                            unpin(parr, r)
                     if own is None:
                         own = arr
                         base = sts
@@ -1155,13 +1195,18 @@ def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
                             own = arr
                             if ev["t"]:
                                 emit(ts, 2, 0, 0, why_i("-"), whole())
+                    # A snapshot of a driver that tells no pins leaves the old ones (frames since changed are out of them).
+                    if parr is not None:
+                        pin = parr
                     counts[:] = [0] * len(procs)
                     for o, c in collections.Counter(own).items():
                         counts[o] = c
                     for i, c in enumerate(counts):
                         procs[i]["peak"] = max(procs[i]["peak"], c)
                     if not ev["t"] and ts >= t_out:
-                        emit(max(ts, t_out), 2, 0, 0, why_i("-"), whole())
+                        emit_state(max(ts, t_out))
+                    elif parr is not None and ev["t"]:
+                        emit(ts, 6, 0, 0, why_i("-"), pins_whole())
                     note_used(ts)
                 elif op in ("free", "alloc"):
                     if own is None:
@@ -1170,11 +1215,13 @@ def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
                     k, p = int(op == "alloc"), proc(pid, fl.get("comm"))
                     if snap is not None:
                         snap[2].append((k, p, runs))
+                    if ts >= t_out and not ev["t"]:
+                        emit_state(t_out)
                     change(own, counts, k, p, runs)
+                    if pin is not None:
+                        unpin(pin, runs)
                     procs[p]["peak"] = max(procs[p]["peak"], counts[p])
                     if ts >= t_out:
-                        if not ev["t"]:
-                            emit(t_out, 2, 0, 0, why_i("-"), whole())
                         emit(ts, k, p, MAP_MODE.get(fl.get("mode"), 0), why_i(fl.get("why", "-")), runs)
                     note_used(ts)
                 elif op == "window" and own is not None and ts >= t_out and ev["t"]:
@@ -1210,7 +1257,7 @@ def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
     if not ev["t"]:
         if base + (t_from or 0) > last_ts:
             sys.exit("nvtrace: --from is past the end of the trace")
-        emit(t_out, 2, 0, 0, why_i("-"), whole())
+        emit_state(t_out)
     wall0 = wall_at(base) if wall_at else None
     ft = {"t": [], "ms": []}
     if wall0 is not None:
@@ -1224,7 +1271,7 @@ def build_map(trace, meta, title, t_from=None, t_to=None, mangohud=()):
     return {"title": title, "frames": frames, "base_frame": base_frame, "frame_kb": 64, "procs": procs,
             "why": MAP_WHY, "ev": ev, "moves": moves, "hints": hints, "notes": sorted(notes), "used": used,
             "frag": frag, "frametimes": ft, "resync": resync, "t_first": ev["t"][0], "t_last": ms(last_ts),
-            "wall0": wall0, "before_first_snapshot": before, "inferred": inferred}
+            "wall0": wall0, "before_first_snapshot": before, "inferred": inferred, "pins": pins}
 
 
 def write_map(data, out):
@@ -1246,6 +1293,9 @@ def write_map(data, out):
           f"{len(ev['t'])} changes, {len(data['procs']) - 2} processes\n"
           f"map: moves {len(data['moves'])} (to sysmem {kinds[1]}, back {kinds[2]}, inside vidmem {kinds[3]}), "
           f"{placed} with their frames, {ev['k'].count(5)} windows\n"
+          + (f"map: what compaction could not move is told at {ev['k'].count(6)} snapshot(s): "
+             + ", ".join(sorted({k for k, _ in data["pins"]})) + "\n" if data["pins"] else
+             "map: the snapshots do not tell what compaction could not move (an older driver)\n")
           + ("map: no snapshot in the trace: the start is inferred from the events, frames with no event are "
              "shown as not known\n" if data.get("inferred") else "")
           + (f"map: {len(data['resync'])} later snapshot(s), {lost} frames differed from the events"

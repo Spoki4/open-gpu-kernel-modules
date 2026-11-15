@@ -395,6 +395,17 @@ NvU64 _vidmemPrevFgNs;
 // The foreground is a game (as of the last policy step; idea I7).
 static NvBool _vidmemFgIsGame;
 
+void
+vepCompactSteps(NvU64 *pStepMB, NvU64 *pFgStepMB)
+{
+    *pStepMB = *pFgStepMB = VIDMEM_EVICT_COMPACT_STEP_MB;
+    if (_vidmemCompactBig)
+    {
+        *pFgStepMB = VIDMEM_EVICT_COMPACT_FG_STEP_MB;
+        *pStepMB   = _vidmemFgIsGame ? VIDMEM_EVICT_COMPACT_FG_STEP_MB : VIDMEM_EVICT_COMPACT_BIG_STEP_MB;
+    }
+}
+
 static NvBool
 _vidmemEvictIsPrevFg(VIDMEM_EVICT_PROC *p, VIDMEM_EVICT_ACTIVITY *pAct)
 {
@@ -1474,14 +1485,10 @@ vepPolicyStep(OBJGPU *pGpu)
         else if ((_vidmemCompactRunMB != 0) && (nowNs >= _vidmemCompactRestNs) &&
                  (VE_AGO_NS(nowNs, _vidmemLastPressureNs) >= (VIDMEM_EVICT_QUIET_SEC * 1000000000ULL)))
         {
-            NvU64 stepMB = VIDMEM_EVICT_COMPACT_STEP_MB, fgStepMB = VIDMEM_EVICT_COMPACT_STEP_MB;
+            NvU64 stepMB, fgStepMB;
             NvU64 windowMB = 0, movedMB;
 
-            if (_vidmemCompactBig)
-            {
-                fgStepMB = VIDMEM_EVICT_COMPACT_FG_STEP_MB;
-                stepMB   = _vidmemFgIsGame ? VIDMEM_EVICT_COMPACT_FG_STEP_MB : VIDMEM_EVICT_COMPACT_BIG_STEP_MB;
-            }
+            vepCompactSteps(&stepMB, &fgStepMB);
             _vidmemEvictWhy = VMT_WHY_COMPACT;
             _vidmemCompactTryNs = nowNs;
             movedMB = vepPlatCompact(pGpu, pProcs, count, stepMB, fgStepMB, &windowMB);

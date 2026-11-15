@@ -92,6 +92,7 @@ NvBool      NV_API_CALL  os_vidmem_trace_on               (NvU32); // local patc
 void        NV_API_CALL  os_vidmem_trace                  (NvU32, NvU32, const NvU64 *); // local patch
 NvBool      NV_API_CALL  os_vidmem_trace_ext_on           (void); // local patch
 void        NV_API_CALL  os_vidmem_trace_ext              (NvU32, NvU32, NvU32, NvU32, const NvU32 *, NvU32); // local patch
+void        NV_API_CALL  os_vidmem_trace_pin              (NvU32, const char *, const NvU32 *, NvU32); // local patch
 NV_STATUS   NV_API_CALL  os_get_current_thread            (NvU64 *);
 char*       NV_API_CALL  os_string_copy                   (char *, const char *);
 NvU32       NV_API_CALL  os_string_length                 (const char *);
