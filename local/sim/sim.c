@@ -369,6 +369,8 @@ static NvU64 layLongest(NvU64 *pFree, NvU64 *pStart)
 // `local/trace/nvtrace.py map` draws a scenario the way it draws a recording:
 // what changed since the last call, per process, in 64 KB frames (32 a chunk).
 //
+// Whose memory compaction may move (the driver's _vidmemCompactVictim()).
+#define SIM_VICTIM(p) ((strcmp((p)->name, "kwin_wayland") != 0) && (strcmp((p)->name, "Xwayland") != 0))
 static NvU32 *gMapPrev;           // who held each chunk at the last call (0 free, else the pid)
 static NvU64  gMapChunks;
 #define MAP_RUNS 64
@@ -376,10 +378,11 @@ static NvU64  gMapChunks;
 static void mapLine(const char *op, int mode, NvU32 why, NvU32 pid, const char *comm, const NvU32 *runs, NvU32 n)
 {
     static const char *modes[] = { "-", "evict", "restore", "move" };
+    const char *m = (mode == 8) ? "compositor" : (mode == 11) ? "refused" : (mode == 12) ? "other" : modes[mode & 3];
     NvU32 i;
 
     fprintf(gMapF, " sim-1 [000] ..... %.6f: vidmem_ext: op=%s mode=%s why=%s pid=%u comm=%s n=%u runs={",
-            gNowS + gMapSkewS - T0, op, modes[mode & 3], (why == 255) ? "-" : whyName(why), pid, comm, n);
+            gNowS + gMapSkewS - T0, op, m, (why == 255) ? "-" : whyName(why), pid, comm, n);
     for (i = 0; i < 2 * n; i++)
         fprintf(gMapF, "%s0x%x", i ? "," : "", runs[i]);
     fprintf(gMapF, "}\n");
@@ -473,6 +476,49 @@ static void mapSync(int mode, NvU32 why)
         mapRuns("alloc", mode, why, seen[s], now, gMapPrev);
     if (snap)
     {
+        //
+        // What compaction cannot move, as the driver's snapshot tells it
+        // (op=pin): the compositor's, what the scenario calls fixed, what
+        // nobody holds by name.
+        //
+        static const struct { NvU32 kind; const char *why; } pins[] =
+            { { 8, "-" }, { 11, "fixed" }, { 12, "-" } };
+        NvU32 *pin = calloc(gChunks + 1, sizeof(*pin));
+
+        for (i = 0; i < gNumProcs; i++)
+            for (k = 0; k < gProcs[i].na; k++)
+                idPid[gProcs[i].a[k].id] = !SIM_VICTIM(&gProcs[i]) ? 8 : (gProcs[i].a[k].movable ? 0 : 11);
+        for (c = 0; c < gChunks; c++)
+            pin[c] = (gChunk[c] == 0) ? 0 : ((now[c] == 1) ? 12 : idPid[gChunk[c]]);
+        for (k = 0; k < 3; k++)
+        {
+            NvU32 pr[2 * MAP_RUNS], n = 0;
+            NvU64 start = 0, len = 0;
+
+            for (c = 0; c <= gChunks; c++)
+            {
+                if ((c < gChunks) && (pin[c] == pins[k].kind))
+                {
+                    if (len++ == 0)
+                        start = c;
+                    continue;
+                }
+                if (len == 0)
+                    continue;
+                if (n == MAP_RUNS)
+                {
+                    mapLine("pin", (int)pins[k].kind, 255, 0, pins[k].why, pr, n);
+                    n = 0;
+                }
+                pr[2 * n]     = (NvU32)(start * 32);
+                pr[2 * n + 1] = (NvU32)(len * 32);
+                n++;
+                len = 0;
+            }
+            if (n != 0)
+                mapLine("pin", (int)pins[k].kind, 255, 0, pins[k].why, pr, n);
+        }
+        free(pin);
         runs[0] = runs[1] = 0;
         for (c = 0; c < gChunks; c++)
             runs[0] += (now[c] != 0) * 32;
@@ -757,7 +803,6 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
             procOf[gProcs[i].a[k].id] = &gProcs[i];
         }
     }
-#define SIM_VICTIM(p) ((strcmp((p)->name, "kwin_wayland") != 0) && (strcmp((p)->name, "Xwayland") != 0))
 #define SIM_LIMIT_KB(p) (((VE_HINT_STATE((p)->hint) == VE_HINT_FG) ? NV_MIN(fgStepMB, stepMB) : stepMB) << 10)
     for (c = 0; c < gChunks; c++)
     {

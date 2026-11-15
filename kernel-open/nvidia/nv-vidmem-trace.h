@@ -403,11 +403,17 @@ TRACE_EVENT(vidmem_hint,
 // (`evict.sh map`): op=snap with the region (base as a frame number, frames),
 // op=have per stretch of one owner (pid 1: the driver itself or not known),
 // op=snapend. op=window: a compaction step's window and, if any, the free run
-// it must keep.
+// it must keep. op=pin (inside a snapshot): frames background compaction
+// could not move at that moment; mode= says why (compositor: its or the X
+// server's; focus: of the window in focus while that is left alone; big: an
+// allocation bigger than a step moves; refused: the move engine cannot move
+// it, comm= has its reason; other: no user allocation holds it, the driver's
+// own).
 #define NV_VMT_EXT_OP                                                        \
     { 0, "free" }, { 1, "alloc" }, { 2, "snap" }, { 3, "have" },             \
-    { 4, "snapend" }, { 5, "window" }
-#define NV_VMT_EXT_MODE { 0, "-" }, { 1, "evict" }, { 2, "restore" }, { 3, "move" }
+    { 4, "snapend" }, { 5, "window" }, { 6, "pin" }
+#define NV_VMT_EXT_MODE { 0, "-" }, { 1, "evict" }, { 2, "restore" }, { 3, "move" },   \
+    { 8, "compositor" }, { 9, "focus" }, { 10, "big" }, { 11, "refused" }, { 12, "other" }
 
 TRACE_EVENT(vidmem_ext,
     TP_PROTO(u32 op, u32 mode, u32 why, u32 pid, const char *comm, const u32 *runs, u32 n),

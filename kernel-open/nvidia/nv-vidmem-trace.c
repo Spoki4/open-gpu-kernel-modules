@@ -103,6 +103,18 @@ void NV_API_CALL os_vidmem_trace_ext(NvU32 op, NvU32 mode, NvU32 why, NvU32 pid,
     trace_vidmem_ext(op, mode, why, pid, comm, runs, n);
 }
 
+// op=pin: frames compaction could not move at a snapshot; the reason goes where the name is.
+void NV_API_CALL os_vidmem_trace_pin(NvU32 kind, const char *reason, const NvU32 *runs, NvU32 n)
+{
+    char comm[TASK_COMM_LEN];
+
+    if (!trace_vidmem_ext_enabled() || (n > NV_VMT_EXT_RUNS))
+        return;
+    memset(comm, 0, sizeof(comm));
+    strscpy(comm, ((reason != NULL) && (reason[0] != 0)) ? reason : "-", sizeof(comm));
+    trace_vidmem_ext(6, kind, 255, 0, comm, runs, n);
+}
+
 //
 // Window state changes in the compositor's hints. A snapshot may arrive in
 // several writes (shell printf writes line by line), so only states of the

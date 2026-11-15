@@ -55,6 +55,8 @@ tr.off td { opacity: .35; }
 .ev time { color: var(--dim); font-variant-numeric: tabular-nums; flex: none; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--dim); margin-top: 6px; font-size: 12px; }
 .warn { color: var(--src); }
+.sw.hatch { border: 1px solid var(--dim);
+  background: repeating-linear-gradient(135deg, var(--ink) 0 1.2px, transparent 1.2px 4px); }
 .dim { color: var(--dim); }
 kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font: inherit; font-size: 11px; }
 </style>
@@ -78,6 +80,7 @@ kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font: i
     <label class="chk"><input type="checkbox" id="f3" checked>inside vidmem</label>
   </span>
   <label class="chk" title="show each move as it goes: the blocks fly from where they were to where they are put"><input type="checkbox" id="anim" checked>animate moves</label>
+  <label class="chk" title="hatch the memory background compaction could not move at the last snapshot"><input type="checkbox" id="pins" checked>what cannot move</label>
   <span class="dim"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> moves, <kbd>space</kbd> play, wheel on the timeline zooms, drag scrubs</span>
 </header>
 <main>
@@ -98,6 +101,7 @@ kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font: i
         <span><span class="sw" style="border:2px solid var(--win)"></span> window being cleared</span>
         <span><span class="sw" style="border:2px dashed var(--keep)"></span> free run kept</span>
         <span>&#8594; from where to where</span>
+        <span id="pinlegend"><span class="sw hatch"></span> compaction could not move it at the last snapshot</span>
       </div>
     </div>
   </div>
@@ -149,30 +153,44 @@ let only = 0;        // show only this process (0: all)
 
 // ---- state and seeking ----
 const state = new Uint16Array(F);
+// What background compaction could not move when the last snapshot was taken:
+// per frame an index into D.pins + 1; 0 for a frame that changed hands since
+// (nothing is known about what came there).
+const PINS = D.pins || [];
+const pin = new Uint8Array(F);
 let pos = 0;         // events applied
 const KEY = Math.max(2048, Math.ceil(NE / 48));
-const keys = [new Uint16Array(F)];
+const keys = [new Uint16Array(F)], pinKeys = [new Uint8Array(F)];
+const pinAt = [];    // the events that are such snapshots
+for (let i = 0; i < NE; i++) if (E.k[i] === 6) pinAt.push(i);
 function apply(i) {
   const k = E.k[i], r = E.r[i];
   if (k === 2) {                       // a snapshot: the whole map
     state.fill(0);
+    pin.fill(0);
     for (let j = 0; j < r.length; j += 3) state.fill(r[j], r[j + 1], r[j + 1] + r[j + 2]);
   } else if (k === 0 || k === 1) {
     const v = k ? E.p[i] : 0;
-    for (let j = 0; j < r.length; j += 2) state.fill(v, r[j], r[j] + r[j + 1]);
+    for (let j = 0; j < r.length; j += 2) { state.fill(v, r[j], r[j] + r[j + 1]); pin.fill(0, r[j], r[j] + r[j + 1]); }
+  } else if (k === 6) {
+    pin.fill(0);
+    for (let j = 0; j < r.length; j += 3) pin.fill(r[j], r[j + 1], r[j + 1] + r[j + 2]);
   }
 }
 function seekIndex(n) {
   if (n < pos || n - pos > KEY) {
     let kf = Math.min(Math.floor(n / KEY), keys.length - 1);
     if (!(n < pos) && kf * KEY <= pos) kf = -1;
-    if (kf >= 0) { state.set(keys[kf]); pos = kf * KEY; }
+    if (kf >= 0) { state.set(keys[kf]); pin.set(pinKeys[kf]); pos = kf * KEY; }
   }
   while (pos < n) {
     apply(pos++);
-    if (pos % KEY === 0 && pos / KEY === keys.length) keys.push(state.slice());
+    if (pos % KEY === 0 && pos / KEY === keys.length) { keys.push(state.slice()); pinKeys.push(pin.slice()); }
   }
 }
+const pinName = i => PINS[i - 1][1] ? `${PINS[i - 1][0]} (${PINS[i - 1][1]})` : PINS[i - 1][0];
+const PIN_SAYS = { compositor: "the compositor's or the X server's", focus: "of the window in focus",
+                   big: "bigger than a step moves", refused: "the move engine refuses", other: "the driver's own" };
 function upper(arr, t) {               // first index with arr[i] > t
   let lo = 0, hi = arr.length;
   while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] <= t) lo = m + 1; else hi = m; }
@@ -318,6 +336,24 @@ function drawMap(u) {                  // u: how far the move at the cursor has 
     g.fillStyle = bg;
     g.fillRect(x + cw - 1, y, 1, ch - 1);
   }
+  // Hatched: what compaction could not move at the last snapshot.
+  if (PINS.length && $("pins").checked) {
+    const pc = document.createElement("canvas");
+    pc.width = pc.height = 4;
+    const pg = pc.getContext("2d");
+    pg.strokeStyle = css("--ink"); pg.lineWidth = 1.1; pg.globalAlpha = 0.8;
+    for (const o of [-4, 0, 4]) { pg.beginPath(); pg.moveTo(o - 1, 5); pg.lineTo(o + 5, -1); pg.stroke(); }
+    g.fillStyle = g.createPattern(pc, "repeat");
+    for (let c = 0; c < NCH; c++) {
+      const x = LEFT + (c % COLS) * cw, y = 2 + Math.floor(c / COLS) * ch;
+      for (let s = 0; s < SEG; s++) {
+        const f0 = c * CF + s * sf, f1 = Math.min(F, f0 + sf);
+        let n = 0;
+        for (let f = f0; f < f1; f++) n += pin[f] !== 0;
+        if (2 * n >= f1 - f0 && n) g.fillRect(x + s * sw, y, Math.min(sw + 0.5, cw - 1 - s * sw), ch - 1);
+      }
+    }
+  }
   // What the move at the cursor took away and brought.
   if (markStep >= 0 && u == null) {
     const src = css("--src"), dst = css("--dst");
@@ -416,6 +452,9 @@ mapC.addEventListener("mousemove", ev => {
   const addr = (D.base_frame + c * CF) * D.frame_kb * 1024;
   let s = `${(c * CF * FMB).toFixed(0)} MB from the base (0x${addr.toString(16)})\n`;
   for (const [o, k] of [...n].sort((a, b) => b[1] - a[1])) s += `${pname(o)}: ${(k * FMB).toFixed(2)} MB\n`;
+  const pn = new Map();
+  for (let f = c * CF; f < Math.min(F, (c + 1) * CF); f++) if (pin[f]) pn.set(pin[f], (pn.get(pin[f]) || 0) + 1);
+  for (const [o, k] of [...pn].sort((a, b) => b[1] - a[1])) s += `cannot move: ${pinName(o)}, ${(k * FMB).toFixed(2)} MB\n`;
   let m = 0;
   for (let f = c * CF; f < Math.min(F, (c + 1) * CF); f++) m |= mark[f];
   if (m & 1) s += "left this place in the move\n";
@@ -529,11 +568,39 @@ function drawNow() {
     if (used === 0) { run++; freeChunks++; if (run > best) best = run; } else run = 0;
   }
   const freeMB = cnt[0] * FMB;
+  // What cannot move, by kind; the run compaction could reach at best: the
+  // longest stretch of chunks with nothing of that in it.
+  let pinHtml = "";
+  if (PINS.length) {
+    const pc = new Int32Array(PINS.length + 1), byKind = new Map();
+    for (let f = 0; f < F; f++) pc[pin[f]]++;
+    let clean = 0, reach = 0, since = 0;
+    for (let c = 0; c < NCH; c++) {
+      let any = 0;
+      const e = Math.min(F, (c + 1) * CF);
+      for (let f = c * CF; f < e && !any; f++) any = pin[f];
+      if (!any) { if (++clean > reach) reach = clean; } else clean = 0;
+    }
+    for (let i = 1; i <= PINS.length; i++) if (pc[i]) byKind.set(PINS[i - 1][0], (byKind.get(PINS[i - 1][0]) || 0) + pc[i]);
+    let lo = 0, hi = pinAt.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (pinAt[m] < pos) lo = m + 1; else hi = m; }
+    if (lo) since = (T - E.t[pinAt[lo - 1]]) / 1000;
+    const total = F - pc[0];
+    pinHtml = `<div style="margin-top:8px">Background compaction could not move <b>${(total * FMB).toFixed(0)} MB</b>` +
+      `<span class="dim"> (as of the snapshot ${since < 90 ? since.toFixed(0) + " s" : (since / 60).toFixed(0) + " min"} before; ` +
+      `what changed hands since is not told)</span></div><table>` +
+      [...byKind].sort((a, b) => b[1] - a[1]).map(([k, n]) => {
+        const why = PINS.map((p, i) => [p, pc[i + 1]]).filter(([p, m]) => p[0] === k && p[1] && m).sort((a, b) => b[1] - a[1])
+          .map(([p, m]) => `${esc(p[1])} ${(m * FMB).toFixed(0)}`).join(", ");
+        return `<tr><td>${PIN_SAYS[k] || esc(k)}${why ? `<div class="dim">${why}</div>` : ""}</td><td class="n">${(n * FMB).toFixed(0)} MB</td></tr>`;
+      }).join("") +
+      `<tr><td>longest stretch with none of it</td><td class="n">${reach * 2} MB</td></tr></table>`;
+  }
   $("now").innerHTML =
     `<table><tr><td>in use</td><td class="n">${((F - cnt[0]) * FMB).toFixed(0)} MB</td></tr>` +
     `<tr><td>free</td><td class="n">${freeMB.toFixed(0)} MB</td></tr>` +
     `<tr><td>free in whole 2 MB chunks</td><td class="n">${freeChunks * 2} MB</td></tr>` +
-    `<tr><td>longest free run</td><td class="n">${best * 2} MB</td></tr></table>` +
+    `<tr><td>longest free run</td><td class="n">${best * 2} MB</td></tr></table>` + pinHtml +
     (D.inferred ? `<div class="warn">no snapshot in this trace: the start is inferred from the events; frames nothing happened to are shown as "not known" (free or held, the trace does not tell)</div>` : "") +
     (D.resync.some(r => r[1]) ? `<div class="warn">the trace lost events: ${D.resync.filter(r => r[1]).length} later snapshot(s) differed from what the events had built (${D.resync.reduce((a, r) => a + r[1], 0)} frames)</div>` : "") +
     (D.resync.length && !D.resync.some(r => r[1]) ? `<div class="dim">${D.resync.length} later snapshot(s) agree with the events</div>` : "");
@@ -665,6 +732,11 @@ addEventListener("keydown", ev => {
 });
 addEventListener("resize", () => { layoutMap(); dirty(); });
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", dirty);
+$("pins").onchange = dirty;
+if (!PINS.length) {
+  $("pins").parentElement.style.display = "none";
+  $("pinlegend").textContent = "what compaction cannot move is not in this recording (a driver older than that)";
+}
 
 $("tllegend").innerHTML =
   `<span><span class="sw" style="background:var(--line)"></span> in use</span>` +

@@ -491,9 +491,10 @@ vidmemMapNote(PMA *pPma, NvBool bAlloc, const NvU64 *pPages, NvU64 count, NvU64 
 
 //
 // `evict.sh map`: the whole map into the trace, a stretch of one owner per
-// run. Checked against PMA's own frame map on the way: a frame in use there
-// and free here was allocated around the table (it becomes the driver's), one
-// free there and held here was freed around it; *pFixed counts both.
+// run (the caller ends the snapshot: _vidmemMapDumpEnd()). Checked against
+// PMA's own frame map on the way: a frame in use there and free here was
+// allocated around the table (it becomes the driver's), one free there and
+// held here was freed around it; *pFixed counts both.
 //
 static void
 _vidmemMapDump(OBJGPU *pGpu, NvU64 *pUsedFrames, NvU64 *pFixed)
@@ -551,10 +552,16 @@ _vidmemMapDump(OBJGPU *pGpu, NvU64 *pUsedFrames, NvU64 *pFixed)
     }
     if (n != 0)
         osVidmemTraceExt(VMT_EXT_HAVE, 0, VMT_WHY_NONE, runPid, runs, n);
-    runs[0] = (NvU32)*pUsedFrames;
-    runs[1] = (NvU32)*pFixed;
-    osVidmemTraceExt(VMT_EXT_SNAPEND, 0, VMT_WHY_NONE, 0, runs, 1);
     portMemFree(pUsed);
+}
+
+// The snapshot is complete (after _vidmemMapPins()).
+static void
+_vidmemMapDumpEnd(NvU64 usedFrames, NvU64 fixed)
+{
+    NvU32 runs[2] = { (NvU32)usedFrames, (NvU32)fixed };
+
+    osVidmemTraceExt(VMT_EXT_SNAPEND, 0, VMT_WHY_NONE, 0, runs, 1);
 }
 
 static NvBool
@@ -4507,6 +4514,44 @@ enum { VC_MOVABLE, VC_DESKTOP, VC_FG, VC_SHARED, VC_BIG, VC_REFUSED, VC_COUNT };
 static NvU64 _vidmemCompactSeen[VC_COUNT];
 static NvU64 _vidmemCompactSeenUsed;
 
+//
+// How a step of background compaction sees the allocation pRef of process p
+// (bVictim: _vidmemCompactVictim(p, NV_TRUE); `limit`: the biggest one of its
+// allocations a step moves, bytes). VC_COUNT: not its business (not in vidmem
+// now, or a view of somebody else's buffer). VC_MOVABLE and VC_SHARED (the
+// compositor pauses for the copy too) can move; VC_REFUSED comes with the
+// move engine's reason.
+//
+static NvU32
+_vidmemCompactClass(OBJGPU *pGpu, VIDMEM_EVICT_PROC *p, NvBool bVictim, NvU64 limit, RsResourceRef *pRef,
+                    VIDMEM_EVICT_MAPREF *pRefs, const char **ppReason)
+{
+    Memory     *pMemory = dynamicCast(pRef->pResource, Memory);
+    NvU32       numRefs = 0;
+    const char *reason;
+
+    *ppReason = NULL;
+    if ((pMemory == NULL) || (pMemory->pMemDesc == NULL) ||
+        (pRef->externalClassId != NV01_MEMORY_LOCAL_USER) ||
+        (pMemory->pMemDesc->pLocalEvictState != NULL) ||
+        (memdescGetAddressSpace(pMemory->pMemDesc) != ADDR_FBMEM) ||
+        (p->bNever && !pMemory->isMemDescOwner))
+        return VC_COUNT;
+    if (!bVictim)
+        return (VE_HINT_STATE(p->hint) == VE_HINT_FG) ? VC_FG : VC_DESKTOP;
+    if (memdescGetSize(pMemory->pMemDesc) > limit)
+        return VC_BIG;
+    _vidmemCheckForMove = NV_TRUE;
+    reason = _vidmemEvictCheck(pGpu, pRef, p->pid, pRefs, &numRefs);
+    _vidmemCheckForMove = NV_FALSE;
+    if (reason != NULL)
+    {
+        *ppReason = reason;
+        return VC_REFUSED;
+    }
+    return _vidmemEvictHasCompositor(pRefs, numRefs) ? VC_SHARED : VC_MOVABLE;
+}
+
 NvU64
 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB, NvU64 fgStepMB,
                NvU64 *pWindowMB)
@@ -4586,7 +4631,6 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
         RmClient **ppClient;
         NvBool     bVictim = _vidmemCompactVictim(&pProcs[i], NV_TRUE);
         NvBool     bFg = (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG);
-        NvU32      cat = bFg ? VC_FG : VC_DESKTOP;
         // The biggest allocation of this process a step moves (vidmem_evict_policy.h).
         NvU64      limit = (bFg ? NV_MIN(fgStepMB, stepMB) : stepMB) << 20;
 
@@ -4603,41 +4647,17 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
             iter = serverutilRefIter(pRsClient->hClient, NV01_NULL_OBJECT, 0, RS_ITERATE_DESCENDANTS, NV_TRUE);
             while (clientRefIterNext(iter.pClient, &iter))
             {
-                Memory *pMemory = dynamicCast(iter.pResourceRef->pResource, Memory);
-                NvU32   numRefs = 0;
-                NvBool  bRefused;
-                NvU64   bytes;
+                Memory     *pMemory = dynamicCast(iter.pResourceRef->pResource, Memory);
+                const char *reason;
+                NvU32       cls = _vidmemCompactClass(pGpu, &pProcs[i], bVictim, limit, iter.pResourceRef, pRefs, &reason);
+                NvU64       bytes;
 
-                if ((pMemory == NULL) || (pMemory->pMemDesc == NULL) ||
-                    (iter.pResourceRef->externalClassId != NV01_MEMORY_LOCAL_USER) ||
-                    (pMemory->pMemDesc->pLocalEvictState != NULL) ||
-                    (memdescGetAddressSpace(pMemory->pMemDesc) != ADDR_FBMEM) ||
-                    (pProcs[i].bNever && !pMemory->isMemDescOwner))
+                if (cls == VC_COUNT)
                     continue;
                 bytes = memdescGetSize(pMemory->pMemDesc);
-                if (!bVictim)
-                {
-                    _vidmemCompactSeen[cat] += bytes;
+                _vidmemCompactSeen[cls] += bytes;
+                if ((cls != VC_MOVABLE) && (cls != VC_SHARED))
                     continue;
-                }
-                if (bytes > limit)
-                {
-                    _vidmemCompactSeen[VC_BIG] += bytes;
-                    continue;
-                }
-                _vidmemCheckForMove = NV_TRUE;
-                bRefused = (_vidmemEvictCheck(pGpu, iter.pResourceRef, pProcs[i].pid, pRefs, &numRefs) != NULL);
-                _vidmemCheckForMove = NV_FALSE;
-                if (bRefused)
-                {
-                    _vidmemCompactSeen[VC_REFUSED] += bytes;
-                    continue;
-                }
-                // Movable too (the compositor pauses for the copy); counted apart.
-                if (_vidmemEvictHasCompositor(pRefs, numRefs))
-                    _vidmemCompactSeen[VC_SHARED] += bytes;
-                else
-                    _vidmemCompactSeen[VC_MOVABLE] += bytes;
                 (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pMovable, base, frames);
                 // It moves whole: the window is charged for all of it (vepCompactWindow()).
                 if ((bytes > (2ULL << 20)) && (numOwners < VEP_COMPACT_MAX_OWNERS))
@@ -4738,6 +4758,185 @@ done:
     portMemFree(pOwner);
     portMemFree(pOwnerFrames);
     return movedMB;
+}
+
+//
+// With a snapshot of the map (`evict.sh map`): the frames a step of
+// background compaction could not move now, and why, as VMT_EXT_PIN events
+// and a line of totals. The same question vepPlatCompact() asks of every
+// allocation (_vidmemCompactClass()), answered per frame: a frame is movable
+// if any holder's allocation there is; of the reasons against, the owner's
+// counts. A frame in use that no user allocation holds is the driver's own
+// (page tables, channel and context buffers, kernel clients).
+//
+#define VIDMEM_MAP_PIN_MOVABLE 1
+#define VIDMEM_MAP_PIN_REASON  32     // + index into the reasons seen
+#define VIDMEM_MAP_PIN_REASONS 48
+#define VIDMEM_MAP_PIN_KINDS   (VIDMEM_MAP_PIN_REASON + VIDMEM_MAP_PIN_REASONS)
+
+static void
+_vidmemMapPinMark(MEMORY_DESCRIPTOR *pMemDesc, NvU8 kind, NvBool bOwner, NvU8 *pKind, NvU64 base, NvU64 frames)
+{
+    PMA_ALLOC_INFO *pInfo = pMemDesc->pPmaAllocInfo;
+    NvU64 pageBytes, n, i, f;
+
+    if (pInfo == NULL)
+        return;
+    n         = pInfo->bContig ? 1 : pInfo->pageCount;
+    pageBytes = pInfo->bContig ? pInfo->allocSize : pInfo->pageSize;
+    for (i = 0; i < n; i++)
+    {
+        NvU64 a = pInfo->pageArray[i];
+
+        if (a < base)
+            continue;
+        for (f = (a - base) >> PMA_PAGE_SHIFT; (f < frames) && (f < ((a - base + pageBytes) >> PMA_PAGE_SHIFT)); f++)
+        {
+            if ((pKind[f] == 0) || (kind == VIDMEM_MAP_PIN_MOVABLE) ||
+                (bOwner && (pKind[f] != VIDMEM_MAP_PIN_MOVABLE)))
+                pKind[f] = kind;
+        }
+    }
+}
+
+static void
+_vidmemMapPins(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
+{
+    static const NvU8 pinOf[VC_COUNT] = { VIDMEM_MAP_PIN_MOVABLE, VMT_PIN_DESKTOP, VMT_PIN_FG, VIDMEM_MAP_PIN_MOVABLE,
+                                          VMT_PIN_BIG, VMT_PIN_REFUSED };
+    NvU32 *pOwner = _vidmemMapOwner;
+    NvU64  base = _vidmemMapBase, frames = _vidmemMapFrames, f, start = 0;
+    NvU64  stepMB, fgStepMB, movable = 0, refused;
+    NvU8  *pKind = NULL, cur = 0;
+    NvU32 *pRuns = NULL, *pNum = NULL;
+    NvU64 *pFrames = NULL;
+    const char *reasons[VIDMEM_MAP_PIN_REASONS];
+    VIDMEM_EVICT_PROC   *pProcs = NULL;
+    VIDMEM_EVICT_MAPREF *pRefs = NULL;
+    NvBool bTrace = osVidmemTraceExtOn();
+    NvU32  count, i, k, numReasons = 0;
+
+    if ((pOwner == NULL) || (frames == 0))
+        return;
+    pKind   = portMemAllocNonPaged(frames);
+    // Per kind: the runs waiting for their event, how many, the frames in all.
+    pRuns   = portMemAllocNonPaged(VIDMEM_MAP_PIN_KINDS * 2 * VMT_EXT_RUNS * sizeof(NvU32));
+    pNum    = portMemAllocNonPaged(VIDMEM_MAP_PIN_KINDS * sizeof(NvU32));
+    pFrames = portMemAllocNonPaged(VIDMEM_MAP_PIN_KINDS * sizeof(NvU64));
+    pProcs  = portMemAllocNonPaged(sizeof(*pProcs) * VIDMEM_EVICT_MAX_PROCS);
+    pRefs   = portMemAllocNonPaged(sizeof(*pRefs) * VIDMEM_EVICT_MAX_MAPPINGS);
+    if ((pKind == NULL) || (pRuns == NULL) || (pNum == NULL) || (pFrames == NULL) || (pProcs == NULL) ||
+        (pRefs == NULL))
+        goto done;
+    portMemSet(pKind, 0, frames);
+    portMemSet(pNum, 0, VIDMEM_MAP_PIN_KINDS * sizeof(NvU32));
+    portMemSet(pFrames, 0, VIDMEM_MAP_PIN_KINDS * sizeof(NvU64));
+
+    vepCompactSteps(&stepMB, &fgStepMB);
+    count = _vidmemEvictGatherProcs(pGpu, pProcs, VIDMEM_EVICT_MAX_PROCS);
+    for (i = 0; i < count; i++)
+    {
+        RmClient **ppClient;
+        NvBool     bVictim = _vidmemCompactVictim(&pProcs[i], NV_TRUE);
+        NvU64      limit = ((VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) ? NV_MIN(fgStepMB, stepMB) : stepMB) << 20;
+
+        for (ppClient = serverutilGetFirstClientUnderLock(); ppClient != NULL;
+             ppClient = serverutilGetNextClientUnderLock(ppClient))
+        {
+            RsClient   *pRsClient = staticCast(*ppClient, RsClient);
+            RS_ITERATOR iter;
+
+            if ((pRsClient->type == CLIENT_TYPE_KERNEL) || ((*ppClient)->ProcID != pProcs[i].pid))
+                continue;
+            iter = serverutilRefIter(pRsClient->hClient, NV01_NULL_OBJECT, 0, RS_ITERATE_DESCENDANTS, NV_TRUE);
+            while (clientRefIterNext(iter.pClient, &iter))
+            {
+                Memory     *pMemory = dynamicCast(iter.pResourceRef->pResource, Memory);
+                const char *reason;
+                NvU32       cls = _vidmemCompactClass(pGpu, &pProcs[i], bVictim, limit, iter.pResourceRef, pRefs, &reason);
+                NvU8        kind;
+
+                if (cls == VC_COUNT)
+                    continue;
+                kind = pinOf[cls];
+                if (cls == VC_REFUSED)
+                {
+                    for (k = 0; (k < numReasons) && (portStringCompare(reasons[k], reason, 32) != 0); k++)
+                        ;
+                    if ((k == numReasons) && (numReasons < VIDMEM_MAP_PIN_REASONS))
+                        reasons[numReasons++] = reason;
+                    if (k < numReasons)
+                        kind = (NvU8)(VIDMEM_MAP_PIN_REASON + k);
+                }
+                _vidmemMapPinMark(pMemory->pMemDesc, kind, pMemory->isMemDescOwner, pKind, base, frames);
+            }
+        }
+    }
+
+    for (f = 0; f <= frames; f++)
+    {
+        NvU8 kind = 0;
+
+        if ((f < frames) && (pOwner[f] != 0))
+            kind = (pKind[f] != 0) ? pKind[f] : VMT_PIN_OTHER;
+        if ((f < frames) && (kind == cur))
+            continue;
+        if (cur == VIDMEM_MAP_PIN_MOVABLE)
+        {
+            movable += f - start;
+        }
+        else if (cur != 0)
+        {
+            NvU32 *r = pRuns + (NvU32)cur * 2 * VMT_EXT_RUNS;
+
+            pFrames[cur] += f - start;
+            if (bTrace)
+            {
+                if (pNum[cur] == VMT_EXT_RUNS)
+                {
+                    osVidmemTracePin((cur >= VIDMEM_MAP_PIN_REASON) ? VMT_PIN_REFUSED : cur,
+                                     (cur >= VIDMEM_MAP_PIN_REASON) ? reasons[cur - VIDMEM_MAP_PIN_REASON] : NULL,
+                                     r, pNum[cur]);
+                    pNum[cur] = 0;
+                }
+                r[2 * pNum[cur]]     = (NvU32)start;
+                r[2 * pNum[cur] + 1] = (NvU32)(f - start);
+                pNum[cur]++;
+            }
+        }
+        cur   = kind;
+        start = f;
+    }
+    for (k = 0; k < VIDMEM_MAP_PIN_KINDS; k++)
+    {
+        if (pNum[k] != 0)
+            osVidmemTracePin((k >= VIDMEM_MAP_PIN_REASON) ? VMT_PIN_REFUSED : k,
+                             (k >= VIDMEM_MAP_PIN_REASON) ? reasons[k - VIDMEM_MAP_PIN_REASON] : NULL,
+                             pRuns + k * 2 * VMT_EXT_RUNS, pNum[k]);
+    }
+
+    refused = pFrames[VMT_PIN_REFUSED];
+    for (k = 0; k < numReasons; k++)
+        refused += pFrames[VIDMEM_MAP_PIN_REASON + k];
+#define PIN_MB(k) (pFrames[k] >> (20 - PMA_PAGE_SHIFT))
+    EVICT_PRINTF("background compaction now (MB): could move %llu; cannot: the compositor's %llu, "
+                 "the window in focus %llu, bigger than a step (%llu MB, %llu MB of the window in focus) %llu, "
+                 "the driver's own %llu, refused %llu",
+                 movable >> (20 - PMA_PAGE_SHIFT), PIN_MB(VMT_PIN_DESKTOP), PIN_MB(VMT_PIN_FG),
+                 stepMB, NV_MIN(fgStepMB, stepMB), PIN_MB(VMT_PIN_BIG), PIN_MB(VMT_PIN_OTHER),
+                 refused >> (20 - PMA_PAGE_SHIFT));
+    for (k = 0; k < numReasons; k++)
+        EVICT_PRINTF("%s%s %llu", (k == 0) ? ": " : ", ", reasons[k], PIN_MB(VIDMEM_MAP_PIN_REASON + k));
+    EVICT_PRINTF("\n");
+#undef PIN_MB
+
+done:
+    portMemFree(pKind);
+    portMemFree(pRuns);
+    portMemFree(pNum);
+    portMemFree(pFrames);
+    portMemFree(pProcs);
+    portMemFree(pRefs);
 }
 
 static NvU32 _vidmemCompRooms, _vidmemCompRoomFails;
@@ -5377,11 +5576,17 @@ vidmemEvictProcess
 
         _vidmemMapDump(pGpu, &used, &fixed);
         if (_vidmemMapOwner == NULL)
+        {
             EVICT_PRINTF("no map of vidmem (no allocation yet, or no memory for it)\n");
+        }
         else
+        {
             EVICT_PRINTF("map: %llu MB of %llu MB in use, %llu frames differed from the allocator's map%s\n",
                          used >> (20 - PMA_PAGE_SHIFT), _vidmemMapFrames >> (20 - PMA_PAGE_SHIFT), fixed,
                          osVidmemTraceExtOn() ? "" : "; not traced (nvidia_vidmem:vidmem_ext is off)");
+            _vidmemMapPins(pGpu, buf, bufSize, pLen);
+            _vidmemMapDumpEnd(used, fixed);
+        }
     }
     else if (mode == 18)
     {

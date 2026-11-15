@@ -148,7 +148,7 @@ The driver emits tracepoints (system `nvidia_vidmem`, free while off;
 | `vidmem_hint` | a window state change from the KWin script | - |
 | `vidmem_frag` | how fragmented free vidmem is: free in whole 2 MB chunks and in holes, longest free run, runs of 32/128 MB or more; every ~10 s (`at=tick`) and after each move batch with the longest run before it (`evict.sh status` prints the same line) | - |
 | `rm_lock` | an RM API/GPU lock wait or hold over `trace-lock` us (default 1000), where it was taken (symbol), who held it | the waiting thread |
-| `vidmem_ext` | where memory lies: every allocation and free of frames of vidmem (64 KB each, as runs of start and count) with the process they are for; inside a move `mode=` evict / restore / move and `why=`; `op=window`: the window a compaction step or a contiguous request clears; `op=snap` .. `have` .. `snapend`: a snapshot of the whole map (`evict.sh map`) | - |
+| `vidmem_ext` | where memory lies: every allocation and free of frames of vidmem (64 KB each, as runs of start and count) with the process they are for; inside a move `mode=` evict / restore / move and `why=`; `op=window`: the window a compaction step or a contiguous request clears; `op=snap` .. `have` .. `pin` .. `snapend`: a snapshot of the whole map (`evict.sh map`), `pin`: the frames background compaction could not move then, `mode=` why (`compositor`, `focus`, `big`, `refused` with the reason in `comm=`, `other`: the driver's own) | - |
 
 `local/trace/nvtrace.py` records them together with Xids (`nvidia:nvidia_dev_xid`),
 the compositor's page flips (`drm:drm_vblank_event_delivered`: a gap in
@@ -177,7 +177,19 @@ ones it took are framed in green, with the window a compaction step was
 clearing and the free run it had to keep; the panel says whose memory, why,
 how much and how long. Stepping to a move plays it: the map goes back to the
 moment before it and the blocks fly from the old place to the new one, an
-arrow per allocation ("animate moves" turns that off). `--from` / `--to` cut a part out of a long session.
+arrow per allocation ("animate moves" turns that off). `--from` / `--to` cut
+a part out of a long session.
+
+Hatched cells are memory background compaction could not move when the last
+snapshot was taken, and the panel and the tooltip say why: the compositor's
+or the X server's, the window in focus (when compaction leaves it alone), an
+allocation bigger than a step moves, one the move engine refuses (with its
+reason: `cpu-mapped`, `kind`, ...), or the driver's own (page tables, channel
+buffers: no user allocation holds the frame). A hole next to a hatched block
+stays; the panel gives the longest stretch with nothing hatched in it, which
+is the most compaction could get. A frame that changed hands after the
+snapshot loses its hatching: what came there is not known until the next
+snapshot (a mark makes one). `evict.sh map` prints the same totals.
 
 The driver keeps the owner of every frame (a table of 4 bytes per 64 KB,
 filled where PMA hands pages out and takes them back, so the driver's own
@@ -391,12 +403,14 @@ the compositor's contiguous buffers then share the bottom of vidmem with it
 (`nvtest` comproom and scanout-churn are the checks; `evict.sh placesides
 off` is the way back).
 
-The map of vidmem (2026-11-15) is built and has never been loaded on a GPU:
-the owner table in the allocation path and the `vidmem_ext` events are new
-code every allocation and free passes through. `tests/map-test.sh` (stage
-`map`) is the check; the page and its reader have run on the simulator's
-traces only. `gamerec.sh map` needs this driver on the host and the service
-installed again (`sudo ./local/gamerec.sh install`).
+The map of vidmem runs on the host since 2026-11-15 (a game session of
+several hours: every later snapshot agreed with the events, the table with
+the allocator's map); the GPU part of `tests/map-test.sh` (stage `map`) has
+not been run yet. What compaction cannot move (`op=pin` in a snapshot, the
+hatching on the page) is built and has never been loaded on a GPU: the
+simulator's traces and the page are checked, the driver's walk over the
+allocations at a snapshot is not. It runs only when a snapshot is asked for
+(`evict.sh map`: the start and the end of a recording, a mark).
 
 ## Numbers cited in the code
 
