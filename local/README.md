@@ -242,7 +242,10 @@ in the launch options `MANGOHUD_CONFIGFILE=~/.config/MangoHud/gamerec.conf
 mangohud %command%` (also OpenGL). Bottles games (WoW through Battle.net in
 the `games` bottle): switch on MangoHud in the bottle's settings once; gamerec
 writes the sandbox's own MangoHud config and moves its logs into the recording
-at the stop. Auto start needs the game to switch GameMode on (Steam:
+at the stop. Lutris games (WoW through Battle.net now): the game's "FPS
+counter (MangoHud)" switch and `MANGOHUD_CONFIGFILE` set to that gamerec.conf
+in its environment variables (Configure, System options); `gamerec.sh status`
+says which of the two is missing. Auto start needs the game to switch GameMode on (Steam:
 `gamemoderun %command%`; Bottles: the bottle's GameMode switch). The overlay
 is invisible unless `record --hud`; Meta+Ctrl+H (`gamerec.sh hud`) shows /
 hides it in games that are already running (MangoHud reloads its config file;

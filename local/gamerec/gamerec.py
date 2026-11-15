@@ -54,7 +54,9 @@ local/game-logs/<id>/            yours: frame times, screenshots, summary
 MangoHud logs only games that load it: either `gamerec.sh steam` once (Steam
 started with MANGOHUD=1 and our config file), or per game in Steam launch
 options:  MANGOHUD_CONFIGFILE=~/.config/MangoHud/gamerec.conf mangohud %command%
-Bottles: the bottle's MangoHud switch. The config logs only while a
+Bottles: the bottle's MangoHud switch. Lutris: the game's FPS counter switch
+and MANGOHUD_CONFIGFILE=~/.config/MangoHud/gamerec.conf in its environment
+variables (System options). The config logs only while a
 recording runs; otherwise it does nothing visible.
 
 The service runs a root-owned copy (/usr/local/lib/gamerec), never this
@@ -422,6 +424,27 @@ def new_id():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def lutris_games():
+    """(name, what its frame times need) per game configured in Lutris: its
+    MangoHud switch, and our config file in its environment (without it
+    MangoHud reads its own config: a visible overlay and no log)."""
+    out = []
+    for y in sorted(glob.glob(os.path.expanduser("~/.local/share/lutris/games/*.yml")) +
+                    glob.glob(os.path.expanduser("~/.config/lutris/games/*.yml"))):
+        try:
+            text = rfile(y)
+        except OSError:
+            continue
+        on = re.search(r"^\s*mangohud:\s*true", text, re.M)
+        conf = re.search(r"^\s*MANGOHUD_CONFIGFILE:\s*['\"]?" + re.escape(MH_CONF) + r"['\"]?\s*$", text, re.M)
+        out.append((re.sub(r"-\d+$", "", os.path.basename(y)[:-4]),
+                    "MangoHud on, frame times logged" if on and conf else
+                    "MangoHud off (Lutris: Configure, System options, FPS counter)" if not on else
+                    f"MangoHud on with its own config, no log (System options, Environment variables: "
+                    f"MANGOHUD_CONFIGFILE={MH_CONF})"))
+    return out
+
+
 def print_hints(d):
     print(f"gamerec: recording into {d}")
     mark_key, hud_key = hotkey_text("mark"), hotkey_text("hud")
@@ -433,6 +456,8 @@ def print_hints(d):
         on = re.search(r"^\s*mangohud:\s*true", rfile(y), re.M)
         print(f"  bottle {os.path.basename(os.path.dirname(y))}: " +
               ("MangoHud on, frame times logged" if on else "MangoHud off (Bottles: bottle settings, MangoHud)"))
+    for name, state in lutris_games():
+        print(f"  lutris {name}: {state}")
     print("  stop:           Ctrl-C here (or `gamerec.sh stop`)\n")
 
 
@@ -566,6 +591,8 @@ def cmd_status(a):
     last = rjson(LAST)
     if last:
         print(f"last: {last.get('id')}")
+    for name, what in lutris_games():
+        print(f"lutris {name}: {what}")
 
 
 # --------------------------------------------------------------------------
