@@ -220,7 +220,10 @@ TRACE_EVENT(vidmem_alloc,
               __entry->born)
 );
 
-// One policy step. a: ns, queue ns (1 Hz timer to start: waiting for the API
+// One policy step; its phases at the end (a[10..13]): the GPU's engine samples
+// (an RPC to GSP), the work-submission check of every channel, the walks
+// over every client's allocations, the moves (evict, restore, compaction,
+// windows). a: ns, queue ns (1 Hz timer to start: waiting for the API
 // lock), avail MB (free outside the block), block free MB, block largest
 // contiguous free MB, evicted MB, busiest pid, hints active, processes,
 // trigger (0 timer, 1 hints)
@@ -238,6 +241,10 @@ TRACE_EVENT(vidmem_tick,
         __field(u32, hints)
         __field(u32, procs)
         __field(u32, trigger)
+        __field(u64, sample_us)
+        __field(u64, submit_us)
+        __field(u64, walk_us)
+        __field(u64, move_us)
     ),
     TP_fast_assign(
         __entry->us = a[0] / 1000;
@@ -250,12 +257,18 @@ TRACE_EVENT(vidmem_tick,
         __entry->hints = a[7];
         __entry->procs = a[8];
         __entry->trigger = a[9];
+        __entry->sample_us = a[10] / 1000;
+        __entry->submit_us = a[11] / 1000;
+        __entry->walk_us = a[12] / 1000;
+        __entry->move_us = a[13] / 1000;
     ),
     TP_printk("us=%llu queue_us=%llu avail_mb=%llu block_free_mb=%llu block_largest_mb=%llu "
-              "evicted_mb=%llu busiest=%u hints=%u procs=%u trigger=%s",
+              "evicted_mb=%llu busiest=%u hints=%u procs=%u trigger=%s sample_us=%llu submit_us=%llu "
+              "walk_us=%llu move_us=%llu",
               __entry->us, __entry->queue_us, __entry->avail_mb, __entry->block_free_mb,
               __entry->block_largest_mb, __entry->evicted_mb, __entry->busiest, __entry->hints,
-              __entry->procs, __entry->trigger ? "hints" : "timer")
+              __entry->procs, __entry->trigger ? "hints" : "timer", __entry->sample_us, __entry->submit_us,
+              __entry->walk_us, __entry->move_us)
 );
 
 // A process with GPU memory at a policy step. a: vidmem bytes, evicted bytes,

@@ -151,7 +151,7 @@ The driver emits tracepoints (system `nvidia_vidmem`, free while off;
 | `vidmem_makeroom` | an allocation of a visible process moved others out first | the allocating thread (`us`) |
 | `vidmem_alloc` | an allocation that took the `trace-lock` threshold or more (1 ms), by phase: the checks before PMA, PMA itself (with any wait for pages still being scrubbed), make-room after a PMA failure and the retry, the GPU lock, the rest (descriptor, GSP, mappings) | every RM call: the allocating thread holds the API lock throughout |
 | `vidmem_reserve` | the reserve turned an allocation away: denied, room made, or created in sysmem | the allocating process |
-| `vidmem_tick` | one policy step (API + GPU lock held throughout), time queued for the lock | every RM call meanwhile |
+| `vidmem_tick` | one policy step (API + GPU lock held throughout), time queued for the lock, and where it went: the engine samples (an RPC to GSP), the work-submission check of every channel, the walks over every client's allocations, the moves | every RM call meanwhile |
 | `vidmem_proc` | per process at each step: vram, sysmem, eligible, window state, idle | - |
 | `vidmem_hint` | a window state change from the KWin script | - |
 | `vidmem_frag` | how fragmented free vidmem is: free in whole 2 MB chunks and in holes, longest free run, runs of 32/128 MB or more; every ~10 s (`at=tick`) and after each move batch with the longest run before it (`evict.sh status` prints the same line) | - |
