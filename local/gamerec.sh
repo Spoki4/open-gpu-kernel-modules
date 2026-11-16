@@ -9,5 +9,6 @@
 #   ./gamerec.sh mark [TEXT]         mark a problem (hotkey Meta+Ctrl+M)
 #   ./gamerec.sh hud [on|off]        show / hide MangoHud (hotkey Meta+Ctrl+H)
 #   ./gamerec.sh map [DIR]           map.html: the map of vidmem and its moves over the recording
-#   ./gamerec.sh hotkey | steam | stop | status | report [DIR]
+#   ./gamerec.sh hotkey | steam | stop | status | report [DIR]   (report: frames, marks, and what the
+#                                    player could have noticed of the driver: gamerec/player.py)
 exec python3 "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/gamerec/gamerec.py" "$@"

@@ -184,6 +184,11 @@ class Tracer:
         wfile(PIDFILE, str(os.getpid()))
         wfile(INSTANCE + "/trace_clock", "mono")
         wfile(INSTANCE + "/buffer_size_kb", str(buf_kb))
+        # The process of each thread: a game's lock waits come from threads of many names (Wine, dxvk).
+        try:
+            wfile(INSTANCE + "/options/record-tgid", "1")
+        except OSError:
+            pass
         self.enabled = []
         for ev in EVENTS + (SCHED_EVENTS if sched else []):
             path = f"{INSTANCE}/events/{ev}/enable"

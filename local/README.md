@@ -256,6 +256,23 @@ hides it in games that are already running (MangoHud reloads its config file;
 the frame log goes on in a new file). Disk: nvtrace ~100 MB per hour, a mark
 ~20-100 MB.
 
+What the player noticed. The report ends with the measure every change of
+the policy is judged by (`gamerec/player.py`, also on its own with a
+recording's directory): while the game is focused, the long frames that are
+the driver's (twice the median and 8 ms more, overlapped by the driver's work
+in the game's way: its channels stopped, its threads waiting for an RM lock,
+its own make-room), with who held the lock or why the game was paused; the
+game's memory in sysmem; the driver's time in the game's way, and the seconds
+it was more than 1 ms a frame; apart from that the time the game was only
+visible (another window focused). "unnoticed" is none of the three. The
+MangoHud log is put on the trace's clock by the driver's long pauses of the
+game (to a few ms; about 1 s without them). Threads are told apart by their
+process since 2026-11-16 (nvtrace records it); older recordings take the
+game's threads by name. The 15 November session (WoW, 158 min focused): 15
+long frames of the driver's, 7 of them waiting for a policy step, 4 for
+Chrome's allocations; nothing in sysmem while focused, 768 MB for 12 s while
+Chrome was (its frames 36 ms instead of 17).
+
 ## Policy simulator (no GPU)
 
 `local/sim/` runs the eviction policy (the driver's own

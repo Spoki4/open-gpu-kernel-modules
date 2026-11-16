@@ -91,7 +91,7 @@ FLIGHT_CFG = os.path.join(HERE, "flight.cfg")
 NVTRACE = os.path.join(LOCAL, "trace", "nvtrace.py")
 EVICT = os.path.join(LOCAL, "evict.sh")
 # What the service copy needs, relative to LOCAL.
-INSTALL_FILES = ["gamerec/gamerec.py", "gamerec/flight.cfg", "trace/nvtrace.py", "evict.sh",
+INSTALL_FILES = ["gamerec/gamerec.py", "gamerec/player.py", "gamerec/flight.cfg", "trace/nvtrace.py", "evict.sh",
                  ".perfetto/v58.2/linux-amd64/tracebox"]
 INSTALL_DIR = "/usr/local/lib/gamerec"
 UNIT = "/etc/systemd/system/gamerec.service"
@@ -1180,6 +1180,8 @@ def report(d, quiet=False):
         out.append("  none (no game ran with MangoHud)")
     for p in files:
         start, fr = load_mangohud(p)
+        # MangoHud's first line can carry the time since the game started as a frame (32287200 ms).
+        fr = [x for x in fr if 0 < x[1] < 10000]
         if len(fr) < 20:
             continue
         ft = [x[1] for x in fr]
@@ -1195,6 +1197,14 @@ def report(d, quiet=False):
         for el, v in sorted(spikes, key=lambda x: -x[1])[:5]:
             at = (start + datetime.timedelta(seconds=el)).strftime("%H:%M:%S") if start else f"+{el:.0f}s"
             out.append(f"      {at}  {v:.0f} ms")
+    # What the player of the focused game could have noticed of the driver (player.py).
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import player
+        out.append("")
+        out.extend(player.analyse(d))
+    except Exception as e:      # the report must not die of it
+        out.append(f"\nplayer: not computed ({e})")
     text = "\n".join(out) + "\n"
     try:
         with open(os.path.join(d, "summary.txt"), "w") as f:

@@ -18,7 +18,12 @@ policy's own log lines; `-cmp PID` prints recorded vs simulated memory of a
 process once a minute (replays only). At the end: per process what sat in
 sysmem while it was focused / visible (MB*s), moves out and back, failed
 restores, ping-pong (out and back within 4 s), denials, and how long its own
-allocations waited for moves.
+allocations waited for moves. Then, per game (`full` or `launched`) that
+was focused, the player's view as `gamerec/player.py` gives it for a
+recording: the driver's RM locks held 8 ms or more while it played (a policy
+step, an allocation making room, a headroom piece: its calls wait), its own
+channels stopped that long, its memory in sysmem, and "unnoticed" or
+"noticed".
 
 `-map FILE` (scenarios with `set layout 1`) writes the layout and every move
 as the driver's trace does; `../trace/nvtrace.py map FILE` turns it into the
@@ -95,7 +100,7 @@ One command per line, `#` starts a comment. Times are seconds from the start.
 | `at T` | run until T (steps every 2 s with autotick) |
 | `step` | a policy step now (what a hint change triggers) |
 | `mark TEXT` | a line in the output |
-| `expect METRIC PID\|- OP VALUE` | a check: `vid`, `evicted`, `sys` (= evicted), `evicts`, `moved_out` (MB copied out in all), `restores`, `restorefails`, `windows` (contiguous windows cleared for it), `pingpong`, `bounces` and `bounce_mb` (the driver's own count: moves undone within a minute, MB copied for nothing), `denied`, `denied_mb`, `born`, `stallmax`, `sysfg_mbs`, `free`, `longest` (MB, the longest free run), `compact_steps`, `compact_idle` (steps that moved / found nothing), `compact_pause` (ms, the longest pause a step gave the process), `compact_moved`, `window_pause` (ms, the longest pause a window cleared for somebody else gave it), `window_pauses`, `window_moved` (MB of it moved inside vidmem for others' windows); OP `<= >= < > ==` |
+| `expect METRIC PID\|- OP VALUE` | a check: `vid`, `evicted`, `sys` (= evicted), `evicts`, `moved_out` (MB copied out in all), `restores`, `restorefails`, `windows` (contiguous windows cleared for it), `pingpong`, `bounces` and `bounce_mb` (the driver's own count: moves undone within a minute, MB copied for nothing), `denied`, `denied_mb`, `born`, `stallmax`, `sysfg_mbs`, `free`, `longest` (MB, the longest free run), `compact_steps`, `compact_idle` (steps that moved / found nothing), `compact_pause` (ms, the longest pause a step gave the process), `compact_moved`, `window_pause` (ms, the longest pause a window cleared for somebody else gave it), `window_pauses`, `window_moved` (MB of it moved inside vidmem for others' windows), `player_hitches` (while it was a game in focus: times the driver held the RM locks 8 ms or more), `player_worst` (ms, the longest), `player_pauses` (its own channels stopped 8 ms or more); OP `<= >= < > ==` |
 | `rec PID VRAM RAM` | recorded values for `-cmp` (replays) |
 | `clock UNIX_S` | wall clock at time 0 (output shows HH:MM:SS) |
 
