@@ -34,10 +34,12 @@ static const char * const _vidmemEvictNeverNames[] =
 #define VIDMEM_EVICT_BUSY_TAKEOVER_SEC 15
 
 //
-// A process active on the GPU holding this much vidmem is a game too, whoever
-// tops the GR samples (2026-11-02 02:44: the Steam overlay's steamwebhelper
-// often did, the game lost its protection and got a 200 MB allocation in
-// sysmem: 18 fps).
+// A process holding this much vidmem is protected like the game of the GR
+// samples, whoever tops them (2026-11-02 02:44: the Steam overlay's
+// steamwebhelper often did, the game lost its protection and got a 200 MB
+// allocation in sysmem: 18 fps): not moved out without a window of its own,
+// never given sysmem for a new allocation. It does not make it a game
+// (_vidmemEvictIsGame()).
 //
 #define VIDMEM_EVICT_GAME_BYTES (1024ULL << 20)
 // "Drawing now": GPU work within the last two policy steps.
@@ -392,10 +394,8 @@ _vidmemEvictGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
 // in one walk.
 //
 NvU64 _vidmemPrevFgNs;
-// The foreground is a game (as of the last policy step; idea I7).
+// The foreground is a game (_vidmemEvictIsGame(), as of the last policy step; idea I7).
 static NvBool _vidmemFgIsGame;
-// ... by the window hints alone (_vidmemEvictIsGameByHints(): not a browser holding >= 1 GB).
-static NvBool _vidmemFgIsHintGame;
 
 void
 vepCompactSteps(NvU64 *pStepMB, NvU64 *pFgStepMB)
@@ -416,28 +416,17 @@ _vidmemEvictIsPrevFg(VIDMEM_EVICT_PROC *p, VIDMEM_EVICT_ACTIVITY *pAct)
 }
 
 //
-// A game (rules R, the user's choice: a fullscreen window that keeps the GPU
-// busy, or anything started by Steam or GameMode); without those hints from
-// the KWin script, a process holding >= 1 GB as before.
+// A game (R4, the user's choice): started by Steam (an ancestor named
+// "reaper"), or a fullscreen window that keeps the GPU busy. The one
+// definition the hint policy uses. Not "holds >= 1 GB", as it was in some
+// places: Chrome holding 1-2.7 GB next to WoW (host, 2026-11-15) was a game
+// there, so compaction kept to the small steps and the small run meant for a
+// game in focus while the user worked in Chrome, and the background cushion
+// guarded a "game's" headroom. GameMode is not seen (it marks no process the
+// driver can tell); a windowed game started otherwise is an app.
 //
 static NvBool
 _vidmemEvictIsGame(VIDMEM_EVICT_PROC *p)
-{
-    if (p->hint & VE_HINT_LAUNCHED_GAME)
-        return NV_TRUE;
-    if ((p->hint & VE_HINT_FULLSCREEN) &&
-        ((_vidmemActivityIdleSec(p->pid) < VIDMEM_EVICT_DRAWING_SEC) || (p->pid == _vidmemBusiestPid)))
-        return NV_TRUE;
-    return p->vidmemBytes >= VIDMEM_EVICT_GAME_BYTES;
-}
-
-//
-// A game by the window hints alone (R4): started by Steam, or a fullscreen
-// window that keeps the GPU busy. Not "holds >= 1 GB": a browser busy on the
-// other monitor holds that much and is not what the user plays.
-//
-static NvBool
-_vidmemEvictIsGameByHints(VIDMEM_EVICT_PROC *p)
 {
     if (p->hint & VE_HINT_LAUNCHED_GAME)
         return NV_TRUE;
@@ -571,7 +560,7 @@ _veClassify(VIDMEM_EVICT_PROC *p, NvU64 nowNs, VE_CLASS *c)
                        (st == VE_HINT_VISIBLE) ? VE_ROLE_VISIBLE :
                        (st == VE_HINT_HIDDEN) ? VE_ROLE_HIDDEN : VE_ROLE_WINDOWLESS;
     c->bMovable      = (p->eligibleBytes >= (4ULL << 20));
-    c->bGame         = _vidmemEvictIsGameByHints(p);
+    c->bGame         = _vidmemEvictIsGame(p);
     c->bPrevFocus    = _vidmemEvictIsPrevFg(p, pAct);
     c->bJustRestored = (pAct->lastRestoreNs != 0) &&
                        (VE_AGO_NS(nowNs, pAct->lastRestoreNs) < VIDMEM_EVICT_AFTER_ACCESS_SEC * 1000000000ULL);
@@ -638,7 +627,7 @@ _veGives(const VE_CLASS *c, NvU32 level)
                 // and went to sysmem for them, and the game ran at 25 fps for
                 // ten seconds. Knob "gamegives" for the old rule.
                 //
-                return !(!_vidmemFgTakesGame && !_vidmemFgIsHintGame && c->bGame);
+                return !(!_vidmemFgTakesGame && !_vidmemFgIsGame && c->bGame);
             }
             return (level == VE_LEVEL_FG_IDLE) && (c->idleSec >= VIDMEM_EVICT_VISIBLE_IDLE_SEC);
 
@@ -889,7 +878,7 @@ _vidmemEvictUpdateReclaimable(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 nowN
     _vidmemMovableFgOwnBytes = 0;
     for (i = 0; i < count; i++)
     {
-        if ((VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) && !pProcs[i].bNever && !_vidmemEvictIsGameByHints(&pProcs[i]))
+        if ((VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) && !pProcs[i].bNever && !_vidmemEvictIsGame(&pProcs[i]))
             _vidmemMovableFgOwnBytes += pProcs[i].eligibleBytes;
     }
 }
@@ -1103,7 +1092,7 @@ vepContigMakeSpace(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 w
     // the game's (2026-11-16). Its contiguous buffers stay: each would want a
     // window of its own to come back (problem #15).
     //
-    if ((avail < wantMB) && (forPid != 0) && _vidmemFgOwnEnabled && !_vidmemFgIsHintGame &&
+    if ((avail < wantMB) && (forPid != 0) && _vidmemFgOwnEnabled && !_vidmemFgIsGame &&
         (VE_HINT_STATE(_vidmemHint(forPid, NULL)) == VE_HINT_FG))
     {
         for (k = 0; k < count; k++)
@@ -1328,7 +1317,7 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
         NvU32 level = VE_LEVEL_HIDDEN, fgPid = 0;
 
         //
-        // A game in the foreground (>= 1 GB) is what fills vidmem: visible
+        // A game in the foreground (R4) is what fills vidmem: visible
         // but idle apps give up memory too. Not every app asks beyond its
         // budget (GL keeps textures in sysmem itself once vidmem looks
         // full, nvtest.sh fgprio), so waiting for its allocations is not enough.
@@ -1619,13 +1608,11 @@ vepPolicyStep(OBJGPU *pGpu)
         NvU32 moves = _vidmemPolicyMoves;
         NvU64 evicted = _vidmemEvictBytes;
 
-        _vidmemFgIsGame = _vidmemFgIsHintGame = NV_FALSE;
+        _vidmemFgIsGame = NV_FALSE;
         for (i = 0; i < count; i++)
         {
             if ((VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) && _vidmemEvictIsGame(&pProcs[i]))
                 _vidmemFgIsGame = NV_TRUE;
-            if ((VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) && _vidmemEvictIsGameByHints(&pProcs[i]))
-                _vidmemFgIsHintGame = NV_TRUE;
             if ((pProcs[i].hint & VE_HINT_GAME_SIDE) && (pProcs[i].vidmemBytes != 0))
                 _vidmemGameSideNs = nowNs;
         }
@@ -1964,7 +1951,7 @@ _veMakeRoomAllowed(NvU32 pid, NvBool bContig)
           // start). So a foreground that is not a game always gets its walk;
           // a fruitless one keeps the next away for a second (above).
           //
-          ((_vidmemMovableFgOwnBytes >= (4ULL << 20)) || !_vidmemFgIsHintGame)))
+          ((_vidmemMovableFgOwnBytes >= (4ULL << 20)) || !_vidmemFgIsGame)))
         return NV_FALSE;
     return NV_TRUE;
 }
@@ -2017,7 +2004,7 @@ vepMakeRoomRun(OBJGPU *pGpu, NvU32 pid, NvU64 size, NvU64 headroomMB, const char
         {
             NvU64 moved = 0;
 
-            if ((pProcs[k].pid != pid) || pProcs[k].bNever || _vidmemEvictIsGameByHints(&pProcs[k]) ||
+            if ((pProcs[k].pid != pid) || pProcs[k].bNever || _vidmemEvictIsGame(&pProcs[k]) ||
                 (pProcs[k].eligibleBytes < size + (16ULL << 20)))
                 continue;
             NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: allocation of the foreground: free %llu MB, nobody left to give, %llu MB of %s's own memory (pid %u) to sysmem for its %llu KB\n",
