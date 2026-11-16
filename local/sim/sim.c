@@ -774,14 +774,15 @@ NvBool vepPlatChunkInfo(OBJGPU *pGpu, NvU64 *pFreeChunks, NvU64 *pLongest)
     return NV_TRUE;
 }
 
+#define SIM_CHUNK_FRAMES 32       // 2 MB in the 64 KB frames the driver counts
 NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
                          NvU32 forPid, NvU32 level, NvU64 *pMovedMB)
 {
     Proc   *p = (forPid != 0) ? findProc(forPid) : NULL;
-    NvU64   need = (size + (2ULL << 20) - 1) >> 21, c, s, lo = 0, best = NV_U64_MAX;
+    NvU64   need = (size + (2ULL << 20) - 1) >> 21, c, lo = 0, best = NV_U64_MAX;
     NvU64   nowNs = osGetMonotonicTimeNs(), spaceMB = 0;
     NvU8   *give, *heavy;
-    NvU32  *cost;
+    NvU32  *cost, *owner, *own, *frames, *cnt;
     int     i, k, pass, ok;
     double  ms = 0;
 
@@ -826,6 +827,12 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
             }
         }
     }
+    // Per chunk what it holds to move (frames, x4 for a process drawing where the user sees it), and its owner:
+    // an allocation moves whole, so one with a corner in the window is charged for all of it (vepContigWindow()).
+    owner  = calloc(gChunks, sizeof(*owner));
+    own    = calloc(gChunks, sizeof(*own));
+    frames = calloc(gNextId + 1, sizeof(*frames));
+    cnt    = calloc(gNextId + 1, sizeof(*cnt));
     for (c = 0; c < gChunks; c++)
     {
         NvU32 id = gChunk[c];
@@ -838,30 +845,28 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
             for (k = 0; k < gProcs[i].na; k++)
             {
                 Alloc *a = &gProcs[i].a[k];
+                NvU32  w = heavy[i] ? 4 : 1;
 
                 if (a->id != id)
                     continue;
                 if ((give[i] != VEP_GIVE_NONE) && a->movable && !((give[i] == VEP_GIVE_MOVE) && a->contig))
-                    cost[c] = heavy[i] ? 4 : 1;
+                {
+                    cost[c] = SIM_CHUNK_FRAMES * w;
+                    if (gCompactOwners && (a->kb > 2048))
+                    {
+                        owner[c]   = id;
+                        own[c]     = SIM_CHUNK_FRAMES * w;
+                        frames[id] = (NvU32)(((a->kb + 2047) >> 11) * SIM_CHUNK_FRAMES * w);
+                    }
+                }
                 break;
             }
         }
     }
-    for (s = 0; s + need <= gChunks; s++)
     {
-        NvU64 sum = 0;
+        VEP_COMPACT_OWNERS ow = { owner, own, frames, cnt };
 
-        for (c = s; c < s + need; c++)
-        {
-            if (cost[c] == NV_U32_MAX)
-                break;
-            sum += cost[c];
-        }
-        if ((c == s + need) && (sum < best))
-        {
-            best = sum;
-            lo   = s;
-        }
+        best = vepContigWindow(cost, &ow, gChunks, need, 1, 0, &lo);
     }
     if (best == NV_U64_MAX)
     {
@@ -990,6 +995,10 @@ done:
     free(give);
     free(heavy);
     free(cost);
+    free(owner);
+    free(own);
+    free(frames);
+    free(cnt);
     return ok ? NV_TRUE : NV_FALSE;
 }
 
@@ -999,7 +1008,6 @@ done:
 // whole allocations out of it, the owner's piece size and the step's total.
 // Without the layout fragmentation is not modelled: nothing to compact.
 //
-#define SIM_CHUNK_FRAMES 32       // 2 MB in the 64 KB frames the driver counts
 NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB, NvU64 fgStepMB,
                      NvU64 *pWindowMB)
 {

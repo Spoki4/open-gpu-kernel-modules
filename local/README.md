@@ -40,7 +40,16 @@ These patches do the same inside the driver.
   has memory in sysmem. The focus keeps a headroom free (2 GB) and the others
   wait for it, except a shown window that takes a good share of the GPU from
   sysmem: that one slows the focus more than a short headroom does and comes
-  back after one policy step.
+  back after one policy step. An app's headroom waits until it has been in
+  focus for 3 s (a screenshot's region picker got none); a game's does not.
+- **Keeps out of the way of a game in focus.** The driver's work for others
+  holds the RM locks the game's own calls wait for, so while a game is in
+  focus it goes in pieces of about 4 ms of copying or waits: the headroom is
+  refilled in small pieces, others' memory comes back after the game (except
+  a shown window drawing from sysmem in earnest), compaction gathers only
+  room for a buffer that was asked for, a fruitless make-room for a window
+  not in focus is not retried for 5 s. A fullscreen window is a game when its
+  process has run for 5 s.
 - **Fights fragmentation.** Scanout and some browser buffers must be
   physically contiguous, and a long session leaves gigabytes free in pieces
   of a few MB. A contiguous request gets a window cleared for it by moving
@@ -48,16 +57,25 @@ These patches do the same inside the driver.
   compacts vidmem a little at a time so the longest free run stays long. A
   step moves whole allocations: of the window in focus those up to 96 MB (a
   pause of about 9 ms), of the others up to 256 MB, and 256 MB in all (96 MB
-  while a game is in focus). A game's memory moves only when no window
-  without it lengthens the run (its blocks are then the only walls). The
-  run it gathers: three quarters of the free memory, 1 GB at least; while a
-  game is in focus only room for the biggest contiguous buffer asked for in
-  the last half hour, and nothing when nobody asked, every step being a
-  pause of the game (the rest is gathered once the game is not in focus). And less is left to compact: while a game runs (started by a
-  launcher, or with a fullscreen window), the others' new memory is placed
-  from the bottom of vidmem and the game's from the top, so the small
-  buffers a browser allocates and frees do not end up as holes between the
-  game's blocks.
+  while a game is in focus). Both choose their window by what it costs to
+  move, an allocation with a corner in it counted with all of it, and a
+  game's memory moves for compaction only when no window without it
+  lengthens the run (its blocks are then the only walls). The run it
+  gathers: three quarters of the free memory, 1 GB at least; while a game is
+  in focus only room for the biggest contiguous buffer asked for in the last
+  half hour, and nothing when nobody asked (the rest is gathered once the
+  game is not in focus). And less is left to compact: while a game runs
+  (started by a launcher, or with a fullscreen window), the others' new
+  memory is placed from the bottom of vidmem and the game's from the top, so
+  the small buffers a browser allocates and frees do not end up as holes
+  between the game's blocks.
+- **Keeps its own time under the locks short.** A policy step walks only the
+  processes whose memory changed since the last walk; the holders of shared
+  buffers (windows the compositor holds too) are indexed once per operation
+  instead of being looked for by a walk of every client each; the work
+  submission check reads FIFO's list of channels (a test machine: a quiet step
+  3 ms instead of 8, a step next to 400 shared buffers 20 ms instead of
+  0.46 s).
 - **Does not keep a fixed reserve** for the compositor any more (the first
   approach, `RmVidmemUserReserveMB`, still there and off by default).
 - Fixes found on the way in NVIDIA's own code: a channel group leaked on GSP

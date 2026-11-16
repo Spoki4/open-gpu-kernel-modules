@@ -4541,6 +4541,8 @@ static NvU64 _vidmemContigInVidmemMB;   // moved inside vidmem by window clearin
 // by the app's own memory (vepContigMakeSpace()), never by moving it out.
 //
 static NvBool _vidmemCompactVictim(VIDMEM_EVICT_PROC *p, NvBool bFgToo);
+static void _vidmemCompactOwn(MEMORY_DESCRIPTOR *pMemDesc, NvU32 idx, NvU32 *pOwner, NvU32 *pOwn, NvU32 *pTmp,
+                              NvU64 base, NvU64 off, NvU64 chunks);
 
 static NvBool
 _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
@@ -4551,8 +4553,9 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     PMA    *pPma = (pHeap != NULL) ? pHeap->pPmaObject : NULL;
     NvU64   base = 0, frames = 0, largest = 0, words, chunks, need, off, freeChunks, longest;
     NvU64  *pUsed, *pMovable = NULL, *pHeavy = NULL;
-    NvU32  *pCost = NULL;
-    NvU64   bestStart = NV_U64_MAX, bestCost = NV_U64_MAX, f;
+    NvU32  *pCost = NULL, *pOwner = NULL, *pOwnerFrames = NULL, numOwners = 0;
+    NvU8   *pOwnerW = NULL;
+    NvU64   bestStart = NV_U64_MAX, bestCost = NV_U64_MAX, f, c;
     VIDMEM_EVICT_MAPREF *pRefs = NULL;
     NvU64   nowNs = osGetMonotonicTimeNs();
     NvBool  bOk = NV_FALSE;
@@ -4576,13 +4579,19 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     chunks = (frames > off) ? (frames - off) / VIDMEM_EVICT_CHUNK_FRAMES : 0;
     pMovable = portMemAllocNonPaged(words * sizeof(NvU64));
     pHeavy   = portMemAllocNonPaged(words * sizeof(NvU64));
-    pCost    = portMemAllocNonPaged(chunks * sizeof(NvU32));
+    pCost    = portMemAllocNonPaged(NV_MAX(chunks, 1) * sizeof(NvU32));
     pRefs    = portMemAllocNonPaged(sizeof(*pRefs) * VIDMEM_EVICT_MAX_MAPPINGS);
-    if ((pMovable == NULL) || (pHeavy == NULL) || (pCost == NULL) || (pRefs == NULL) || (need == 0) ||
-        (need > chunks))
+    // Who holds each chunk (owner, its frames there, scratch), per allocation its frames, a count, a weight.
+    pOwner       = portMemAllocNonPaged(NV_MAX(chunks, 1) * 3 * sizeof(NvU32));
+    pOwnerFrames = portMemAllocNonPaged((VEP_COMPACT_MAX_OWNERS + 1) * 2 * sizeof(NvU32));
+    pOwnerW      = portMemAllocNonPaged(VEP_COMPACT_MAX_OWNERS + 1);
+    if ((pMovable == NULL) || (pHeavy == NULL) || (pCost == NULL) || (pRefs == NULL) || (pOwner == NULL) ||
+        (pOwnerFrames == NULL) || (pOwnerW == NULL) || (need == 0) || (need > chunks))
         goto done;
     portMemSet(pMovable, 0, words * sizeof(NvU64));
     portMemSet(pHeavy, 0, words * sizeof(NvU64));
+    portMemSet(pOwner, 0, chunks * 3 * sizeof(NvU32));
+    portMemSet(pOwnerFrames, 0, (VEP_COMPACT_MAX_OWNERS + 1) * 2 * sizeof(NvU32));
     // Already there: an aligned window with nothing in it.
     if (_vidmemEvictBestWindow(pUsed, pMovable, NULL, pCost, base, off, chunks, need, align, NULL) == 0)
     {
@@ -4638,11 +4647,41 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
                 (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pMovable, base, frames);
                 if (bHeavy)
                     (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pHeavy, base, frames);
+                // It moves whole: a window with a corner of it is charged for all of it (vepContigWindow()).
+                if ((memdescGetSize(pMemory->pMemDesc) > (2ULL << 20)) && (numOwners < VEP_COMPACT_MAX_OWNERS))
+                {
+                    NvU8 w = bHeavy ? VIDMEM_EVICT_HEAVY_COST : 1;
+
+                    numOwners++;
+                    pOwnerFrames[numOwners] = (NvU32)((memdescGetSize(pMemory->pMemDesc) >> PMA_PAGE_SHIFT) * w);
+                    pOwnerW[numOwners]      = w;
+                    _vidmemCompactOwn(pMemory->pMemDesc, numOwners, pOwner, pOwner + chunks, pOwner + 2 * chunks,
+                                      base, off, chunks);
+                }
             }
         }
     }
 
-    (void)_vidmemEvictBestWindow(pUsed, pMovable, pHeavy, pCost, base, off, chunks, need, align, &bestStart);
+    //
+    // The window: what is in it to move per chunk (_vidmemEvictBestWindow()
+    // counts it, a process drawing where the user sees it four times), an
+    // allocation with a corner in it charged for all of it, starting at a
+    // multiple of the alignment (vepContigWindow(), shared with the simulator).
+    //
+    (void)_vidmemEvictBestWindow(pUsed, pMovable, pHeavy, pCost, base, off, chunks, need, align, NULL);
+    for (c = 0; c < chunks; c++)
+    {
+        if (pOwner[c] != 0)
+            pOwner[chunks + c] *= pOwnerW[pOwner[c]];
+    }
+    {
+        VEP_COMPACT_OWNERS owners = { pOwner, pOwner + chunks, pOwnerFrames, pOwnerFrames + VEP_COMPACT_MAX_OWNERS + 1 };
+        NvU64 alignChunks = align >> 21;
+        NvU64 startOff = ((base + (off << PMA_PAGE_SHIFT)) >> 21) % NV_MAX(alignChunks, 1ULL);
+
+        if (vepContigWindow(pCost, &owners, chunks, need, alignChunks, startOff, &bestStart) == NV_U64_MAX)
+            bestStart = NV_U64_MAX;
+    }
     if (bestStart == NV_U64_MAX)
     {
         static NvU32 noneLogged;
@@ -4741,6 +4780,9 @@ done:
     portMemFree(pHeavy);
     portMemFree(pCost);
     portMemFree(pRefs);
+    portMemFree(pOwner);
+    portMemFree(pOwnerFrames);
+    portMemFree(pOwnerW);
     return bOk;
 }
 

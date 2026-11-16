@@ -1600,6 +1600,70 @@ vepCompactWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, NvU64 ch
 }
 
 //
+// A window for a contiguous request was chosen by the frames in use inside
+// it, while every allocation with a corner in it moves whole: for Chrome's
+// 130 MB on the host (2026-11-15 22:18) windows over the edge of WoW's 256 MB
+// blocks moved all 256 MB of each. Charged like a compaction window now.
+//
+NvU64
+vepContigWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, NvU64 chunks, NvU64 need,
+                NvU64 alignChunks, NvU64 startOff, NvU64 *pStart)
+{
+    NvU64 best = NV_U64_MAX, sum = 0, drag = 0, fixed = 0, c;
+
+    if ((need == 0) || (need > chunks))
+        return NV_U64_MAX;
+    alignChunks = NV_MAX(alignChunks, 1ULL);
+    for (c = 0; c < chunks; c++)
+    {
+        NvU32 o;
+
+        // In: chunk c.
+        if (pCost[c] == VEP_COMPACT_FIXED)
+            fixed++;
+        else
+            sum += pCost[c];
+        o = (pOwners != NULL) ? pOwners->pOwner[c] : 0;
+        if (o != 0)
+        {
+            if (pOwners->pCount[o]++ == 0)
+                drag += pOwners->pFrames[o];
+            drag -= NV_MIN(drag, (NvU64)pOwners->pOwn[c]);
+        }
+        // Out: chunk c - need.
+        if (c >= need)
+        {
+            NvU64 d = c - need;
+
+            if (pCost[d] == VEP_COMPACT_FIXED)
+                fixed--;
+            else
+                sum -= pCost[d];
+            o = (pOwners != NULL) ? pOwners->pOwner[d] : 0;
+            if (o != 0)
+            {
+                drag += pOwners->pOwn[d];
+                if (--pOwners->pCount[o] == 0)
+                    drag -= NV_MIN(drag, (NvU64)pOwners->pFrames[o]);
+            }
+        }
+        if ((c + 1 >= need) && (fixed == 0) && (((c + 1 - need) + startOff) % alignChunks == 0) &&
+            (sum + drag < best))
+        {
+            best    = sum + drag;
+            *pStart = c + 1 - need;
+        }
+    }
+    // pCount back to zeros: the chunks of the last window.
+    for (c = chunks - need; (pOwners != NULL) && (c < chunks); c++)
+    {
+        if (pOwners->pOwner[c] != 0)
+            pOwners->pCount[pOwners->pOwner[c]]--;
+    }
+    return best;
+}
+
+//
 // One policy step, after the platform sampled the GPU activity
 // (_vidmemActivityNote(), lastSubmitNs). API lock RW, GPU lock held.
 //
