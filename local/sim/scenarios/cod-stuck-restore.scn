@@ -12,6 +12,8 @@
 # low mark while CoD has memory out, all of it back once there is room.
 # ghostty and claude-desktop went out and back in the same step (11:57:40 in
 # the journal), 189 and 33 times in the simulator.
+# The recording predates the hints' game flags (2026-11-06): CoD, a Steam
+# game, is marked "launched" by hand, as the driver now sees it (R4).
 # Made with:
 #   replay.py 20261106_112014 --from 11:49:30 --to 12:06:00 --expect ...
 # replay of gamerec recording 20261106_112014, 11:49:30 .. 12:05:58, 492 policy steps
@@ -86,7 +88,7 @@ hint 1684199 -
 act 1684199 1749 0
 place 1684199 3 0 1.00
 proc 1684253 sp26-cod.exe old
-hint 1684253 f
+hint 1684253 f launched
 act 1684253 0 21
 place 1684253 9162 522 0.72
 step
@@ -481,7 +483,7 @@ hint 93448 f inh
 act 93448 0 22
 act 1683734 1778 0
 act 1684199 1771 0
-hint 1684253 v
+hint 1684253 v launched
 act 1684253 0 22
 step
 rec 1614 281 0
@@ -8350,7 +8352,7 @@ act 67468 1519 4
 hint 93448 v inh
 act 1683734 2224 0
 act 1684199 2217 0
-hint 1684253 f
+hint 1684253 f launched
 act 1684253 0 39
 step
 rec 1614 345 0
@@ -8451,7 +8453,7 @@ act 67468 1522 4
 hint 93448 f inh
 act 93448 0 5
 act 1683734 2228 0
-hint 1684253 v
+hint 1684253 v launched
 act 1684253 0 32
 step
 rec 1614 345 0
@@ -8552,7 +8554,7 @@ act 5734 19569 4
 hint 9569 v inh other
 act 9569 83378 0
 act 67468 1524 4
-hint 1684253 f
+hint 1684253 f launched
 act 1684253 0 22
 step
 rec 1614 280 0

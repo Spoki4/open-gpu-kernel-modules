@@ -29,10 +29,12 @@ These patches do the same inside the driver.
   off (`evict.sh auto on` runs it on GPU activity alone).
 - **Makes room inside an allocation**: when a visible process (or the
   compositor, or a new GPU context) finds no memory, hidden processes are
-  moved out first and the allocation is retried instead of failing. The
-  focused window may take what it needs from a visible game; a focused app
-  that is not a game gets its allocation even when nobody can make room, and
-  as much of its own older memory goes to sysmem.
+  moved out first and the allocation is retried instead of failing. A
+  focused app that is not a game never moves a visible game out: the game's
+  memory only moves to other vidmem pages for its contiguous buffers, and
+  when nobody else can make room the app's own older memory goes to sysmem
+  instead of a denial (`evict.sh gamegives on`: the old rule, the focus took
+  what it needed from the game).
 - **Brings memory back** when its window is shown again and there is room,
   the focused window first; nothing returns to others while the focus still
   has memory in sysmem. The focus keeps a headroom free (2 GB) and the others
@@ -450,10 +452,12 @@ Comments and tests refer to the problems that led to a piece of code.
 
 Rules (R): R1 focus > previously focused > visible > hidden, and nothing
 returns to visible windows while the focus lacks memory; R2 the focus may
-take from a visible game, only what it needs; R3 victims by how long ago
-they were focused; R4 "game" is a separate flag (fullscreen and busy, or
-started by Steam/GameMode), not the same as focus; R5 when nothing else
-helps, the game matters more than the desktop app.
+take from a visible game, only what it needs (since 2026-11-16 only a focus
+that is itself a game: R5 wins over R2, and a focused app pays with its own
+memory; recording 20261115_213442, 22:18); R3 victims by how long ago they
+were focused; R4 "game" is a separate flag (fullscreen and busy, or started
+by Steam), not the same as focus; R5 when nothing else helps, the game
+matters more than the desktop app.
 
 Ideas (I) cited: I5 use the GPU's access counters to move cold memory first
 (probe: `tests/momc-probe.sh`); I7 shrink the reported budget of background

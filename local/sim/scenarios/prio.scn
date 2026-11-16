@@ -1,7 +1,9 @@
 # rules R and #7: the focused window comes first.
 #  - #7: Chrome focused on monitor 2 next to a fullscreen game drawing on
-#    monitor 1 gets its WebGPU memory: the game gives what is needed, not
-#    more (it was denied and the page died next to CoD).
+#    monitor 1 gets its WebGPU memory (it was denied and the page died next
+#    to CoD). Since 2026-11-16 (R5 over R2, the user's choice) the game gives
+#    nothing for it: Chrome pays with its own older memory (-set
+#    game_gives=1: the game gives what is needed, as before).
 #  - R3: the window focused before the current one keeps its memory against
 #    the foreground's headroom (alt-tab back is instant); older ones go first.
 #  - R5: when the focused game finds nothing else, a video drawing on the
@@ -59,9 +61,9 @@ at 62
 target 2589 1800 0.7 spread=4
 at 70
 expect denied 2589 == 0           # #7: no denial for the focused page
-expect evicted 5000 > 0           # the game gave what the others did not have...
-expect evicted 5000 <= 900        # ...and about only that
-expect sys 2589 == 0
+expect evicted 5000 == 0          # the game on the other monitor keeps its memory
+expect sys 2589 > 0               # the page paid with its own older memory
+expect sys 2589 <= 600
 
 mark back to the game, which then streams in more than the idle ones hold
 hint 2589 v

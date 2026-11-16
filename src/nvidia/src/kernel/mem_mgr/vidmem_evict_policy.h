@@ -244,6 +244,13 @@ extern NvU64  _vidmemPrevFgNs;          // lastFgNs of the window focused before
 extern NvU32  _vidmemEvictWhy;          // VMT_WHY_* of the next evict/restore call
 extern NvU64  _vidmemEvictBudgetBytes;  // partial eviction: stop after this many bytes (0: all)
 extern NvBool _vidmemEvictBigPagesOnly; // evict only allocations on 2 MB pages (making chunks free)
+extern NvBool _vidmemEvictNoContig;     // evict/move no contiguous allocation (the requester's own, for a window)
+//
+// A focused app that is not a game may move a visible game out to sysmem
+// (knob "gamegives", 0 by default: only inside vidmem; the user's choice
+// 2026-11-16, see _vidmemEvictHintVictimOk()).
+//
+extern NvU32  _vidmemFgTakesGame;
 
 // Policy functions the driver calls.
 NvU32  _vidmemHint(NvU32 pid, NvBool *pbActive);
@@ -313,6 +320,29 @@ NvBool vepPlatChunkInfo(OBJGPU *pGpu, NvU64 *pFreeChunks, NvU64 *pLongest);
 // may give memory at `level`. forPid's own memory never leaves vidmem for it.
 NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
                          NvU32 forPid, NvU32 level, NvU64 *pMovedMB);
+//
+// What `p` gives for a window cleared for an allocation of `forPid` (0: the
+// compositor) at `level`: nothing, a move of its memory to other vidmem
+// pages, or a move to sysmem of what cannot go elsewhere in vidmem.
+// bMayMove: the platform may move its memory inside vidmem at all (not the
+// compositor's). *pbHeavy: a window over it costs more (it draws where the
+// user sees it). Shared by the driver and the simulator.
+//
+#define VEP_GIVE_NONE  0
+#define VEP_GIVE_MOVE  1   // inside vidmem only; its contiguous buffers stay
+#define VEP_GIVE_EVICT 2   // inside vidmem first, the rest to sysmem
+NvU32  vepContigGive(VIDMEM_EVICT_PROC *p, NvU32 forPid, NvU32 level, NvBool bMayMove, NvU64 nowNs,
+                     NvBool *pbHeavy);
+//
+// The moves inside vidmem for a window found no room (whole allocations of
+// those who give VEP_GIVE_MOVE): free memory until `wantMB` is free in all
+// (the window, what still has to leave it, a margin), from those who may be
+// moved out at `level`, then from forPid's own memory that is not contiguous
+// when it is a focused app that is not a game. Returns the MB freed. The
+// caller tries the moves again.
+//
+NvU64  vepContigMakeSpace(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 wantMB, NvU32 forPid,
+                          NvU32 level);
 // Background compaction (problem #16), one step: clear the window of 2 MB
 // chunks that moving makes the longest free run, by moving what is in it to
 // other vidmem pages. Whose memory: anyone's but the compositor's. Whole

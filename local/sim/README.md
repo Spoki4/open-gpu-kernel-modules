@@ -60,9 +60,18 @@ the clock from `vidmem_evict_sim.h`.
   allocations moved out of the window, the owner's piece size and the step's
   total, no new chunks in the window or in the run that is kept. `mix` lays
   several processes' allocations out interleaved.
+- With the layout a contiguous allocation needs a free run, as from PMA:
+  when none holds it the driver's path to place it runs
+  (`vepMakeRoomPlaceRun()`), and the window for it is cleared as the driver
+  clears one: what each process gives (`vepContigGive()` in the policy
+  file), the window with the least to move, its allocations moved to other
+  chunks, the rest to sysmem or, for those who may only move inside vidmem,
+  room made by `vepContigMakeSpace()` first. A restored contiguous allocation
+  needs a free run too.
 - Not modelled: fragmentation without the layout (`frag` scales free 2 MB
   chunks, default none), 64 KB pages inside a chunk, contiguous windows for
-  requests (always found, layout or not), per-allocation hot or cold (access
+  requests without the layout (always found), the placement path for
+  allocations that are not contiguous, per-allocation hot or cold (access
   counters), sizes of real allocations (a process grows in `chunk=` MB
   pieces), apps reacting to their budget.
 
@@ -73,7 +82,7 @@ One command per line, `#` starts a comment. Times are seconds from the start.
 | command | |
 |---|---|
 | `cap MB` | vidmem for processes |
-| `set KNOB VALUE` | `fg_headroom`, `bg_cushion`, `auto`, `low`, `high` (policy registry knobs), `fg_own` (problem #7, 1/0), `copy_gbs`, `frag`, `longest` (MB, longest free run: a bigger contiguous allocation comes back from sysmem only into a window the policy had cleared; 0: no limit), `autotick` (policy step every 2 s, default 1), `hints`, `layout` (1: allocations have places), `compact` (MB, the free run compaction keeps), `compact_big` (0: compaction moves allocations of 32 MB at most, as before problem #17), `compact_whole` (0: the compaction window is charged for the frames inside it only, as before), `place_top` (0: every allocation takes the lowest free chunks; 1, the default: non-contiguous ones from the top, as the driver), `place_sides` (0: next to a game the others' memory is placed from the top too, as before) |
+| `set KNOB VALUE` | `fg_headroom`, `bg_cushion`, `auto`, `low`, `high` (policy registry knobs), `fg_own` (problem #7, 1/0), `copy_gbs`, `frag`, `longest` (MB, longest free run: a bigger contiguous allocation comes back from sysmem only into a window the policy had cleared; 0: no limit), `autotick` (policy step every 2 s, default 1), `hints`, `layout` (1: allocations have places), `compact` (MB, the free run compaction keeps), `compact_big` (0: compaction moves allocations of 32 MB at most, as before problem #17), `compact_whole` (0: the compaction window is charged for the frames inside it only, as before), `place_top` (0: every allocation takes the lowest free chunks; 1, the default: non-contiguous ones from the top, as the driver), `place_sides` (0: next to a game the others' memory is placed from the top too, as before), `game_gives` (1: a focused app that is not a game may move a visible game out, as before 2026-11-16) |
 | `proc PID NAME [old] [never] [exempt] [chunk=MB]` | a process; `old`: seen long before the start; kwin_wayland/Xwayland are the compositor |
 | `hint PID f\|v\|h\|- [inh] [other] [full] [launched]` | window hint (focused, visible, hidden, none), inherited from a parent (of another app), has a fullscreen window, started by Steam/GameMode |
 | `act PID IDLE_S\|- SAMPLES` | GPU activity: seconds since its last work (`-` never), engine samples in the last ~10 s |
@@ -86,7 +95,7 @@ One command per line, `#` starts a comment. Times are seconds from the start.
 | `at T` | run until T (steps every 2 s with autotick) |
 | `step` | a policy step now (what a hint change triggers) |
 | `mark TEXT` | a line in the output |
-| `expect METRIC PID\|- OP VALUE` | a check: `vid`, `evicted`, `sys` (= evicted), `evicts`, `moved_out` (MB copied out in all), `restores`, `restorefails`, `windows` (contiguous windows cleared for it), `pingpong`, `bounces` and `bounce_mb` (the driver's own count: moves undone within a minute, MB copied for nothing), `denied`, `denied_mb`, `born`, `stallmax`, `sysfg_mbs`, `free`, `longest` (MB, the longest free run), `compact_steps`, `compact_idle` (steps that moved / found nothing), `compact_pause` (ms, the longest pause a step gave the process), `compact_moved`; OP `<= >= < > ==` |
+| `expect METRIC PID\|- OP VALUE` | a check: `vid`, `evicted`, `sys` (= evicted), `evicts`, `moved_out` (MB copied out in all), `restores`, `restorefails`, `windows` (contiguous windows cleared for it), `pingpong`, `bounces` and `bounce_mb` (the driver's own count: moves undone within a minute, MB copied for nothing), `denied`, `denied_mb`, `born`, `stallmax`, `sysfg_mbs`, `free`, `longest` (MB, the longest free run), `compact_steps`, `compact_idle` (steps that moved / found nothing), `compact_pause` (ms, the longest pause a step gave the process), `compact_moved`, `window_pause` (ms, the longest pause a window cleared for somebody else gave it), `window_pauses`, `window_moved` (MB of it moved inside vidmem for others' windows); OP `<= >= < > ==` |
 | `rec PID VRAM RAM` | recorded values for `-cmp` (replays) |
 | `clock UNIX_S` | wall clock at time 0 (output shows HH:MM:SS) |
 

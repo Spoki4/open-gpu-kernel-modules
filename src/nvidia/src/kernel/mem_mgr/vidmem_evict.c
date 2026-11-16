@@ -271,6 +271,7 @@ static NvU64 _vidmemEvictPhaseNs[VE_PH_COUNT];
 NvU64 _vidmemEvictBudgetBytes;
 // Making whole 2 MB chunks free: only allocations on 2 MB pages move (policy sets it).
 NvBool _vidmemEvictBigPagesOnly;
+NvBool _vidmemEvictNoContig;       // see vidmem_evict_policy.h
 
 // Process the current evict/restore call works on (recorded in the state).
 static NvU32 _vidmemEvictCurPid;
@@ -2852,6 +2853,10 @@ _vidmemEvictPidLocked
                 if (_vidmemEvictBigPagesOnly &&
                     ((pMemDesc->pPmaAllocInfo == NULL) || (pMemDesc->pPmaAllocInfo->pageSize < (2ULL << 20))))
                     continue;
+                // The requester's own memory for its window: not its contiguous buffers.
+                if (_vidmemEvictNoContig &&
+                    ((pMemDesc->pPmaAllocInfo == NULL) || pMemDesc->pPmaAllocInfo->bContig))
+                    continue;
 
                 // Partial eviction: enough moved (counting deferred ones).
                 if (_vidmemEvictBudgetBytes != 0)
@@ -4229,6 +4234,36 @@ _vidmemPidHasInRange(NvU32 pid)
     return NV_FALSE;
 }
 
+// The bytes of `pid`'s allocations (whole) with a page in the window being cleared.
+static NvU64
+_vidmemPidBytesInRange(NvU32 pid)
+{
+    RmClient **ppClient;
+    NvU64      bytes = 0;
+
+    for (ppClient = serverutilGetFirstClientUnderLock(); ppClient != NULL;
+         ppClient = serverutilGetNextClientUnderLock(ppClient))
+    {
+        RsClient   *pRsClient = staticCast(*ppClient, RsClient);
+        RS_ITERATOR iter;
+
+        if ((pRsClient->type == CLIENT_TYPE_KERNEL) || ((*ppClient)->ProcID != pid))
+            continue;
+        iter = serverutilRefIter(pRsClient->hClient, NV01_NULL_OBJECT, 0, RS_ITERATE_DESCENDANTS, NV_TRUE);
+        while (clientRefIterNext(iter.pClient, &iter))
+        {
+            Memory *pMemory = dynamicCast(iter.pResourceRef->pResource, Memory);
+
+            if ((pMemory != NULL) && (pMemory->pMemDesc != NULL) &&
+                (iter.pResourceRef->externalClassId == NV01_MEMORY_LOCAL_USER) &&
+                (pMemory->pMemDesc->pLocalEvictState == NULL) &&
+                _vidmemMemDescInRange(pMemory->pMemDesc, _vidmemEvictRangeLo, _vidmemEvictRangeHi))
+                bytes += memdescGetSize(pMemory->pMemDesc);
+        }
+    }
+    return bytes;
+}
+
 static NvU64 _vidmemContigInVidmemMB;   // moved inside vidmem by window clearing, in all (status)
 
 //
@@ -4242,7 +4277,10 @@ static NvU64 _vidmemContigInVidmemMB;   // moved inside vidmem by window clearin
 // Those who may not be moved out at `level` but whose memory compaction may
 // move (_vidmemCompactVictim(): anyone but the focus and the compositor)
 // still give for a window, by a move to other vidmem pages only: it stays in
-// vidmem, the price is a pause for the copy (problem #16).
+// vidmem, the price is a pause for the copy (problem #16). A game on the
+// other monitor is one of them for a focused app (vepContigGive()); when its
+// memory finds no other place in vidmem, room is made for it by others and
+// by the app's own memory (vepContigMakeSpace()), never by moving it out.
 //
 static NvBool _vidmemCompactVictim(VIDMEM_EVICT_PROC *p, NvBool bFgToo);
 
@@ -4260,7 +4298,8 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     VIDMEM_EVICT_MAPREF *pRefs = NULL;
     NvU64   nowNs = osGetMonotonicTimeNs();
     NvBool  bOk = NV_FALSE;
-    NvU32   i;
+    NvU64   spaceMB = 0;
+    NvU32   i, pass;
 
     *pMovedMB = 0;
     pUsed = vidmemPmaUsedMap(pPma, &base, &frames, &largest);
@@ -4297,13 +4336,13 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     for (i = 0; i < count; i++)
     {
         RmClient **ppClient;
-        NvBool     bSelf = (forPid != 0) && (pProcs[i].pid == forPid);
-        // Given only because of the level (drawing in a window the user sees): costly.
-        NvBool     bHeavy = !bSelf && !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, VE_LEVEL_HIDDEN);
+        NvBool     bHeavy;
+        NvU32      give = vepContigGive(&pProcs[i], forPid, level, _vidmemCompactVictim(&pProcs[i], NV_FALSE),
+                                        nowNs, &bHeavy);
         // Moved inside vidmem only: itself, and those not to be moved out at this level.
-        NvBool     bMoveOnly = bSelf || !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, level);
+        NvBool     bMoveOnly = (give == VEP_GIVE_MOVE);
 
-        if (bMoveOnly && !bSelf && !_vidmemCompactVictim(&pProcs[i], NV_FALSE))
+        if (give == VEP_GIVE_NONE)
             continue;
         for (ppClient = serverutilGetFirstClientUnderLock(); ppClient != NULL;
              ppClient = serverutilGetNextClientUnderLock(ppClient))
@@ -4373,29 +4412,59 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
 
         osVidmemTraceExt(VMT_EXT_WINDOW, 3, VMT_WHY_ALLOC, forPid, w, 1);
     }
-    for (i = 0; i < count; i++)
+    for (pass = 0; pass < 2; pass++)
     {
-        NvU64  moved = 0;
-        NvBool bSelf = (forPid != 0) && (pProcs[i].pid == forPid);
-        NvBool bMoveOnly = bSelf || !_vidmemEvictHintVictimOk(&pProcs[i], forPid, nowNs, level);
+        NvU64 shortBytes = 0, lo, hi;
 
-        if ((bMoveOnly && !bSelf && !_vidmemCompactVictim(&pProcs[i], NV_FALSE)) ||
-            !_vidmemPidHasInRange(pProcs[i].pid))
-            continue;
+        for (i = 0; i < count; i++)
+        {
+            NvU64  moved = 0;
+            NvBool bHeavy;
+            NvU32  give = vepContigGive(&pProcs[i], forPid, level, _vidmemCompactVictim(&pProcs[i], NV_FALSE),
+                                        nowNs, &bHeavy);
+
+            if ((give == VEP_GIVE_NONE) || !_vidmemPidHasInRange(pProcs[i].pid))
+                continue;
+            //
+            // To other vidmem pages first (problems #16, #15: Chrome's contiguous
+            // buffers pushed the game's memory out to sysmem, which then ran from
+            // there until a restore); to sysmem what is left in the window: what
+            // the compositor maps too, or when no vidmem outside it is free.
+            //
+            (void)_vidmemEvictPidLocked(pGpu, 3, pProcs[i].pid, NULL, 0, NULL, &moved);
+            *pMovedMB += moved >> 20;
+            *pInVidmemMB += moved >> 20;
+            if (give == VEP_GIVE_MOVE)
+            {
+                // What found no other place in vidmem (whole allocations).
+                shortBytes += _vidmemPidBytesInRange(pProcs[i].pid);
+                continue;
+            }
+            if (!_vidmemPidHasInRange(pProcs[i].pid))
+                continue;
+            moved = 0;
+            (void)_vidmemEvictPidLocked(pGpu, 1, pProcs[i].pid, NULL, 0, NULL, &moved);
+            *pMovedMB += moved >> 20;
+        }
+        if ((pass != 0) || (shortBytes == 0))
+            break;
         //
-        // To other vidmem pages first (problems #16, #15: Chrome's contiguous
-        // buffers pushed the game's memory out to sysmem, which then ran from
-        // there until a restore); to sysmem what is left in the window: what
-        // the compositor maps too, or when no vidmem outside it is free.
+        // Memory that may only move inside vidmem (a game on the other
+        // monitor, for a focused app) found no room outside the window: room
+        // is made by those who may be moved out at this level, then by the
+        // requester's own memory (vepContigMakeSpace()), and the moves are
+        // tried once more. Before, that memory went to sysmem instead (host,
+        // 2026-11-15 22:18: three 256 MB blocks of WoW for Chrome's 130 MB).
         //
-        (void)_vidmemEvictPidLocked(pGpu, 3, pProcs[i].pid, NULL, 0, NULL, &moved);
-        *pMovedMB += moved >> 20;
-        *pInVidmemMB += moved >> 20;
-        if (bMoveOnly || !_vidmemPidHasInRange(pProcs[i].pid))
-            continue;
-        moved = 0;
-        (void)_vidmemEvictPidLocked(pGpu, 1, pProcs[i].pid, NULL, 0, NULL, &moved);
-        *pMovedMB += moved >> 20;
+        lo = _vidmemEvictRangeLo;
+        hi = _vidmemEvictRangeHi;
+        _vidmemEvictRangeLo = _vidmemEvictRangeHi = 0;
+        spaceMB = vepContigMakeSpace(pGpu, pProcs, count, (need << 1) + (shortBytes >> 20) + 16, forPid, level);
+        *pMovedMB += spaceMB;
+        _vidmemEvictRangeLo = lo;
+        _vidmemEvictRangeHi = hi;
+        if (spaceMB == 0)
+            break;
     }
     _vidmemEvictRangeLo = _vidmemEvictRangeHi = 0;
 
@@ -4405,8 +4474,8 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     bOk = (pUsed != NULL) &&
           (_vidmemEvictBestWindow(pUsed, pMovable, NULL, pCost, base, off, chunks, need, align, NULL) == 0);
     _vidmemContigInVidmemMB += inVidmem;
-    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: window %s: %llu MB moved, %llu of them inside vidmem\n",
-              bOk ? "cleared" : "not cleared", *pMovedMB, inVidmem);
+    NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: window %s: %llu MB moved, %llu of them inside vidmem, %llu MB out to make room for those\n",
+              bOk ? "cleared" : "not cleared", *pMovedMB, inVidmem, spaceMB);
 
 done:
     portMemFree(pUsed);
@@ -5504,6 +5573,8 @@ _vidmemEvictStatus(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
                  !vepGameSideNow() ? "no game holds vidmem now, everybody's new memory is placed from the top" :
                  _vidmemPlaceSides ? "a game holds vidmem, the others' new memory is placed from the bottom" :
                                      "a game holds vidmem");
+    EVICT_PRINTF("a visible game for a focused app: %s\n",
+                 _vidmemFgTakesGame ? "may be moved to sysmem (gamegives on)" : "moved inside vidmem only");
     EVICT_PRINTF("%-8s %-16s %7s %7s %8s %7s %7s %-7s %s\n",
                  "pid", "name", "vram_mb", "ram_mb", "evict_mb", "idle_s", "samples", "window", "flags");
 
@@ -5587,6 +5658,12 @@ vidmemEvictProcess
             _vidmemMapPins(pGpu, buf, bufSize, pLen);
             _vidmemMapDumpEnd(used, fixed);
         }
+    }
+    else if (mode == 20)
+    {
+        _vidmemFgTakesGame = (arg != 0);
+        EVICT_PRINTF("a focused app that is not a game %s a visible game's memory to sysmem\n",
+                     _vidmemFgTakesGame ? "may move" : "moves only inside vidmem, never");
     }
     else if (mode == 18)
     {

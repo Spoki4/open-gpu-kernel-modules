@@ -60,6 +60,9 @@ typedef struct
     NvU64  windowKB;              // a contiguous window cleared for it and not used yet
     NvU32  windows;               // windows cleared for it
     double compactMaxMs;          // longest pause a compaction step gave it
+    double winMaxMs;              // longest pause a window cleared for somebody else gave it
+    NvU64  winKB;                 // its memory moved inside vidmem for others' windows
+    NvU32  winPauses;             // how many such pauses
     NvU64  compactKB;             // moved by compaction
 } Proc;
 
@@ -189,6 +192,7 @@ NvBool vidmemIsReserveExemptName(const char *name)
 NvU64 _vidmemEvictBytes;
 NvU64 _vidmemEvictBudgetBytes;
 NvBool _vidmemEvictBigPagesOnly;     // the simulator has no page sizes: ignored
+NvBool _vidmemEvictNoContig;         // evictions skip contiguous allocations
 NvU32 _vidmemEvictWhy;
 
 static NvU64 sumKB(const Proc *p, int where)
@@ -289,6 +293,9 @@ static int layPlace(Alloc *a, int how, NvU64 aLo, NvU64 aHi, NvU64 bLo, NvU64 bH
                 return 1;
             }
         }
+        // No free run holds it: PMA fails a contiguous request (the caller makes room or gives up).
+        a->id = 0;
+        return 0;
     }
     else if (how == LAY_FIT)
     {
@@ -334,6 +341,14 @@ static void layPlaceNew(Proc *p, Alloc *a)
                 gScenario, gLine, (unsigned long long)a->kb, p->name);
         exit(2);
     }
+}
+
+static NvU64 layLongest(NvU64 *pFree, NvU64 *pStart);
+
+// Would a contiguous allocation of `kb` find a free run (always, without the layout)?
+static int layFits(NvU64 kb)
+{
+    return !gLayout || (layLongest(NULL, NULL) >= ((kb + 2047) >> 11));
 }
 
 // Free chunks and the longest run of them; *pStart (optional): where it begins.
@@ -637,7 +652,7 @@ NV_STATUS vepPlatMovePid(OBJGPU *pGpu, NvU32 mode, NvU32 pid, NvU64 *pMovedBytes
 
         if (mode == 1)
         {
-            if ((a->where != W_VID) || !a->movable)
+            if ((a->where != W_VID) || !a->movable || (_vidmemEvictNoContig && a->contig))
                 continue;
             if ((_vidmemEvictBudgetBytes != 0) && ((kb << 10) >= _vidmemEvictBudgetBytes))
                 continue;
@@ -655,6 +670,12 @@ NV_STATUS vepPlatMovePid(OBJGPU *pGpu, NvU32 mode, NvU32 pid, NvU64 *pMovedBytes
             if ((_vidmemEvictBudgetBytes != 0) && (((kb + a->kb) << 10) > _vidmemEvictBudgetBytes))
                 continue;
             if (freeKB() < a->kb)
+            {
+                failed++;
+                continue;
+            }
+            // Contiguous with the layout: only into a free run that holds it.
+            if (a->contig && gLayout && (layLongest(NULL, NULL) < ((a->kb + 2047) >> 11)))
             {
                 failed++;
                 continue;
@@ -745,17 +766,218 @@ NvBool vepPlatChunkInfo(OBJGPU *pGpu, NvU64 *pFreeChunks, NvU64 *pLongest)
 NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
                          NvU32 forPid, NvU32 level, NvU64 *pMovedMB)
 {
-    Proc *p = (forPid != 0) ? findProc(forPid) : NULL;
+    Proc   *p = (forPid != 0) ? findProc(forPid) : NULL;
+    NvU64   need = (size + (2ULL << 20) - 1) >> 21, c, s, lo = 0, best = NV_U64_MAX;
+    NvU64   nowNs = osGetMonotonicTimeNs(), spaceMB = 0;
+    NvU8   *give, *heavy;
+    NvU32  *cost;
+    int     i, k, pass, ok;
+    double  ms = 0;
 
-    (void)pGpu; (void)pProcs; (void)count; (void)align; (void)level;
+    (void)pGpu; (void)align;
     *pMovedMB = 0;
-    // Always found, by moving what is in it to other vidmem pages (no cost modelled).
-    if ((p != NULL) && (p->windowKB < (size >> 10)))
+    if (!gLayout)
     {
-        p->windowKB = size >> 10;
-        p->windows++;
+        // Always found, by moving what is in it to other vidmem pages (no cost modelled).
+        if ((p != NULL) && (p->windowKB < (size >> 10)))
+        {
+            p->windowKB = size >> 10;
+            p->windows++;
+        }
+        return NV_TRUE;
     }
-    return NV_TRUE;
+    layEnsure();
+    if (layLongest(NULL, NULL) >= need)
+        return NV_TRUE;
+
+    //
+    // As the driver's _vidmemEvictMakeContig(): what each process gives
+    // (vepContigGive()), the window of `need` chunks with no chunk nobody may
+    // move and the least to move (a process drawing where the user sees it
+    // counts four times), its allocations moved to other chunks first, the
+    // rest of those who may be moved out to sysmem; room for what may only
+    // move inside vidmem made by vepContigMakeSpace() once.
+    //
+    give  = calloc(gNumProcs, 1);
+    heavy = calloc(gNumProcs, 1);
+    cost  = calloc(gChunks, sizeof(*cost));
+    for (i = 0; i < gNumProcs; i++)
+    {
+        NvBool bHeavy = NV_FALSE;
+
+        for (k = 0; k < (int)count; k++)
+        {
+            if (pProcs[k].pid == gProcs[i].pid)
+            {
+                give[i]  = (NvU8)vepContigGive(&pProcs[k], forPid, level, SIM_VICTIM(&gProcs[i]), nowNs, &bHeavy);
+                heavy[i] = bHeavy;
+                break;
+            }
+        }
+    }
+    for (c = 0; c < gChunks; c++)
+    {
+        NvU32 id = gChunk[c];
+
+        if (id == 0)
+            continue;
+        cost[c] = NV_U32_MAX;
+        for (i = 0; (i < gNumProcs) && (cost[c] == NV_U32_MAX); i++)
+        {
+            for (k = 0; k < gProcs[i].na; k++)
+            {
+                Alloc *a = &gProcs[i].a[k];
+
+                if (a->id != id)
+                    continue;
+                if ((give[i] != VEP_GIVE_NONE) && a->movable && !((give[i] == VEP_GIVE_MOVE) && a->contig))
+                    cost[c] = heavy[i] ? 4 : 1;
+                break;
+            }
+        }
+    }
+    for (s = 0; s + need <= gChunks; s++)
+    {
+        NvU64 sum = 0;
+
+        for (c = s; c < s + need; c++)
+        {
+            if (cost[c] == NV_U32_MAX)
+                break;
+            sum += cost[c];
+        }
+        if ((c == s + need) && (sum < best))
+        {
+            best = sum;
+            lo   = s;
+        }
+    }
+    if (best == NV_U64_MAX)
+    {
+        if (gVerbose)
+            printf("%s  WINDOW none of %llu MB can be cleared for %s (longest free %llu MB)\n", clockStr(gNowS),
+                   (unsigned long long)(need << 1), (p != NULL) ? p->name : "the compositor",
+                   (unsigned long long)(layLongest(NULL, NULL) << 1));
+        ok = 0;
+        goto done;
+    }
+    if (gVerbose)
+        printf("%s  WINDOW clearing %llu MB at chunk %llu for %s\n", clockStr(gNowS), (unsigned long long)(need << 1),
+               (unsigned long long)lo, (p != NULL) ? p->name : "the compositor");
+    for (pass = 0; pass < 2; pass++)
+    {
+        NvU64 shortKB = 0;
+
+        for (i = 0; i < gNumProcs; i++)
+        {
+            Proc  *q = &gProcs[i];
+            NvU64  inKB = 0, outKB = 0;
+            NvU32  nIn = 0, nOut = 0;
+
+            if (give[i] == VEP_GIVE_NONE)
+                continue;
+            for (k = 0; k < q->na; k++)
+            {
+                Alloc *a = &q->a[k];
+                NvU32  oldId = a->id;
+                NvU64  x;
+                int    inWin = 0;
+
+                if ((a->where != W_VID) || (a->id == 0) || !a->movable || ((give[i] == VEP_GIVE_MOVE) && a->contig))
+                    continue;
+                for (x = lo; x < lo + need; x++)
+                    inWin |= (gChunk[x] == oldId);
+                if (!inWin)
+                    continue;
+                // To other chunks first, outside the window (_vidmemRelocate()).
+                if (layPlace(a, LAY_FIT, lo, lo + need, 0, 0))
+                {
+                    for (x = 0; x < gChunks; x++)
+                        if (gChunk[x] == oldId)
+                            gChunk[x] = 0;
+                    inKB += a->kb;
+                    nIn++;
+                    continue;
+                }
+                a->id = oldId;
+                if (give[i] == VEP_GIVE_MOVE)
+                {
+                    shortKB += a->kb;
+                    continue;
+                }
+                // Moved out: what found no place in vidmem.
+                a->where = W_EVICT;
+                layRemove(a);
+                _vidmemEvictBytes += a->kb << 10;
+                outKB += a->kb;
+                nOut++;
+            }
+            if (inKB != 0)
+            {
+                double t = moveMs(inKB, nIn);
+
+                ms += t;
+                *pMovedMB += inKB >> 10;
+                if (q != p)
+                {
+                    q->winMaxMs = NV_MAX(q->winMaxMs, t);
+                    q->winKB   += inKB;
+                    q->winPauses++;
+                }
+                gMoves++;
+                gMovedKB += inKB;
+                mapMove(3, VMT_WHY_ALLOC, q->pid, q->name, inKB, nIn, 0, t);
+                if (gVerbose)
+                    printf("%s  WINDOW move %s(%u) %llu MB inside vidmem, %.0f ms\n", clockStr(gNowS), q->name,
+                           q->pid, (unsigned long long)(inKB >> 10), t);
+            }
+            if (outKB != 0)
+            {
+                double t = moveMs(outKB, nOut);
+
+                ms += t;
+                *pMovedMB += outKB >> 10;
+                if (gNowS - q->lastRestoreS <= 4.0)
+                    q->pingpong++;
+                q->evicts++;
+                q->evictKB += outKB;
+                q->lastEvictS = gNowS;
+                gMoves++;
+                gMovedKB += outKB;
+                mapMove(1, VMT_WHY_ALLOC, q->pid, q->name, outKB, nOut, 0, t);
+                if (gVerbose)
+                    printf("%s  WINDOW evict %s(%u) %llu MB to sysmem, %.0f ms\n", clockStr(gNowS), q->name,
+                           q->pid, (unsigned long long)(outKB >> 10), t);
+            }
+        }
+        if ((pass != 0) || (shortKB == 0))
+            break;
+        gCtxMs += ms;
+        accumulate(gNowS + ms / 1000.0);
+        ms = 0;
+        spaceMB = vepContigMakeSpace(NULL, pProcs, count, (need << 1) + (shortKB >> 10) + 16, forPid, level);
+        *pMovedMB += spaceMB;
+        if (gVerbose)
+            printf("%s  WINDOW %llu MB had no other place in vidmem: %llu MB made free\n", clockStr(gNowS),
+                   (unsigned long long)(shortKB >> 10), (unsigned long long)spaceMB);
+        if (spaceMB == 0)
+            break;
+    }
+    gCtxMs += ms;
+    accumulate(gNowS + ms / 1000.0);
+    ok = 1;
+    for (c = lo; c < lo + need; c++)
+        ok &= (gChunk[c] == 0);
+    if (ok && (p != NULL))
+        p->windows++;
+    if (gVerbose)
+        printf("%s  WINDOW %s, %llu MB moved\n", clockStr(gNowS), ok ? "cleared" : "not cleared",
+               (unsigned long long)*pMovedMB);
+done:
+    free(give);
+    free(heavy);
+    free(cost);
+    return ok ? NV_TRUE : NV_FALSE;
 }
 
 //
@@ -1006,12 +1228,12 @@ static void simAlloc(Proc *p, NvU64 kb, int movable, int contig)
     if (p->exempt)
     {
         // The compositor: never turned away; others move out until it fits.
-        ok = freeKB() >= kb;
+        ok = (freeKB() >= kb) && (!contig || layFits(kb));
         if (!ok && _vidmemAutoActive())
         {
             ctxBegin(p, "compositor");
             (void)vepMakeRoomCompositorRun(NULL, size, contig, 2ULL << 20, &wantMB, &avail, &moved);
-            ok = freeKB() >= kb;
+            ok = (freeKB() >= kb) && (!contig || layFits(kb));
         }
     }
     else
@@ -1049,6 +1271,23 @@ static void simAlloc(Proc *p, NvU64 kb, int movable, int contig)
 #endif
         if (ok && !born)
             ok = freeKB() >= kb;    // PMA
+        //
+        // A contiguous request no free run holds (the layout): PMA fails, the
+        // driver makes room to place it (vidmemEvictMakeRoomPlace(): whole
+        // chunks, then a window) and tries once more.
+        //
+        if (ok && !born && contig && !layFits(kb))
+        {
+            NvU32 level = vepMakeRoomPlaceLevel(p->pid, NV_TRUE);
+
+            ok = 0;
+            if (level != NV_U32_MAX)
+            {
+                gCtxWhat = "placing";
+                if (vepMakeRoomPlaceRun(NULL, p->pid, size, NV_TRUE, 2ULL << 20, level, &wantMB, &avail, &moved))
+                    ok = (freeKB() >= kb) && layFits(kb);
+            }
+        }
     }
     if (born)
     {
@@ -1337,6 +1576,9 @@ static double metric(const char *m, Proc *p)
     if (strcmp(m, "born") == 0)       return p->born;
     if (strcmp(m, "stallmax") == 0)   return p->maxStallMs;
     if (strcmp(m, "compact_pause") == 0) return p->compactMaxMs;
+    if (strcmp(m, "window_pause") == 0) return p->winMaxMs;          // ms, longest pause for somebody else's window
+    if (strcmp(m, "window_pauses") == 0) return p->winPauses;
+    if (strcmp(m, "window_moved") == 0) return (double)(p->winKB >> 10);
     if (strcmp(m, "compact_moved") == 0) return (double)(p->compactKB >> 10);
     if (strcmp(m, "sysfg_mbs") == 0)  return p->sysFgMBs;
     fprintf(stderr, "%s:%d: unknown metric %s\n", gScenario, gLine, m);
@@ -1375,6 +1617,7 @@ static int setKnob(const char *k, const char *v)
     else if (strcmp(k, "frag") == 0)         gFrag = d;
     else if (strcmp(k, "longest") == 0)      gLongestMB = (NvU64)d;
     else if (strcmp(k, "fg_own") == 0)       _vidmemFgOwnEnabled = (NvU32)d;
+    else if (strcmp(k, "game_gives") == 0)   _vidmemFgTakesGame = (NvU32)d;
     else if (strcmp(k, "autotick") == 0)     gAutoTick = (int)d;
     else if (strcmp(k, "hints") == 0)        gHintsActive = (int)d;
     else if (strcmp(k, "layout") == 0)       gLayout = (int)d;
