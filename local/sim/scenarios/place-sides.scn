@@ -43,7 +43,7 @@ free 2617 192
 expect free - >= 1600
 mark the holes are between the browser's buffers; the game's blocks stand together
 at 150
-expect longest - >= 576              # three such buffers
+expect longest - >= 192              # the buffer asked for (with the game in focus no more is gathered)
 expect compact_moved 12557 == 0      # the game was not paused for it
 expect compact_pause 2617 <= 27
 expect evicts 2617 == 0
