@@ -387,6 +387,16 @@ typedef struct
 } VEP_COMPACT_OWNERS;
 // Allocations numbered at most; the rest count by their frames in the window only.
 #define VEP_COMPACT_MAX_OWNERS 8192
+//
+// The cheapest window of `need` chunks for a contiguous request, among those
+// with no VEP_COMPACT_FIXED chunk that start where (start + startOff) is a
+// multiple of alignChunks: what is in it to move, an allocation with a corner
+// in it charged for all of it (pOwners as for vepCompactWindow(), pFrames of
+// each already weighted by the caller; NULL: by the chunks' costs alone).
+// NV_U64_MAX: none; else the cost, *pStart the first chunk.
+//
+NvU64  vepContigWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, NvU64 chunks, NvU64 need,
+                       NvU64 alignChunks, NvU64 startOff, NvU64 *pStart);
 NvBool vepCompactWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, NvU64 chunks, NvU64 chunkFrames,
                         NvU64 runStart, NvU64 runLen, NvU64 budgetFrames, NvU64 *pLo, NvU64 *pHi);
 // Total evicted bytes right now (the engine's count).
