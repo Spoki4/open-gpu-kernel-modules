@@ -1,6 +1,7 @@
 vram-hog
 gbm-hog
 compr-test
+vk-share
 .vulkan-headers/
 stress-logs/
 nvt-game

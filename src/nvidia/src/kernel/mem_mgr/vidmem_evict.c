@@ -700,9 +700,14 @@ _vidmemEvictAddHolderMaps
 // walk (problem #1). Without it every shared allocation looked for its other
 // holders by walking every client and every resource again: a policy step
 // took ~20 ms under the RM locks on the desktop (Chrome WebGPU and kwin lost
-// 2-4 frames every 2 s). Built by vepPlatGatherProcs() and
-// _vidmemEvictPidLocked(); entries keep the walk order, so the first holder
-// of a process is the same as found by a walk. Off (NULL) elsewhere.
+// 2-4 frames every 2 s). Built once for each operation that holds the
+// locks (a policy step, a make-room, a headroom piece, a procfs command) and
+// used by everything inside it: walks, moves, windows, compaction steps. A
+// compaction step had none: it looked for the holders of every shared
+// buffer by walking every client again, and took 23-27 ms with a game in
+// focus for a move of 3-6 ms (host, 2026-11-15 22:08-22:13, recording
+// 20261115_213442). Entries keep the walk order, so the first holder of a
+// process is the same as found by a walk. Off (NULL) elsewhere.
 //
 typedef struct
 {
@@ -3588,6 +3593,7 @@ _vidmemEvictIsFirstPidHolder(MEMORY_DESCRIPTOR *pMemDesc, NvU32 pid, RsResourceR
 //
 static NvU64 _vidmemStepWalkNs, _vidmemStepMoveNs;
 static NvU32 _vidmemStepMoveDepth;      // a move inside a window or compaction is counted once
+static NvU64 _vidmemStepCompactNs, _vidmemStepCompactMoveNs;   // a compaction step, and its moves
 #define VE_MOVE_TIME_BEGIN() NvU64 vmtMove0 = VMT_NOW(); _vidmemStepMoveDepth++
 #define VE_MOVE_TIME_END()   do { if (--_vidmemStepMoveDepth == 0) _vidmemStepMoveNs += VMT_NOW() - vmtMove0; } while (0)
 
@@ -3810,8 +3816,10 @@ _vidmemEvictPolicyTick(OBJGPU *pGpu, NvU32 trigger)
     NvU64 stepNs = osGetMonotonicTimeNs();   // the clock the policy keeps (not VMT_NOW's)
     NvU64 walkNs, moveNs;
 
-    _vidmemStepWalkNs = _vidmemStepMoveNs = 0;
+    _vidmemStepWalkNs = _vidmemStepMoveNs = _vidmemStepCompactNs = _vidmemStepCompactMoveNs = 0;
+    _veHolderIndexBegin();
     _vidmemEvictPolicyStep(pGpu);
+    _veHolderIndexEnd();
     walkNs = _vidmemStepWalkNs;
     moveNs = _vidmemStepMoveNs;
 
@@ -3871,6 +3879,8 @@ _vidmemEvictPolicyTick(OBJGPU *pGpu, NvU32 trigger)
         a[11] = _vidmemStepSubmitNs;
         a[12] = walkNs;
         a[13] = moveNs;
+        a[14] = _vidmemStepCompactNs;
+        a[15] = _vidmemStepCompactMoveNs;
         osVidmemTrace(VMT_TICK, 0, a);
     }
     // Every 5th timer step (10 s): how fragmented free vidmem is (problem #16).
@@ -4083,7 +4093,9 @@ _vidmemHeadroomWorkItem(NvU32 gpuInstance, void *pArgs)
         rmapiLockIsWriteOwner() &&
         (rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_MEM) == NV_OK))
     {
+        _veHolderIndexBegin();
         bMore = vepHeadroomRun(pGpu);
+        _veHolderIndexEnd();
         rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     }
     if (bMore && (pGpu != NULL))
@@ -4159,7 +4171,9 @@ _vidmemEvictMakeRoomWant(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvU64 he
             return NV_FALSE;
         bLocked = NV_TRUE;
     }
+    _veHolderIndexBegin();
     bOk = vepMakeRoomRun(pGpu, pid, size, headroomMB, why, &wantMB, &avail);
+    _veHolderIndexEnd();
     if (bLocked)
         rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
     if (osVidmemTraceOn(VMT_MAKEROOM))
@@ -4715,6 +4729,7 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
     VE_MOVE_TIME_BEGIN();
 
     moved = _vidmemPlatCompact(pGpu, pProcs, count, stepMB, fgStepMB, pWindowMB);
+    _vidmemStepCompactNs += VMT_NOW() - vmtMove0;
     VE_MOVE_TIME_END();
     return moved;
 }
@@ -4735,6 +4750,7 @@ _vidmemPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 s
     VIDMEM_EVICT_MAPREF *pRefs = NULL;
     NvU32   i, victims = 0, numOwners = 0;
     NvBool  bGameToo = NV_FALSE;
+    NvU64   tMove;
     const char *why = "";
 
     *pWindowMB = 0;
@@ -4930,7 +4946,9 @@ _vidmemPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 s
             break;
         _vidmemRelocateMaxBytes =
             ((VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG) ? NV_MIN(fgStepMB, stepMB) : stepMB) << 20;
+        tMove = VMT_NOW();
         (void)_vidmemEvictPidLocked(pGpu, 3, pProcs[i].pid, NULL, 0, NULL, &moved);
+        _vidmemStepCompactMoveNs += VMT_NOW() - tMove;
         movedMB += moved >> 20;
     }
     _vidmemEvictRangeLo = _vidmemEvictRangeHi = 0;
@@ -5190,7 +5208,9 @@ vidmemEvictMakeRoomCompositor(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvB
             return NV_FALSE;
         bLocked = NV_TRUE;
     }
+    _veHolderIndexBegin();
     bOk = vepMakeRoomCompositorRun(pGpu, size, bContig, align, &wantMB, &avail, &movedMB);
+    _veHolderIndexEnd();
     if (bLocked)
         rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
 
@@ -5269,7 +5289,9 @@ vidmemEvictMakeRoomPlace(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvBool b
             return NV_FALSE;
         bLocked = NV_TRUE;
     }
+    _veHolderIndexBegin();
     bOk = vepMakeRoomPlaceRun(pGpu, pid, size, bContig, align, level, &wantMB, &avail, &movedMB);
+    _veHolderIndexEnd();
     if (bLocked)
         rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
     dt = VMT_NOW() - t0;
@@ -5311,7 +5333,9 @@ vidmemEvictMakeRoomForKernel(OBJGPU *pGpu, NvU32 pid, NvU64 size)
             return NV_FALSE;
         bLocked = NV_TRUE;
     }
+    _veHolderIndexBegin();
     bOk = vepMakeRoomPlaceRun(pGpu, pid, size, NV_FALSE, 0, level, &wantMB, &avail, &movedMB);
+    _veHolderIndexEnd();
     if (bLocked)
         rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
     if (bOk || (logged++ < 8) || ((logged % 256) == 0))
@@ -5774,6 +5798,7 @@ vidmemEvictProcess
     status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_MEM);
     if (status != NV_OK)
         return status;
+    _veHolderIndexBegin();
 
     // 12: move inside vidmem (problem #16), mode 3 of _vidmemEvictPidLocked().
     if (mode == 19)
@@ -5897,6 +5922,7 @@ vidmemEvictProcess
         EVICT_PRINTF("auto %s\n", _vidmemAutoName());
     }
 
+    _veHolderIndexEnd();
     rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     return status;
 }
