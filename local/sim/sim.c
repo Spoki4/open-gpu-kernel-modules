@@ -81,6 +81,7 @@ static int    gVerbose;
 static double gCopyGBs = 3.5;     // copy speed of a move (2026-11-06 CoD: 494 MB in 139 ms)
 static double gFrag = 1.0;        // share of free memory in free 2 MB chunks
 static int    gCompactOwners = 1; // the compaction window is charged for whole allocations (knob "compact_whole")
+static int    gCompactGameLast = 1; // a game's memory only when nothing else lengthens the run (knob "compact_game_last")
 static int    gPlaceTop = 1;      // non-contiguous allocations fill the layout from the top (knob "place_top")
 static NvU64  gLongestMB;         // longest free run (0: no limit): a bigger contiguous buffer comes back only into a cleared window
 // The layout (knob "layout"): which allocation holds each 2 MB chunk, 0 free.
@@ -992,8 +993,9 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
 {
     NvU64   wantMB;
     NvU64   freeChunks = 0, runStart = 0, runLen, lo = 0, hi = 0, c, doneKB = 0, keepLo = 0, keepHi = 0;
-    NvU32  *pCost, *pOwner, *pOwn, *pFrames, *pCount;
+    NvU32  *pCost, *pCostNoGame, *pOwner, *pOwn, *pFrames, *pCount;
     VEP_COMPACT_OWNERS owners;
+    int     bGameToo = 0;
     Alloc **byId;
     Proc  **procOf;
     NvU8   *inWin;
@@ -1010,6 +1012,7 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
         return 0;
 
     pCost  = calloc(gChunks, sizeof(*pCost));
+    pCostNoGame = calloc(gChunks, sizeof(*pCostNoGame));
     pOwner = calloc(gChunks, sizeof(*pOwner));
     pOwn   = calloc(gChunks, sizeof(*pOwn));
     pFrames = calloc(gNextId + 1, sizeof(*pFrames));
@@ -1041,12 +1044,18 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
             pOwn[c]     = SIM_CHUNK_FRAMES;
             pFrames[id] = (NvU32)(((byId[id]->kb + 2047) >> 11) * SIM_CHUNK_FRAMES);
         }
+        // A game's memory only when no window without it lengthens the run (as the driver).
+        pCostNoGame[c] = (gCompactGameLast && (procOf[id]->hint & VE_HINT_GAME_SIDE)) ? VEP_COMPACT_FIXED : pCost[c];
     }
     owners.pOwner  = pOwner;
     owners.pOwn    = pOwn;
     owners.pFrames = pFrames;
     owners.pCount  = pCount;
-    if (!vepCompactWindow(pCost, gCompactOwners ? &owners : NULL, gChunks, SIM_CHUNK_FRAMES, runStart, runLen,
+    if (!vepCompactWindow(pCostNoGame, gCompactOwners ? &owners : NULL, gChunks, SIM_CHUNK_FRAMES, runStart, runLen,
+                          (stepMB << 20) >> 16, &lo, &hi))
+        bGameToo = 1;
+    if (bGameToo &&
+        !vepCompactWindow(pCost, gCompactOwners ? &owners : NULL, gChunks, SIM_CHUNK_FRAMES, runStart, runLen,
                           (stepMB << 20) >> 16, &lo, &hi))
     {
         gCompactIdle++;
@@ -1074,7 +1083,7 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
         NvU32  n = 0;
         double ms;
 
-        if (!SIM_VICTIM(p))
+        if (!SIM_VICTIM(p) || (gCompactGameLast && !bGameToo && (p->hint & VE_HINT_GAME_SIDE)))
             continue;
         for (k = 0; k < p->na; k++)
         {
@@ -1138,6 +1147,7 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
     }
 done:
     free(pCost);
+    free(pCostNoGame);
     free(pOwner);
     free(pOwn);
     free(pFrames);
@@ -1618,6 +1628,7 @@ static int setKnob(const char *k, const char *v)
     else if (strcmp(k, "longest") == 0)      gLongestMB = (NvU64)d;
     else if (strcmp(k, "fg_own") == 0)       _vidmemFgOwnEnabled = (NvU32)d;
     else if (strcmp(k, "game_gives") == 0)   _vidmemFgTakesGame = (NvU32)d;
+    else if (strcmp(k, "compact_game_last") == 0) gCompactGameLast = (int)d;
     else if (strcmp(k, "autotick") == 0)     gAutoTick = (int)d;
     else if (strcmp(k, "hints") == 0)        gHintsActive = (int)d;
     else if (strcmp(k, "layout") == 0)       gLayout = (int)d;

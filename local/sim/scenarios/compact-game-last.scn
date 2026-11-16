@@ -1,0 +1,47 @@
+# Background compaction takes a game's memory last (rented RTX 3060,
+# 2026-11-16, sides-test): with the sides the game's blocks lie at the top of
+# vidmem and the desktop's memory at the bottom, the free run between them. A
+# step took the window that the 256 MB it may move make longest, whoever's
+# memory that was: where the game had freed some of its blocks, moving the
+# rest of them gained more per MB than the desktop's dense memory, and the
+# game on the other monitor was paused for it. Now a window without the
+# game's memory comes first (`-set compact_game_last=0`: as before, the
+# game's blocks move and the check on it fails).
+cap 5500
+set layout 1
+set copy_gbs 10
+set fg_headroom 0            # the layout is the subject, not who is moved out
+proc 1614 kwin_wayland old
+proc 2617 chrome old
+proc 3686 spotify old
+proc 5000 claude-desktop old
+proc 4000 game-helper old       # a second process of the game
+proc 12557 game old
+
+act 1614 0 4
+alloc 1614 250 n=5 fixed
+hint 12557 f full
+hint 4000 v full
+act 12557 0 200
+act 2617 2 4
+act 5000 30 0
+alloc 12557 64               # the game is up: the next policy step sees it
+at 4
+mark the desktop's memory dense at the bottom, the game's blocks with holes of its own at the top
+mix n=30 2617 30 3686 2 5000 30 3686 2   # each under 1 GB: more would count as a game
+mix n=24 12557 64 4000 64
+free 3686 99999              # holes of 2 MB in the desktop's memory
+free 4000 99999              # the game's helper exits: every other block of the game's side is free
+expect longest - <= 400
+
+mark the user looks at the browser; compaction wants three quarters of the free memory
+hint 12557 v full
+hint 4000 -
+hint 2617 f
+act 2617 0 20
+step
+at 120
+expect compact_steps - >= 2
+expect compact_moved 12557 == 0     # the game's blocks stayed where they were
+expect compact_moved 2617 > 0       # the desktop's memory moved instead
+expect longest - >= 1300
