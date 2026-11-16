@@ -42,7 +42,8 @@ step
 target 9000 900 0.9 spread=3      # below 1 GB: not what the policy takes for a game
 at 24
 expect sys 9000 == 0
-expect evicted 7000 > 0          # the headroom came from the window just covered
+expect evicted 7000 == 0         # an app's headroom waits for 3 s of focus (since 2026-11-16);
+                                 # Claude's growth right after the switch got what it needed as it went
 
 mark Chrome draws on for twelve seconds (a page finishing its work) while Claude grows a little more, then stops
 at 32

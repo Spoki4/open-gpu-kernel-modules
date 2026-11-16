@@ -425,13 +425,29 @@ _vidmemEvictIsPrevFg(VIDMEM_EVICT_PROC *p, VIDMEM_EVICT_ACTIVITY *pAct)
 // guarded a "game's" headroom. GameMode is not seen (it marks no process the
 // driver can tell); a windowed game started otherwise is an app.
 //
+//
+// A fullscreen window counts when its process has been running this long: a
+// screenshot's region picker is a new process each time, covers the screen
+// for a few seconds and draws (host, 2026-11-15 19:03: 2.5 s), and as "a game
+// in focus" it got a game's headroom, refilled from the windows it covered. A
+// game the user comes back to (alt-tab) is a game at once.
+//
+#define VIDMEM_EVICT_FULLSCREEN_GAME_SEC 5
+
 static NvBool
 _vidmemEvictIsGame(VIDMEM_EVICT_PROC *p)
 {
+    VIDMEM_EVICT_ACTIVITY *pAct;
+
     if (p->hint & VE_HINT_LAUNCHED_GAME)
         return NV_TRUE;
-    return (p->hint & VE_HINT_FULLSCREEN) &&
-           ((_vidmemActivityIdleSec(p->pid) < VIDMEM_EVICT_DRAWING_SEC) || (p->pid == _vidmemBusiestPid));
+    if (!(p->hint & VE_HINT_FULLSCREEN))
+        return NV_FALSE;
+    pAct = _vidmemActivityFind(p->pid, NV_FALSE);
+    if ((pAct == NULL) || (pAct->firstSeenNs == 0) ||
+        (VE_AGO_NS(osGetMonotonicTimeNs(), pAct->firstSeenNs) < VIDMEM_EVICT_FULLSCREEN_GAME_SEC * 1000000000ULL))
+        return NV_FALSE;
+    return (_vidmemActivityIdleSec(p->pid) < VIDMEM_EVICT_DRAWING_SEC) || (p->pid == _vidmemBusiestPid);
 }
 
 // The process with the most recent engine samples: the one to keep.
@@ -523,6 +539,16 @@ _vidmemEvictBusiestPid(VIDMEM_EVICT_PROC *pProcs, NvU32 count)
 // nothing in sysmem and waits for the headroom as before (problem #6).
 //
 #define VIDMEM_EVICT_HEAVY_SAMPLES 8
+//
+// While a game is in focus (R4) the driver's work for others, done under the
+// RM locks the game's own calls wait for, goes in pieces of about this much
+// copying (under a frame even at 144 Hz, at the copy speed seen so far,
+// 8-64 MB) or waits until the game is not in focus (the player's view of
+// the 15 November session: waits behind the driver's own work were half of
+// the long frames of the driver's).
+//
+#define VIDMEM_EVICT_GAME_PIECE_MS 4
+static NvU64 _vidmemGamePieceMB(void);
 // Margin on top of what a restore of a non-foreground process needs.
 
 //
@@ -939,6 +965,12 @@ vepReclaimableFor(NvU32 pid)
 static NvU64 _vidmemRestoreMBps = 4000;    // estimate, updated by every restore of the foreground
 
 static NvU64
+_vidmemGamePieceMB(void)
+{
+    return NV_MIN(NV_MAX(_vidmemRestoreMBps * VIDMEM_EVICT_GAME_PIECE_MS / 1000, 8ULL), 64ULL);
+}
+
+static NvU64
 _vidmemEvictFgRestoreCapMB(VIDMEM_EVICT_ACTIVITY *pAct, NvU64 nowNs)
 {
     NvU64 ms = ((pAct->fgSinceNs != 0) &&
@@ -1227,6 +1259,9 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
         pAct = _vidmemActivityFind(pProcs[i].pid, NV_TRUE);
         if (_vidmemEvictInFgHold(pAct, nowNs))
             continue;
+        // Shown but not drawing in earnest (1b takes those): it waits until the game is not in focus.
+        if (_vidmemFgIsGame && (needMB > _vidmemGamePieceMB()))
+            continue;
         avail = vepPlatAvailMB(pGpu);
         if (avail < needMB + keepMB)
         {
@@ -1277,6 +1312,14 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
             (pAct->drawingSinceNs == 0) ||
             (VE_AGO_NS(nowNs, pAct->drawingSinceNs) < steadyNs) ||
             _vidmemEvictInFgHold(pAct, nowNs))
+            continue;
+        //
+        // While a game is in focus a light one (a frame now and then from
+        // sysmem costs the game little) waits if it is big; a heavy one comes
+        // back at once: drawing from sysmem in earnest it costs the game more
+        // than the copy (host, 2026-11-15 19:03: 2-7 fps for 45 s).
+        //
+        if (_vidmemFgIsGame && !bHeavy && (needMB > _vidmemGamePieceMB()))
             continue;
         if (bVisible)
         {
@@ -1373,7 +1416,8 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
             }
             if (pAct->roomSinceNs == 0)
                 pAct->roomSinceNs = nowNs;
-            if (bMoved || !bQuiet ||
+            // In no hurry: not while a game is in focus (every move holds the locks it waits for).
+            if (bMoved || !bQuiet || _vidmemFgIsGame ||
                 (VE_AGO_NS(nowNs, pAct->roomSinceNs) < VIDMEM_EVICT_HIDDEN_BACK_SEC * 1000000000ULL))
                 continue;
             NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: hints: plenty free (%llu MB), restoring %s (pid %u, %llu MB)\n",
@@ -1909,6 +1953,21 @@ NvU32 _vidmemFgHeadroomMB = 2048;
 // Nothing to move a moment ago: do not walk every client per allocation.
 static NvU64 _vidmemMakeRoomFruitlessNs;
 
+//
+// How long after a fruitless make-room the next is not tried: a second, and
+// for a window that is not in focus while a game is five (host, 2026-11-15
+// 22:07: a make-room for Chrome on the other monitor held the locks 23 ms and
+// found nothing, the game waiting behind it).
+//
+static NvBool
+_veMakeRoomRested(NvU32 pid, NvU64 nowNs)
+{
+    NvU64 restNs = (_vidmemFgIsGame && (VE_HINT_STATE(_vidmemHint(pid, NULL)) != VE_HINT_FG)) ?
+                   5000000000ULL : 1000000000ULL;
+
+    return (_vidmemMakeRoomFruitlessNs == 0) || (VE_AGO_NS(nowNs, _vidmemMakeRoomFruitlessNs) >= restNs);
+}
+
 static NvBool _veMakeRoomAllowed(NvU32 pid, NvBool bContig);
 
 NvBool
@@ -1935,7 +1994,7 @@ _veMakeRoomAllowed(NvU32 pid, NvBool bContig)
         return NV_FALSE;
     if (VE_HINT_STATE(_vidmemHint(pid, NULL)) < VE_HINT_VISIBLE)
         return NV_FALSE;
-    if ((_vidmemMakeRoomFruitlessNs != 0) && (VE_AGO_NS(nowNs, _vidmemMakeRoomFruitlessNs) < 1000000000ULL))
+    if (!_veMakeRoomRested(pid, nowNs))
         return NV_FALSE;
     if (bContig)
         return NV_TRUE;
@@ -2042,6 +2101,7 @@ vepMakeRoomRun(OBJGPU *pGpu, NvU32 pid, NvU64 size, NvU64 headroomMB, const char
 //
 #define VIDMEM_EVICT_HEADROOM_STEP_MB 256
 static NvU32 _vidmemHeadroomPid;
+static NvBool _vidmemFocusDwelt(NvU32 pid);
 
 // NV_TRUE: a refill run should be queued (none pending).
 NvBool
@@ -2063,7 +2123,7 @@ vepHeadroomRun(OBJGPU *pGpu)
     NvBool bMore;
 
     if ((pid == 0) || !_vidmemAutoActive() || !_vidmemHintsActive() || (_vidmemFgHeadroomMB == 0) ||
-        (VE_HINT_STATE(_vidmemHint(pid, NULL)) != VE_HINT_FG))
+        (VE_HINT_STATE(_vidmemHint(pid, NULL)) != VE_HINT_FG) || !_vidmemFocusDwelt(pid))
     {
         _vidmemHeadroomPid = 0;
         return NV_FALSE;
@@ -2080,9 +2140,17 @@ vepHeadroomRun(OBJGPU *pGpu)
         return NV_FALSE;
     count = _vidmemEvictGatherProcs(pGpu, pProcs, VIDMEM_EVICT_MAX_PROCS);
     _vidmemEvictWhy = VMT_WHY_ALLOC;
+    //
+    // A game in focus waits for each piece: smaller ones then, and without the
+    // victim's margin on top that would double them (VIDMEM_EVICT_GAME_PIECE_MS).
+    //
+    if (_vidmemFgIsGame)
+        _vidmemEvictVictimMarginMB = 0;
     avail = _vidmemEvictHintFree(pGpu, pProcs, count,
-                                 NV_MIN(target, before + VIDMEM_EVICT_HEADROOM_STEP_MB), pid,
+                                 NV_MIN(target, before + (_vidmemFgIsGame ? _vidmemGamePieceMB() :
+                                                                            VIDMEM_EVICT_HEADROOM_STEP_MB)), pid,
                                  VE_LEVEL_FG_IDLE, "foreground headroom");
+    _vidmemEvictVictimMarginMB = 64;
     _vidmemEvictUpdateReclaimable(pProcs, count, osGetMonotonicTimeNs());
     _vidmemLastPressureNs = osGetMonotonicTimeNs();
     portMemFree(pProcs);
@@ -2092,12 +2160,35 @@ vepHeadroomRun(OBJGPU *pGpu)
     return bMore;
 }
 
+//
+// The headroom is for a window the user works in: an app focused a moment
+// ago gets it only after VIDMEM_EVICT_HEADROOM_DWELL_SEC (a region picker in
+// focus for 2.5 s took 572 MB of Chrome for it, host 2026-11-15 19:03); a
+// game at once. Room for what an allocation needs is made at once as before.
+//
+#define VIDMEM_EVICT_HEADROOM_DWELL_SEC 3
+
+static NvBool
+_vidmemFocusDwelt(NvU32 pid)
+{
+    VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(pid, NV_FALSE);
+
+    //
+    // A game gets it at once: back from alt-tab it streams, and without the
+    // headroom its own allocations would make room inside its frames.
+    //
+    if (_vidmemFgIsGame)
+        return NV_TRUE;
+    return (pAct != NULL) && (pAct->fgSinceNs != 0) &&
+           (VE_AGO_NS(osGetMonotonicTimeNs(), pAct->fgSinceNs) >= VIDMEM_EVICT_HEADROOM_DWELL_SEC * 1000000000ULL);
+}
+
 // Should an allocation of `pid` of `size` make room to keep the foreground headroom?
 NvBool
 vepKeepFgHeadroomWanted(OBJGPU *pGpu, NvU32 pid, NvU64 size)
 {
     if ((_vidmemFgHeadroomMB == 0) || !_vidmemAutoActive() || !_vidmemHintsActive() || (pid == 0) ||
-        (VE_HINT_STATE(_vidmemHint(pid, NULL)) != VE_HINT_FG))
+        (VE_HINT_STATE(_vidmemHint(pid, NULL)) != VE_HINT_FG) || !_vidmemFocusDwelt(pid))
         return NV_FALSE;
     // The headroom only takes idle ones; none left at the last walk: no walk (#8).
     if (!_vidmemEvictAnyMovable(VE_LEVEL_FG_IDLE))
@@ -2217,7 +2308,7 @@ vepMakeRoomDeniedWhy(NvU32 pid)
         return "the policy is off (no window hints)";
     if (VE_HINT_STATE(_vidmemHint(pid, NULL)) < VE_HINT_VISIBLE)
         return "its window is not visible";
-    if ((_vidmemMakeRoomFruitlessNs != 0) && (VE_AGO_NS(nowNs, _vidmemMakeRoomFruitlessNs) < 1000000000ULL))
+    if (!_veMakeRoomRested(pid, nowNs))
         return "nothing could be moved a moment ago";
     NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: movable as of the last walk (MB): hidden %llu, for an idle foreground %llu, for a foreground's allocation %llu, the foreground's own %llu\n",
               _vidmemMovableHiddenBytes >> 20, _vidmemMovableFgIdleBytes >> 20, _vidmemMovableFgAllocBytes >> 20,
@@ -2248,7 +2339,7 @@ vepMakeRoomContextsLevel(NvU32 pid)
 
     if (!_vidmemAutoActive() || !_vidmemHintsActive())
         return NV_U32_MAX;
-    if ((_vidmemMakeRoomFruitlessNs != 0) && (VE_AGO_NS(nowNs, _vidmemMakeRoomFruitlessNs) < 1000000000ULL))
+    if (!_veMakeRoomRested(pid, nowNs))
         return NV_U32_MAX;
     level = ((pid != 0) && (VE_HINT_STATE(_vidmemHint(pid, NULL)) == VE_HINT_FG)) ?
             VE_LEVEL_FG_ALLOC : VE_LEVEL_HIDDEN;

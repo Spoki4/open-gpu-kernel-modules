@@ -8,6 +8,9 @@
 # 2787 MB were free and "its memory + the focus's headroom + hysteresis" is
 # 2876. A window that is shown and takes a good share of the GPU from sysmem
 # costs the focus far more than a headroom short of its mark.
+# Since 2026-11-16 the picker gets no headroom at all: a new process with a
+# fullscreen window is not a game for its first seconds, and an app's headroom
+# waits until it has been in focus for 3 s; Chrome gives nothing.
 cap 11000
 proc 1614 kwin_wayland old
 proc 1625 plasmashell old
@@ -46,7 +49,7 @@ hint 1625 h
 step
 target 4009 320 0.9
 at 22
-expect evicted 7000 > 0          # as recorded: it gave for the picker's headroom
+expect evicted 7000 == 0         # it gave 572 MB for the picker's headroom that evening
 
 mark the picker closes: the game is in focus again, Chrome and the terminal are shown; Chrome draws from sysmem
 free 4009 320
@@ -61,12 +64,13 @@ step
 at 24
 act 7000 0 14
 at 28
-expect sys 7000 == 0             # back within a few seconds, not 45
-expect restores 7000 == 1
+expect sys 7000 == 0             # nothing out, nothing to bring back (it was back within seconds since 2026-11-15)
+expect restores 7000 == 0
 
 mark the game streams on with less than its headroom free; Chrome keeps playing
 target 5000 7000 0.75 spread=20
 at 90
 expect sys 7000 == 0
-expect evicts 7000 == 2          # the two pieces for the picker, and not out again
+expect evicts 7000 == 0          # not for the picker, and not for the game's streaming
+expect player_hitches 5000 == 0  # the player's view: nothing of the driver's in the game's way
 expect sys 5000 == 0
