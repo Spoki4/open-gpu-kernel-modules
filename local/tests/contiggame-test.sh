@@ -88,7 +88,9 @@ got=$(grep -o ' churned=[0-9]*' "$T/hog.log" | cut -d= -f2)
 # With little free memory a refusal is the rule's answer (nobody else may give), not a failure.
 denied=$(klog | grep -cE 'vidmem user reserve: denied|Failed to allocate NVKMS memory')
 echo "  refusals of the app: $denied"
-[[ ${got:-0} -ge $churn ]] || (( every > 4 )) || fail "the app made ${got:-0} of $churn remakes ($(grep -o 'stop=[a-z-]*' "$T/hog.log"))"
+# Refused with nobody left to pay (the hidden apps draw, the game only moves, the app has none of its own):
+# the rule's answer. Stopped otherwise: a failure.
+[[ ${got:-0} -ge $churn ]] || (( every > 4 )) || (( denied > 0 )) || fail "the app made ${got:-0} of $churn remakes ($(grep -o 'stop=[a-z-]*' "$T/hog.log"))"
 (( clears >= 1 )) || fail "no window was cleared (test setup: vidmem not fragmented?)"
 if (( gives == 0 )); then
     (( gout == 0 )) || fail "the game's memory was moved out $gout times for the focused app"

@@ -5,7 +5,9 @@
 # again. A process nobody may move (named like the login screen) fills vidmem
 # down to 1.5 GB; app B (1.6 GB) draws as a visible window; then app A (not a
 # game: 800 MB, no fullscreen window) starts focused and B's hint turns hidden
-# in the same write. Checks: B gave memory for A's headroom; for 24 s none of
+# in the same write. Since 2026-11-16 B usually gives nothing (an app's
+# headroom waits 3 s of focus, by then B draws while hidden), and the checks
+# are what is left of them. Otherwise: B gave memory for A's headroom; for 24 s none of
 # it comes back although B keeps drawing, and the driver's own count of moves
 # undone within a minute (`evict.sh status`, "bounces:") does not grow;
 # focused again, B is back within seconds; contents intact. Window hints
@@ -56,11 +58,23 @@ for try in 1 2 3; do
     out=$(col "$b" 4)
     echo "  try $try: A $(grep -o 'allocated_mb=[0-9]*' "$T/a.log"), in sysmem $(col "$a" 4) MB; B in sysmem ${out:-?} MB; free $(free_mb) MB"
     if [[ ${out:-0} -ge 200 ]]; then got=1; break; fi
+    (( try == 3 )) && break       # the last A stays for the checks
     kill -INT $a 2>/dev/null; wait $a 2>/dev/null; a=
     printf '%s v\n' "$b" >"$H"
 done
 if (( !got )); then
-    fail "B gave nothing for A's headroom in three tries: the case did not arise (free memory, timing?)"
+    #
+    # Since 2026-11-16 an app's headroom waits until it has been in focus for
+    # 3 s, and by then B counts as drawing while hidden and is left alone: B
+    # gives nothing, so nothing can come back to go out again. What is left to
+    # check: A got its memory, nothing was undone, contents intact.
+    #
+    read -r n1 mb1 <<<"$(bounces)"
+    echo "  B gave nothing for A's headroom (an app's headroom waits 3 s of focus); bounces $n0 -> $n1"
+    [[ $(grep -o 'allocated_mb=[0-9]*' "$T/a.log" | cut -d= -f2) -ge $AMB ]] || fail "the focused app did not get its $AMB MB"
+    (( n1 == n0 )) || fail "$((n1 - n0)) moves were undone within a minute ($((mb1 - mb0)) MB copied for nothing)"
+    # Run on with the last try: keep A for the check of contents below.
+    [[ -n $a ]] || a=
 else
     [[ $(grep -o 'allocated_mb=[0-9]*' "$T/a.log" | cut -d= -f2) -ge $AMB ]] || fail "the focused app did not get its $AMB MB"
     [[ $(col "$a" 4) -eq 0 ]] || fail "the focused app has memory in sysmem"
