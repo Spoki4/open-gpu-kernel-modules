@@ -417,6 +417,8 @@ vidmemMapForget(PMA *pPma)
 // process that made it, inside the move engine for the process whose memory
 // moves; a free for whoever held the first frame.
 //
+static void _veWalkDirty(NvU32 pid);
+
 void
 vidmemMapNote(PMA *pPma, NvBool bAlloc, const NvU64 *pPages, NvU64 count, NvU64 pageBytes)
 {
@@ -488,6 +490,9 @@ vidmemMapNote(PMA *pPma, NvBool bAlloc, const NvU64 *pPages, NvU64 count, NvU64 
     }
     if (bTrace && (n != 0))
         osVidmemTraceExt(op, mode, why, NV_MAX(pid, 1), runs, n);
+    // Its memory changed: the next walk counts it again (vepPlatGatherProcs()).
+    if (bPid)
+        _veWalkDirty(pid);
 }
 
 //
@@ -721,6 +726,7 @@ typedef struct
 static VE_HOLDER *_veHolders;
 static NvU32      _veNumHolders;
 static NvU32      _veHolderUsers;
+static NvBool     _veHoldersBuilt;      // built (or tried) for the current users
 
 static NvBool
 _veHolderLess(const VE_HOLDER *a, const VE_HOLDER *b)
@@ -766,15 +772,24 @@ _veHolderSort(VE_HOLDER *v, NvU32 n)
     }
 }
 
-// Start using the index (built if nobody uses it yet). Pair with _veHolderIndexEnd().
+//
+// Start using the index. Pair with _veHolderIndexEnd(). It is built at the
+// first lookup (_veHoldersReady()): a policy step whose walk finds nothing
+// changed checks no allocation, and building it is a walk of every object.
+//
 static void
 _veHolderIndexBegin(void)
+{
+    if (_veHolderUsers++ == 0)
+        _veHoldersBuilt = NV_FALSE;
+}
+
+static void
+_veHolderIndexBuild(void)
 {
     RmClient **ppClient;
     NvU32      n = 0;
 
-    if (_veHolderUsers++ != 0)
-        return;
     _veHolders = portMemAllocNonPaged(sizeof(*_veHolders) * VE_HOLDER_MAX);
     if (_veHolders == NULL)
         return;
@@ -810,6 +825,18 @@ _veHolderIndexBegin(void)
     _veNumHolders = n;
 }
 
+// The index is there to look in (built now if somebody uses it and it is not yet).
+static NvBool
+_veHoldersReady(void)
+{
+    if ((_veHolderUsers != 0) && !_veHoldersBuilt)
+    {
+        _veHoldersBuilt = NV_TRUE;
+        _veHolderIndexBuild();
+    }
+    return _veHolders != NULL;
+}
+
 static void
 _veHolderIndexEnd(void)
 {
@@ -819,6 +846,7 @@ _veHolderIndexEnd(void)
         portMemFree(_veHolders);
     _veHolders = NULL;
     _veNumHolders = 0;
+    _veHoldersBuilt = NV_FALSE;
 }
 
 // The holders of pMemDesc in walk order: *pFirst, return value = how many (0: not indexed).
@@ -943,7 +971,7 @@ _vidmemEvictCollectHolders
                                          bCheck, pRefs, pNumRefs);
     }
 
-    if (_veHolders != NULL)
+    if (_veHoldersReady())
     {
         NvU32 first, n = _veHolderRange(pMemDesc, &first), k;
 
@@ -3543,7 +3571,7 @@ _vidmemEvictIsFirstPidHolder(MEMORY_DESCRIPTOR *pMemDesc, NvU32 pid, RsResourceR
 {
     RmClient **ppClient;
 
-    if (_veHolders != NULL)
+    if (_veHoldersReady())
     {
         NvU32 first, n = _veHolderRange(pMemDesc, &first), k;
 
@@ -3597,19 +3625,67 @@ static NvU64 _vidmemStepCompactNs, _vidmemStepCompactMoveNs;   // a compaction s
 #define VE_MOVE_TIME_BEGIN() NvU64 vmtMove0 = VMT_NOW(); _vidmemStepMoveDepth++
 #define VE_MOVE_TIME_END()   do { if (--_vidmemStepMoveDepth == 0) _vidmemStepMoveNs += VMT_NOW() - vmtMove0; } while (0)
 
+//
+// The walk's totals per process, kept from one walk to the next: a process
+// whose memory did not change is not walked again for up to
+// VE_WALK_MAX_AGE_NS. Every policy step walked every allocation of every
+// client and checked each one for moving (on a rented RTX 3060 with 14
+// processes, 3.3-4.7 ms of a step of 7.7 under the locks; on the host about
+// 3 ms every 2 s). Changed: pages of vidmem allocated or freed for it (which
+// includes every move of its memory, vidmemMapNote()) or another number of
+// clients. Not seen: a new mapping or a dup without new pages; that is what
+// the age is for, and a stale "eligible" only makes the move engine, which
+// checks every allocation again, skip what cannot move.
+//
+#define VE_WALK_MAX_AGE_NS (10ULL * 1000000000ULL)
+typedef struct
+{
+    NvU32             pid;
+    NvU32             clients;
+    NvBool            bDirty;
+    NvU64             walkedNs;
+    VIDMEM_EVICT_PROC proc;
+} VE_WALK_CACHE;
+static VE_WALK_CACHE _veWalkCache[VIDMEM_EVICT_MAX_PROCS];
+static NvU32         _veWalkCacheCount;
+static NvU32         _veWalkWalked, _veWalkKept;    // processes walked / taken from the cache (status)
+
+// Pages of vidmem changed hands for `pid`: walk it again at the next walk.
+static void
+_veWalkDirty(NvU32 pid)
+{
+    NvU32 i;
+
+    for (i = 0; i < _veWalkCacheCount; i++)
+    {
+        if (_veWalkCache[i].pid == pid)
+            _veWalkCache[i].bDirty = NV_TRUE;
+    }
+}
+
 NvU32
 vepPlatGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
 {
     VIDMEM_EVICT_MAPREF *pRefs;
     RmClient           **ppClient;
-    NvU32                count = 0;
-    NvU64                t0 = VMT_NOW();
+    NvU32                count = 0, i, k;
+    NvU64                t0 = VMT_NOW(), nowNs = osGetMonotonicTimeNs();
+    NvBool              *pWalk;
+    NvS32               *pSlot;
 
     pRefs = portMemAllocNonPaged(sizeof(*pRefs) * VIDMEM_EVICT_MAX_MAPPINGS);
-    if (pRefs == NULL)
+    pWalk = portMemAllocNonPaged(sizeof(*pWalk) * maxProcs);
+    pSlot = portMemAllocNonPaged(sizeof(*pSlot) * maxProcs);
+    if ((pRefs == NULL) || (pWalk == NULL) || (pSlot == NULL))
+    {
+        portMemFree(pRefs);
+        portMemFree(pWalk);
+        portMemFree(pSlot);
         return 0;
+    }
     _veHolderIndexBegin();
 
+    // The processes and their clients (cheap: no objects).
     for (ppClient = serverutilGetFirstClientUnderLock();
          ppClient != NULL;
          ppClient = serverutilGetNextClientUnderLock(ppClient))
@@ -3617,12 +3693,9 @@ vepPlatGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
         RmClient          *pRmClient = *ppClient;
         RsClient          *pRsClient = staticCast(pRmClient, RsClient);
         VIDMEM_EVICT_PROC *pProc = NULL;
-        RS_ITERATOR        iter;
-        NvU32              i;
 
         if ((pRsClient->type == CLIENT_TYPE_KERNEL) || (pRmClient->ProcID == 0))
             continue;
-
         for (i = 0; i < count; i++)
         {
             if (pProcs[i].pid == pRmClient->ProcID)
@@ -3643,6 +3716,65 @@ vepPlatGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
         pProc->clients++;
         if (_vidmemEvictIsNeverName(pRmClient->name))
             pProc->bNever = NV_TRUE;
+    }
+
+    // Which of them to walk: changed, a new number of clients, or the totals too old.
+    for (i = 0; i < count; i++)
+    {
+        pSlot[i] = -1;
+        for (k = 0; k < _veWalkCacheCount; k++)
+        {
+            if (_veWalkCache[k].pid == pProcs[i].pid)
+            {
+                pSlot[i] = (NvS32)k;
+                break;
+            }
+        }
+        pWalk[i] = (pSlot[i] < 0) || _veWalkCache[pSlot[i]].bDirty ||
+                   (_veWalkCache[pSlot[i]].clients != pProcs[i].clients) ||
+                   (VE_AGO_NS(nowNs, _veWalkCache[pSlot[i]].walkedNs) >= VE_WALK_MAX_AGE_NS) ||
+                   (portStringCompare(_veWalkCache[pSlot[i]].proc.name, pProcs[i].name,
+                                      NV_PROC_NAME_MAX_LENGTH) != 0);
+        if (!pWalk[i])
+        {
+            VIDMEM_EVICT_PROC *pC = &_veWalkCache[pSlot[i]].proc;
+
+            pProcs[i].vidmemBytes        = pC->vidmemBytes;
+            pProcs[i].evictedBytes       = pC->evictedBytes;
+            pProcs[i].eligibleBytes      = pC->eligibleBytes;
+            pProcs[i].evictedContigBytes = pC->evictedContigBytes;
+            pProcs[i].evictedContigMax   = pC->evictedContigMax;
+            pProcs[i].evictedContigAlign = pC->evictedContigAlign;
+            _veWalkKept++;
+        }
+        else
+        {
+            _veWalkWalked++;
+        }
+    }
+
+    // The allocations of the processes to walk.
+    for (ppClient = serverutilGetFirstClientUnderLock();
+         ppClient != NULL;
+         ppClient = serverutilGetNextClientUnderLock(ppClient))
+    {
+        RmClient          *pRmClient = *ppClient;
+        RsClient          *pRsClient = staticCast(pRmClient, RsClient);
+        VIDMEM_EVICT_PROC *pProc = NULL;
+        RS_ITERATOR        iter;
+
+        if ((pRsClient->type == CLIENT_TYPE_KERNEL) || (pRmClient->ProcID == 0))
+            continue;
+        for (i = 0; i < count; i++)
+        {
+            if (pProcs[i].pid == pRmClient->ProcID)
+            {
+                pProc = &pProcs[i];
+                break;
+            }
+        }
+        if ((pProc == NULL) || !pWalk[i])
+            continue;
 
         iter = serverutilRefIter(pRsClient->hClient, NV01_NULL_OBJECT, 0,
                                  RS_ITERATE_DESCENDANTS, NV_TRUE);
@@ -3696,8 +3828,37 @@ vepPlatGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
         }
     }
 
+    // The cache follows the processes there are now.
+    {
+        VE_WALK_CACHE *pNew = portMemAllocNonPaged(sizeof(*pNew) * VIDMEM_EVICT_MAX_PROCS);
+
+        if (pNew != NULL)
+        {
+            NvU32 n = 0;
+
+            for (i = 0; (i < count) && (n < VIDMEM_EVICT_MAX_PROCS); i++)
+            {
+                pNew[n].pid      = pProcs[i].pid;
+                pNew[n].clients  = pProcs[i].clients;
+                pNew[n].bDirty   = NV_FALSE;
+                pNew[n].walkedNs = pWalk[i] ? nowNs : _veWalkCache[pSlot[i]].walkedNs;
+                pNew[n].proc     = pProcs[i];
+                n++;
+            }
+            portMemCopy(_veWalkCache, sizeof(*pNew) * n, pNew, sizeof(*pNew) * n);
+            _veWalkCacheCount = n;
+            portMemFree(pNew);
+        }
+        else
+        {
+            _veWalkCacheCount = 0;
+        }
+    }
+
     _veHolderIndexEnd();
     portMemFree(pRefs);
+    portMemFree(pWalk);
+    portMemFree(pSlot);
     _vidmemStepWalkNs += VMT_NOW() - t0;
     return count;
 }
@@ -5732,6 +5893,7 @@ _vidmemEvictStatus(OBJGPU *pGpu, char *buf, NvU32 bufSize, NvU32 *pLen)
                  !vepGameSideNow() ? "no game holds vidmem now, everybody's new memory is placed from the top" :
                  _vidmemPlaceSides ? "a game holds vidmem, the others' new memory is placed from the bottom" :
                                      "a game holds vidmem");
+    EVICT_PRINTF("walks: %u processes walked, %u taken unchanged from the last walk\n", _veWalkWalked, _veWalkKept);
     EVICT_PRINTF("a visible game for a focused app: %s\n",
                  _vidmemFgTakesGame ? "may be moved to sysmem (gamegives on)" : "moved inside vidmem only");
     EVICT_PRINTF("%-8s %-16s %7s %7s %8s %7s %7s %-7s %s\n",
