@@ -1346,7 +1346,6 @@ _vidmemEvictPolicyHints(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, Nv
 // apart: the run at its 1056 MB, 640 MB free elsewhere, and eight more steps
 // moved 600 MB of the game into a second window that could never be longer.
 //
-#define VE_HINT_GAME_SIDE (VE_HINT_LAUNCHED_GAME | VE_HINT_FULLSCREEN)
 
 // A game held vidmem at one of the last two policy steps (a step may come late).
 NvBool

@@ -66,7 +66,10 @@ echo "holes:  $(frag)"
 # The user looks at an app: compaction may take pieces of 256 MB, the game's blocks too if they are in the way.
 printf '%s v g\n%s v g\n%s f\n' "$g1" "$g2" "${pids[0]}" >"$H"
 freenow=$(st | grep '^fragmentation' | grep -o 'free [0-9]*' | cut -d' ' -f2)
-sudo -n ../evict.sh compact $((freenow * 70 / 100)) >/dev/null
+# Longer than the run there is: the holes sometimes leave it at three quarters of the
+# free memory already, and compaction then had nothing to do (rented RTX 3060, 2026-11-16).
+want=$((freenow * 70 / 100)); (( want >= l0 + 512 )) || want=$((l0 + 512))
+sudo -n ../evict.sh compact "$want" >/dev/null
 t0=$SECONDS
 while (( SECONDS - t0 < dur )); do
     sleep 10

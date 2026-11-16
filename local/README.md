@@ -48,14 +48,16 @@ These patches do the same inside the driver.
   compacts vidmem a little at a time so the longest free run stays long. A
   step moves whole allocations: of the window in focus those up to 96 MB (a
   pause of about 9 ms), of the others up to 256 MB, and 256 MB in all (96 MB
-  while a game is in focus). The run it gathers: three quarters of the free
-  memory, 1 GB at least; while a game is in focus only three times the
-  biggest contiguous buffer asked for in the last half hour (256 MB at
-  least), every step being a pause of the game. And less is left to compact:
-  while a game runs (started by a launcher, or with a fullscreen window), the
-  others' new memory is placed from the bottom of vidmem and the game's from
-  the top, so the small buffers a browser allocates and frees do not end up
-  as holes between the game's blocks.
+  while a game is in focus). A game's memory moves only when no window
+  without it lengthens the run (its blocks are then the only walls). The
+  run it gathers: three quarters of the free memory, 1 GB at least; while a
+  game is in focus only three times the biggest contiguous buffer asked for
+  in the last half hour (256 MB at least), every step being a pause of the
+  game. And less is left to compact: while a game runs (started by a
+  launcher, or with a fullscreen window), the others' new memory is placed
+  from the bottom of vidmem and the game's from the top, so the small
+  buffers a browser allocates and frees do not end up as holes between the
+  game's blocks.
 - **Does not keep a fixed reserve** for the compositor any more (the first
   approach, `RmVidmemUserReserveMB`, still there and off by default).
 - Fixes found on the way in NVIDIA's own code: a channel group leaked on GSP
@@ -400,16 +402,19 @@ failure, single moves of 1-36 ms. Compaction stood still next to the game
 
 Not verified yet: `vm/fulltest.sh` on the 3080 Ti (its `desktop` and `game`
 stages have never run), moving buffers shared with the compositor under a
-real Plasma session, the access-counter probe on Ampere. The fix for problem
-#17 has run in the simulator only (`sim/scenarios/compact-game.scn`); on a
-GPU the stages `compactbig` and `compactbigfg` of `fulltest.sh` are for it. So
-have what followed on 2026-11-14: the run compaction wants next to a game,
-the window charged for whole allocations, and the sides
-(`sim/scenarios/place-sides.scn`; stage `sides`, a test written and never
-run). Sides change where the desktop's memory is placed while a game runs:
-the compositor's contiguous buffers then share the bottom of vidmem with it
-(`nvtest` comproom and scanout-churn are the checks; `evict.sh placesides
-off` is the way back).
+real Plasma session, the access-counter probe on Ampere. Sides change where
+the desktop's memory is placed while a game runs: the compositor's
+contiguous buffers then share the bottom of vidmem with it (`nvtest`
+comproom and scanout-churn are the checks, not run yet; `evict.sh
+placesides off` is the way back).
+
+On a rented RTX 3060 (vast.ai, 2026-11-16; Ubuntu 22.04, so no `nvtest`,
+which wants KWin 6) every `fulltest.sh` stage that needs no desktop
+passes: move, contig, contigloop, contiggame, the four compaction stages
+(the fix for problem #17), sides (10 of 10 once compaction took the game's
+memory last; it had failed 1-2 runs in 5 before), fgown, bounce. A focused
+app next to a visible game moved the game's blocks inside vidmem only (one
+move of 256 MB, 37 ms, the game's content verified).
 
 A screenshot next to the game (host, 2026-11-15 19:03): the picker covered
 both monitors for 2.5 s, Chrome gave 572 MB for its headroom and, shown

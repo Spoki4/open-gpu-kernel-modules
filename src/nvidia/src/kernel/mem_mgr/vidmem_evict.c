@@ -4638,11 +4638,12 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
     NvU64   base = 0, frames = 0, largest = 0, words, chunks, off, c, f;
     NvU64   runStart = 0, runLen = 0, cur = 0, freeChunks = 0;
     NvU64   budgetFrames = (budgetMB << 20) >> PMA_PAGE_SHIFT, lo, hi;
-    NvU64  *pUsed, *pMovable = NULL, movedMB = 0;
-    NvU32  *pCost = NULL, *pOwner = NULL, *pOwnerFrames = NULL;
+    NvU64  *pUsed, *pMovable = NULL, *pGame = NULL, movedMB = 0;
+    NvU32  *pCost = NULL, *pCostNoGame = NULL, *pOwner = NULL, *pOwnerFrames = NULL;
     VEP_COMPACT_OWNERS owners = {0};
     VIDMEM_EVICT_MAPREF *pRefs = NULL;
     NvU32   i, victims = 0, numOwners = 0;
+    NvBool  bGameToo = NV_FALSE;
     const char *why = "";
 
     *pWindowMB = 0;
@@ -4655,15 +4656,18 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
     off    = (NV_ALIGN_UP64(base, 2ULL << 20) - base) >> PMA_PAGE_SHIFT;
     chunks = (frames > off) ? (frames - off) / VIDMEM_EVICT_CHUNK_FRAMES : 0;
     pMovable = portMemAllocNonPaged(words * sizeof(NvU64));
+    pGame    = portMemAllocNonPaged(words * sizeof(NvU64));
     pCost    = portMemAllocNonPaged(NV_MAX(chunks, 1) * sizeof(NvU32));
+    pCostNoGame = portMemAllocNonPaged(NV_MAX(chunks, 1) * sizeof(NvU32));
     pRefs    = portMemAllocNonPaged(sizeof(*pRefs) * VIDMEM_EVICT_MAX_MAPPINGS);
     // Who holds each chunk, the frames it has there, a scratch count; per allocation its frames and a scratch count.
     pOwner       = portMemAllocNonPaged(NV_MAX(chunks, 1) * 3 * sizeof(NvU32));
     pOwnerFrames = portMemAllocNonPaged((VEP_COMPACT_MAX_OWNERS + 1) * 2 * sizeof(NvU32));
-    if ((pMovable == NULL) || (pCost == NULL) || (pRefs == NULL) || (pOwner == NULL) || (pOwnerFrames == NULL) ||
-        (chunks == 0))
+    if ((pMovable == NULL) || (pGame == NULL) || (pCost == NULL) || (pCostNoGame == NULL) || (pRefs == NULL) ||
+        (pOwner == NULL) || (pOwnerFrames == NULL) || (chunks == 0))
         goto done;
     portMemSet(pMovable, 0, words * sizeof(NvU64));
+    portMemSet(pGame, 0, words * sizeof(NvU64));
     portMemSet(pOwner, 0, chunks * 3 * sizeof(NvU32));
     portMemSet(pOwnerFrames, 0, (VEP_COMPACT_MAX_OWNERS + 1) * 2 * sizeof(NvU32));
 
@@ -4735,6 +4739,8 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
                 if ((cls != VC_MOVABLE) && (cls != VC_SHARED))
                     continue;
                 (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pMovable, base, frames);
+                if (pProcs[i].hint & VE_HINT_GAME_SIDE)
+                    (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pGame, base, frames);
                 // It moves whole: the window is charged for all of it (vepCompactWindow()).
                 if ((bytes > (2ULL << 20)) && (numOwners < VEP_COMPACT_MAX_OWNERS))
                 {
@@ -4745,18 +4751,35 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
             }
         }
     }
-    // A chunk with a frame nobody can move ends the run for good.
+    //
+    // A chunk with a frame nobody can move ends the run for good. One with a
+    // frame of a game (VE_HINT_GAME_SIDE) ends it too at first: a window
+    // without the game's memory is looked for before one with it. The game's
+    // blocks are the biggest pieces in vidmem and every move of one is a
+    // pause of the game, and a window was chosen by its length alone: on a
+    // rented RTX 3060 (2026-11-16, sides-test) a step took a 64 MB block of
+    // the game on the other monitor for a window 64 MB longer, with gigabytes
+    // of the desktop's memory movable on the other side of the run; the sides
+    // that keep the game apart (vepPlaceLow()) were for nothing. R5: the game
+    // pays only when nothing else helps, e.g. its blocks are the only walls
+    // between the holes (sim/scenarios/compact-game.scn).
+    //
     for (c = 0; c < chunks; c++)
     {
+        pCostNoGame[c] = pCost[c];
         if (pCost[c] == 0)
             continue;
         for (f = off + c * VIDMEM_EVICT_CHUNK_FRAMES; f < off + (c + 1) * VIDMEM_EVICT_CHUNK_FRAMES; f++)
         {
-            if (((pUsed[f >> 6] >> (f & 63)) & 1) && !((pMovable[f >> 6] >> (f & 63)) & 1))
+            if (!((pUsed[f >> 6] >> (f & 63)) & 1))
+                continue;
+            if (!((pMovable[f >> 6] >> (f & 63)) & 1))
             {
-                pCost[c] = NV_U32_MAX;
+                pCost[c] = pCostNoGame[c] = NV_U32_MAX;
                 break;
             }
+            if ((pGame[f >> 6] >> (f & 63)) & 1)
+                pCostNoGame[c] = NV_U32_MAX;
         }
     }
 
@@ -4765,8 +4788,14 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
     owners.pOwn    = pOwner + chunks;
     owners.pFrames = pOwnerFrames;
     owners.pCount  = pOwnerFrames + VEP_COMPACT_MAX_OWNERS + 1;
-    (void)vepCompactWindow(pCost, &owners, chunks, VIDMEM_EVICT_CHUNK_FRAMES, runStart, runLen, budgetFrames,
+    (void)vepCompactWindow(pCostNoGame, &owners, chunks, VIDMEM_EVICT_CHUNK_FRAMES, runStart, runLen, budgetFrames,
                            &lo, &hi);
+    if (hi == lo)
+    {
+        bGameToo = NV_TRUE;
+        (void)vepCompactWindow(pCost, &owners, chunks, VIDMEM_EVICT_CHUNK_FRAMES, runStart, runLen, budgetFrames,
+                               &lo, &hi);
+    }
     if (hi == lo)
     {
         why = "no stretch longer than the run is free of memory that cannot be moved now";
@@ -4803,7 +4832,8 @@ vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepM
     {
         NvU64 moved = 0;
 
-        if (!_vidmemCompactVictim(&pProcs[i], NV_TRUE) || !_vidmemPidHasInRange(pProcs[i].pid))
+        if (!_vidmemCompactVictim(&pProcs[i], NV_TRUE) || (!bGameToo && (pProcs[i].hint & VE_HINT_GAME_SIDE)) ||
+            !_vidmemPidHasInRange(pProcs[i].pid))
             continue;
         if (_vidmemRelocateDoneBytes >= _vidmemRelocateTotalBytes)
             break;
@@ -4829,7 +4859,9 @@ done:
                   runLen << 1, wantMB, freeChunks << 1, victims, why);
     portMemFree(pUsed);
     portMemFree(pMovable);
+    portMemFree(pGame);
     portMemFree(pCost);
+    portMemFree(pCostNoGame);
     portMemFree(pRefs);
     portMemFree(pOwner);
     portMemFree(pOwnerFrames);

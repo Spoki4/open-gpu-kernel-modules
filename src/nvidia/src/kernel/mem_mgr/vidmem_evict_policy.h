@@ -190,6 +190,8 @@ typedef struct
 #define VE_HINT_OTHER_APP 0x200   // inherited from an ancestor with another name
 #define VE_HINT_FULLSCREEN 0x400  // has a fullscreen window (the KWin script's "g")
 #define VE_HINT_LAUNCHED_GAME 0x800 // started by a game launcher (Steam's reaper) or GameMode
+// A game for the sides of vidmem and for compaction (vepPlaceLow(), vepPlatCompact()).
+#define VE_HINT_GAME_SIDE (VE_HINT_LAUNCHED_GAME | VE_HINT_FULLSCREEN)
 // A process that inherits "hidden" from an ancestor of another name (no
 // window of its own) is left alone in its first two minutes: a game started
 // from Steam has no window while it loads. Helper processes of the same app
@@ -345,7 +347,8 @@ NvU64  vepContigMakeSpace(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, 
                           NvU32 level);
 // Background compaction (problem #16), one step: clear the window of 2 MB
 // chunks that moving makes the longest free run, by moving what is in it to
-// other vidmem pages. Whose memory: anyone's but the compositor's. Whole
+// other vidmem pages. Whose memory: anyone's but the compositor's, a game's
+// (VE_HINT_GAME_SIDE) only when no window without it lengthens the run. Whole
 // allocations move: one of the window in focus up to `fgStepMB`, of the
 // others up to `stepMB`, bigger ones count as fixed; `stepMB` in all per
 // step. Nothing to do when the run already has what vepCompactWantMB() says
