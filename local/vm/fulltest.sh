@@ -14,6 +14,7 @@
 #   move         move-test.sh        moves inside vidmem keep the content (#16)
 #   contig       contig-test.sh      windows for the compositor's contiguous buffers (#16, #12)
 #   contigloop   contigloop-test.sh  a focused app remaking a contiguous buffer: no loop (#15)
+#   contiggame   contiggame-test.sh  the same next to a visible game: its memory never goes to sysmem (R5)
 #   compact      compact-test.sh     background compaction lengthens the free run (#16)
 #   compactfg    compact-test.sh fg  the same out of the memory of the window in focus (#16)
 #   compactbig   compact-test.sh     the same with 128 MB blocks, as a game on the other monitor holds
@@ -152,6 +153,7 @@ stage tools 300 900 'TOOLS OK' "../build.sh tools >/tmp/build-tools.log 2>&1 && 
 stage move 180 900 'MOVETEST PASS' "./move-test.sh"
 stage contig 180 600 'CONTIGTEST PASS' "./contig-test.sh"
 stage contigloop 180 600 'CONTIGLOOPTEST PASS' "./contigloop-test.sh"
+stage contiggame 180 600 'CONTIGGAMETEST PASS' "./contiggame-test.sh"
 stage compact 180 900 'COMPACTTEST PASS' "./compact-test.sh 120 4096"
 stage compactfg 180 900 'COMPACTTEST PASS' "./compact-test.sh 120 4096 fg"
 stage compactbig 180 900 'COMPACTTEST PASS' "CHUNK_MB=128 ./compact-test.sh 120 4096"

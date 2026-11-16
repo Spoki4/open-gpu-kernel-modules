@@ -473,6 +473,8 @@ nv_procfs_write_vidmem_evict(
         mode = 18;
     else if (strcmp(cmd, "map") == 0)
         mode = 19;
+    else if (strcmp(cmd, "gamegives") == 0)
+        mode = 20;
     else
         return -EINVAL;
 
@@ -482,7 +484,7 @@ nv_procfs_write_vidmem_evict(
         if (arg == NULL)
             return -EINVAL;
         ret = kstrtouint(strim(arg), 10, &pid);
-        if ((ret < 0) || ((mode != 4) && (mode != 6) && (mode != 7) && (mode != 8) && (mode != 10) && (mode != 11) && (mode != 13) && (mode != 14) && (mode != 15) && (mode != 16) && (mode != 17) && (mode != 18) && (pid == 0)))
+        if ((ret < 0) || ((mode != 4) && (mode != 6) && (mode != 7) && (mode != 8) && (mode != 10) && (mode != 11) && (mode != 13) && (mode != 14) && (mode != 15) && (mode != 16) && (mode != 17) && (mode != 18) && (mode != 20) && (pid == 0)))
         {
             return -EINVAL;
         }

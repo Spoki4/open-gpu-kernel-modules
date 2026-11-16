@@ -1,0 +1,65 @@
+# A focused browser's contiguous buffers next to a fullscreen game drawing on
+# the other monitor (host, 2026-11-15 22:18, recording 20261115_213442).
+# Chrome allocated and freed 130 MB contiguous buffers ~145 times a second;
+# 1.3 GB was free in pieces, nine times no run held one and a window was
+# cleared over WoW's blocks; three times a 256 MB block of WoW found no other
+# place in vidmem and went to sysmem for it, and the game ran at 25 fps for
+# ten seconds, until the user went back to it.
+# Wanted (R5 over R2, the user's choice 2026-11-16): the game's memory moves
+# inside vidmem only; when it finds no place there, the browser pays with its
+# own memory that is not contiguous. `-set game_gives=1`: the old rule, the
+# game's blocks go to sysmem and the checks on it fail.
+cap 4828
+set layout 1
+set copy_gbs 10
+set fg_headroom 0            # the window is the subject, not the headroom
+set compact 0                # nor background compaction
+proc 1614 kwin_wayland old
+proc 2672 chrome old chunk=8
+proc 3686 spotify old
+proc 566609 Wow.exe old
+
+act 1614 0 4
+alloc 1614 250 n=5 fixed
+mark the session leaves the game's 256 MB blocks with the browser's buffers and small holes between them
+mix n=16 566609 256 2672 8 3686 14 2672 8
+free 3686 99999              # 224 MB free in holes of 14 MB, no run of 130 MB
+hint 566609 v full
+hint 3686 h
+hint 2672 f
+act 566609 0 30
+act 2672 0 6
+act 3686 600 0
+step
+expect free - >= 190
+expect longest - <= 20
+
+mark the browser asks for a 130 MB contiguous buffer, again and again (every 0.5 s here)
+alloc 2672 130 contig
+at 0.5
+free 2672 130
+alloc 2672 130 contig
+at 1
+free 2672 130
+alloc 2672 130 contig
+at 1.5
+free 2672 130
+alloc 2672 130 contig
+at 2.5
+free 2672 130
+alloc 2672 130 contig
+at 3
+free 2672 130
+alloc 2672 130 contig
+at 6
+expect denied 2672 == 0          # it got its buffers
+expect windows 2672 >= 1
+expect moved_out 566609 == 0     # nothing of the game went to sysmem
+expect sys 566609 == 0
+expect window_moved 566609 >= 256  # one of its blocks moved inside vidmem instead...
+expect window_pauses 566609 <= 1   # ...once: the hole it left holds the next buffers
+expect window_pause 566609 <= 30   # 256 MB at 10 MB/ms
+expect moved_out 2672 > 0        # the browser paid with its own memory...
+expect moved_out 2672 <= 200     # ...about what the game's block needed
+expect bounces 2672 <= 1         # it came back once there was room, and stayed
+expect sys 2672 == 0
