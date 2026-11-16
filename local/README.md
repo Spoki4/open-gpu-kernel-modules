@@ -92,7 +92,7 @@ Everything is switchable at run time, see `evict.sh` below.
 | `src/nvidia/src/kernel/mem_mgr/vidmem_evict_policy.c`, `.h` | the policy: who moves, when it comes back; also built by the simulator |
 | `src/nvidia/src/kernel/mem_mgr/video_mem.c` | hooks in the allocation path, the optional reserve |
 | `kernel-open/nvidia/nv-procfs.c`, `nv-vidmem-trace.[ch]` | `/proc/driver/nvidia/...` files, tracepoints |
-| `local/evict.sh`, `census.sh` | control and inspection from a shell |
+| `local/evict.sh`, `census.sh`, `evict-status.py` | control and inspection from a shell (`evict-status.py`: `status` laid out for a terminal) |
 | `local/kwin-vram-hints/` | the KWin script that reports window state |
 | `local/sim/` | policy simulator, no GPU needed |
 | `local/tests/` | test programs and scenarios for a real GPU |
@@ -122,6 +122,7 @@ sudo ./local/install.sh stock            # back to the stock modules; then reboo
 
 ```bash
 sudo ./local/evict.sh status             # the policy's state, fragmentation, bounces (moves undone within a minute), per process: vram, ram, window state
+                                         # on a terminal laid out by evict-status.py; into a pipe the driver's plain lines (--raw / --pretty to choose)
 sudo ./local/evict.sh dry chrome         # what of a process could move, and why the rest cannot
 sudo ./local/evict.sh evict|restore|move <pid|chrome|name>   # by hand: to sysmem, back, to other vidmem pages
 sudo ./local/evict.sh auto on|off|hints  # the automatic policy (hints, the default: only with window hints)

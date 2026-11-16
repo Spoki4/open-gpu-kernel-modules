@@ -3,7 +3,9 @@
 # automatic policy (needs the patched module, see
 # src/nvidia/src/kernel/mem_mgr/vidmem_evict.c).
 #
-#   sudo ./evict.sh status                      # per process: vram, ram, evictable, idle
+#   sudo ./evict.sh status [--raw|--pretty]     # per process: vram, ram, evictable, idle; laid out
+#                                               # by evict-status.py on a terminal, the driver's plain
+#                                               # lines into a pipe (--raw / --pretty: either anywhere)
 #   sudo ./evict.sh dry     <pid|chrome|name>   # list what could move, and why not
 #   sudo ./evict.sh move    <pid|chrome|name>   # move its vidmem to other vidmem pages (no sysmem; problem #16)
 #   sudo ./evict.sh compact MB                  # background compaction keeps a free run of MB (0: off; problem #16)
@@ -40,12 +42,23 @@
 set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "evict.sh: run with sudo" >&2; exit 1; }
-usage() { echo "usage: sudo $0 status | map | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows|moveshared|fgown|compactfg|compactbig|placesides|gamegives on|off | quiesce 0..4 | compact MB | trace-lock US" >&2; exit 2; }
+usage() { echo "usage: sudo $0 status [--raw|--pretty] | map | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows|moveshared|fgown|compactfg|compactbig|placesides|gamegives on|off | quiesce 0..4 | compact MB | trace-lock US" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 
 mode=$1
 case $mode in
-    status|map)
+    status)
+        view=auto
+        case ${2-} in
+            '') ;;
+            --raw) view=raw ;;
+            --pretty) view=pretty ;;
+            *) usage ;;
+        esac
+        [[ $# -le 2 ]] || usage
+        cmd="$mode"
+        ;;
+    map)
         [[ $# -eq 1 ]] || usage
         cmd="$mode"
         ;;
@@ -106,10 +119,25 @@ files=(/proc/driver/nvidia/gpus/*/vidmem_evict)
 exec 9>/run/nvidia-vidmem-evict.lock
 flock 9
 
-status=0
-for f in "${files[@]}"; do
-    [[ ${#files[@]} -gt 1 ]] && echo "== $f"
-    echo "$cmd" > "$f" || status=$?
-    cat "$f"
-done
-exit $status
+run() {
+    local f status=0
+    for f in "${files[@]}"; do
+        [[ ${#files[@]} -gt 1 ]] && echo "== $f"
+        echo "$cmd" > "$f" || status=$?
+        cat "$f"
+    done
+    return $status
+}
+
+# The tests and gamerec read the plain lines: only a terminal (or --pretty) gets the layout.
+view=${view:-raw}
+[[ $view == auto ]] && { [[ -t 1 ]] && view=pretty || view=raw; }
+pretty=$(dirname "$(readlink -f "$0")")/evict-status.py
+if [[ $view == pretty ]] && command -v python3 >/dev/null && [[ -f $pretty ]]; then
+    # sudo does not pass COLUMNS on; a pipe (--pretty | less -R) has no width of its own.
+    cols=$( { stty size </dev/tty; } 2>/dev/null | cut -d' ' -f2) || true
+    color=; [[ -t 1 ]] || color=1
+    run | COLUMNS=${cols:-} FORCE_COLOR=$color python3 "$pretty"     # set -e, pipefail: run's status
+    exit 0
+fi
+run
