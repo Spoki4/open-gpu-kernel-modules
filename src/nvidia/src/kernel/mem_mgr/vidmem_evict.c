@@ -4039,14 +4039,16 @@ vidmemEvictMakeRoom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
     return _vidmemEvictMakeRoomWant(pGpu, pRmClient, size, VIDMEM_EVICT_HINT_LOW_MB, "allocation");
 }
 
+static NvU32 _vidmemRequesterPid(RmClient *pRmClient);
+
 void
 vidmemEvictKeepFgHeadroom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size)
 {
     if ((pRmClient == NULL) || _vidmemEvictIsBusyThread() ||
-        !vepKeepFgHeadroomWanted(pGpu, pRmClient->ProcID, size))
+        !vepKeepFgHeadroomWanted(pGpu, _vidmemRequesterPid(pRmClient), size))
         return;
     // In the background, not inside this allocation (problem #5).
-    if (vepHeadroomRequest(pRmClient->ProcID))
+    if (vepHeadroomRequest(_vidmemRequesterPid(pRmClient)))
         _vidmemHeadroomQueue(pGpu);
 }
 
@@ -4058,14 +4060,19 @@ _vidmemEvictMakeRoomWant(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvU64 he
     NvBool             bOk;
     NvBool             bLocked = NV_FALSE;
     NvU64              t0;
+    NvU32              pid;
 
-    if ((pRmClient == NULL) || _vidmemEvictIsBusyThread() || !vepMakeRoomAllowed(pRmClient->ProcID))
+    if ((pRmClient == NULL) || _vidmemEvictIsBusyThread())
+        return NV_FALSE;
+    // Who asks: for a buffer made through nvidia-drm, the calling process (_vidmemRequesterPid()).
+    pid = _vidmemRequesterPid(pRmClient);
+    if (!vepMakeRoomAllowed(pid))
         return NV_FALSE;
     if (!rmapiLockIsWriteOwner())
     {
         if (lockLogged++ < 4)
             NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: cannot make room for %s(%u) here: no API write lock\n",
-                      pRmClient->name, pRmClient->ProcID);
+                      pRmClient->name, pid);
         return NV_FALSE;
     }
 
@@ -4076,15 +4083,15 @@ _vidmemEvictMakeRoomWant(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size, NvU64 he
             return NV_FALSE;
         bLocked = NV_TRUE;
     }
-    bOk = vepMakeRoomRun(pGpu, pRmClient->ProcID, size, headroomMB, why, &wantMB, &avail);
+    bOk = vepMakeRoomRun(pGpu, pid, size, headroomMB, why, &wantMB, &avail);
     if (bLocked)
         rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
     if (osVidmemTraceOn(VMT_MAKEROOM))
     {
         NvU64 a[VMT_ARGS] = { size, wantMB, avail, bOk, VMT_NOW() - t0,
-                              (VE_HINT_STATE(_vidmemHint(pRmClient->ProcID, NULL)) == VE_HINT_FG) ?
+                              (VE_HINT_STATE(_vidmemHint(pid, NULL)) == VE_HINT_FG) ?
                                   VE_LEVEL_FG_IDLE : VE_LEVEL_HIDDEN };
-        osVidmemTrace(VMT_MAKEROOM, pRmClient->ProcID, a);
+        osVidmemTrace(VMT_MAKEROOM, pid, a);
     }
     return bOk;
 }
