@@ -537,37 +537,91 @@ _vidmemEvictBusiestPid(VIDMEM_EVICT_PROC *pProcs, NvU32 count)
 // Margin on top of what a restore of a non-foreground process needs.
 
 //
-// May `p` be moved out to make room, by the window hints? Hidden (own
-// windows, or inherited after the grace period), or no window anywhere in
-// its ancestry and idle on the GPU; for the foreground process also visible
-// ones (see VE_LEVEL_*). Never the foreground, the caller (`exceptPid`), the
-// desktop, or a process that needed a buffer back a moment ago.
+// What a process is to the policy right now: one place for it (rules R, R4),
+// read by the table below (_veGives()) and by whoever else asks.
 //
-NvBool
-_vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs, NvU32 level)
+#define VE_ROLE_DESKTOP    0   // the desktop itself (bNever): never moved out
+#define VE_ROLE_FOCUS      1   // its window is in focus
+#define VE_ROLE_VISIBLE    2   // a window the user sees
+#define VE_ROLE_HIDDEN     3   // only hidden windows (own, or inherited from an ancestor)
+#define VE_ROLE_WINDOWLESS 4   // no window anywhere in its ancestry
+typedef struct
+{
+    NvU32  role;            // VE_ROLE_*
+    NvU32  idleSec;         // since its last GPU work (_vidmemActivityIdleSec())
+    NvBool bMovable;        // has 4 MB or more that could be moved now
+    NvBool bGame;           // R4 by the hints: started by Steam, or fullscreen and busy
+    NvBool bPrevFocus;      // the window focused before the current one (R1, R3)
+    NvBool bJustRestored;   // needed one of its buffers back a moment ago (no ping-pong)
+    NvBool bProtected;      // _vidmemEvictIsProtected(): the game of the samples, >= 1 GB, new, just restored
+    NvBool bDrawsHidden;    // hidden and drawing since it was hidden (not only right before)
+    NvBool bInheritGrace;   // hidden by an ancestor of another name, in its first minutes (a game loading)
+} VE_CLASS;
+
+static void
+_veClassify(VIDMEM_EVICT_PROC *p, NvU64 nowNs, VE_CLASS *c)
 {
     VIDMEM_EVICT_ACTIVITY *pAct = _vidmemActivityFind(p->pid, NV_TRUE);
     NvU32 st = VE_HINT_STATE(p->hint);
-    NvU32 idle = _vidmemActivityIdleSec(p->pid);
 
-    if (p->bNever || (p->pid == exceptPid) || (p->eligibleBytes < (4ULL << 20)))
+    portMemSet(c, 0, sizeof(*c));
+    c->idleSec       = _vidmemActivityIdleSec(p->pid);
+    c->role          = p->bNever ? VE_ROLE_DESKTOP :
+                       (st == VE_HINT_FG) ? VE_ROLE_FOCUS :
+                       (st == VE_HINT_VISIBLE) ? VE_ROLE_VISIBLE :
+                       (st == VE_HINT_HIDDEN) ? VE_ROLE_HIDDEN : VE_ROLE_WINDOWLESS;
+    c->bMovable      = (p->eligibleBytes >= (4ULL << 20));
+    c->bGame         = _vidmemEvictIsGameByHints(p);
+    c->bPrevFocus    = _vidmemEvictIsPrevFg(p, pAct);
+    c->bJustRestored = (pAct->lastRestoreNs != 0) &&
+                       (VE_AGO_NS(nowNs, pAct->lastRestoreNs) < VIDMEM_EVICT_AFTER_ACCESS_SEC * 1000000000ULL);
+    c->bProtected    = _vidmemEvictIsProtected(p->pid, nowNs);
+    c->bDrawsHidden  = (st == VE_HINT_HIDDEN) && (c->idleSec < VIDMEM_EVICT_DRAWING_SEC) &&
+                       (pAct->hiddenSinceNs != 0) &&
+                       ((VE_AGO_NS(nowNs, pAct->hiddenSinceNs)) / 1000000000ULL > (NvU64)c->idleSec + 1);
+    c->bInheritGrace = (p->hint & VE_HINT_OTHER_APP) &&
+                       (VE_AGO_NS(nowNs, pAct->firstSeenNs) < VIDMEM_EVICT_INHERIT_GRACE_SEC * 1000000000ULL);
+}
+
+//
+// Who gives up memory for whom: the asking side is a level (VE_LEVEL_*: who
+// asks and what for), the giving side its class. NV_TRUE: it may be moved out
+// to sysmem. Memory that may not be moved out may still move inside vidmem
+// for a contiguous window (vepContigGive()).
+//
+//                    HIDDEN      FG_IDLE      FG_RESTORE   FG_ALLOC     COMPOSITOR
+//   desktop          -           -            -            -            -
+//   focus            -           -            -            -            yes (last)
+//   previous focus   -           -            as its window             yes
+//   just restored    -           -            -            -            yes
+//   visible          -           idle 10 s    yes          yes          yes
+//     a game, for a focus that is not one: - at FG_RESTORE/FG_ALLOC (R5 over R2)
+//   hidden           yes         yes          yes          yes          yes
+//     drawing since hidden, or inheriting in its grace: -
+//   windowless       idle 10 s   idle 4 s     idle 4 s     idle 4 s     yes
+//     protected (the samples' game, >= 1 GB, new): -
+// Nothing that has less than 4 MB to give.
+//
+static NvBool
+_veGives(const VE_CLASS *c, NvU32 level)
+{
+    if ((c->role == VE_ROLE_DESKTOP) || !c->bMovable)
         return NV_FALSE;
     if (level == VE_LEVEL_COMPOSITOR)
         return NV_TRUE;
-    if (st == VE_HINT_FG)
+    if (c->role == VE_ROLE_FOCUS)
         return NV_FALSE;
     // The previous foreground stays for the background and for the
     // foreground's headroom and pressure; it gives what the foreground needs
     // right now or to come back (FG_ALLOC, FG_RESTORE), and to the compositor.
-    if (((level == VE_LEVEL_HIDDEN) || (level == VE_LEVEL_FG_IDLE)) && _vidmemEvictIsPrevFg(p, pAct))
+    if (((level == VE_LEVEL_HIDDEN) || (level == VE_LEVEL_FG_IDLE)) && c->bPrevFocus)
         return NV_FALSE;
-    if ((pAct->lastRestoreNs != 0) &&
-        (VE_AGO_NS(nowNs, pAct->lastRestoreNs) < VIDMEM_EVICT_AFTER_ACCESS_SEC * 1000000000ULL))
+    if (c->bJustRestored)
         return NV_FALSE;
 
-    switch (st)
+    switch (c->role)
     {
-        case VE_HINT_VISIBLE:
+        case VE_ROLE_VISIBLE:
             // Drawing: only to bring back the foreground's own memory, or
             // for what an allocation of it needs (a video gives the focused
             // game what nobody else has, R5).
@@ -584,25 +638,17 @@ _vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs, NvU
                 // and went to sysmem for them, and the game ran at 25 fps for
                 // ten seconds. Knob "gamegives" for the old rule.
                 //
-                if (!_vidmemFgTakesGame && !_vidmemFgIsHintGame && _vidmemEvictIsGameByHints(p))
-                    return NV_FALSE;
-                return NV_TRUE;
+                return !(!_vidmemFgTakesGame && !_vidmemFgIsHintGame && c->bGame);
             }
-            return (level == VE_LEVEL_FG_IDLE) && (idle >= VIDMEM_EVICT_VISIBLE_IDLE_SEC);
+            return (level == VE_LEVEL_FG_IDLE) && (c->idleSec >= VIDMEM_EVICT_VISIBLE_IDLE_SEC);
 
-        case VE_HINT_HIDDEN:
+        case VE_ROLE_HIDDEN:
             //
             // Drawing now while hidden (work in the last two steps, after it
             // was hidden): no. Work only before it was hidden (alt-tab) or a
             // short burst now and then (a check every 20 s): yes.
             //
-            if ((idle < VIDMEM_EVICT_DRAWING_SEC) && (pAct->hiddenSinceNs != 0) &&
-                ((VE_AGO_NS(nowNs, pAct->hiddenSinceNs)) / 1000000000ULL > (NvU64)idle + 1))
-                return NV_FALSE;
-            if ((p->hint & VE_HINT_OTHER_APP) &&
-                (VE_AGO_NS(nowNs, pAct->firstSeenNs) < VIDMEM_EVICT_INHERIT_GRACE_SEC * 1000000000ULL))
-                return NV_FALSE;
-            return NV_TRUE;
+            return !c->bDrawsHidden && !c->bInheritGrace;
 
         default:
             //
@@ -615,9 +661,24 @@ _vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs, NvU
             // the whole run (2026-11-04, bench.py apps-evict: 8.8 fps vs 52).
             //
             if (level >= VE_LEVEL_FG_IDLE)
-                return (idle >= VIDMEM_EVICT_DRAWING_SEC) && !_vidmemEvictIsProtected(p->pid, nowNs);
-            return (idle >= VIDMEM_EVICT_IDLE_SEC) && !_vidmemEvictIsProtected(p->pid, nowNs);
+                return (c->idleSec >= VIDMEM_EVICT_DRAWING_SEC) && !c->bProtected;
+            return (c->idleSec >= VIDMEM_EVICT_IDLE_SEC) && !c->bProtected;
     }
+}
+
+//
+// May `p` be moved out to make room for `level`? The table above, never for
+// the caller itself (`exceptPid`).
+//
+NvBool
+_vidmemEvictHintVictimOk(VIDMEM_EVICT_PROC *p, NvU32 exceptPid, NvU64 nowNs, NvU32 level)
+{
+    VE_CLASS c;
+
+    if (p->pid == exceptPid)
+        return NV_FALSE;
+    _veClassify(p, nowNs, &c);
+    return _veGives(&c, level);
 }
 
 //
@@ -640,25 +701,29 @@ _vidmemEvictHintPickVictim(VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU32 exceptP
     for (i = 0; i < count; i++)
     {
         VIDMEM_EVICT_ACTIVITY *pA;
+        VE_CLASS c;
         NvU64 fg, vis;
         NvU32 cls;
 
-        if (!_vidmemEvictHintVictimOk(&pProcs[i], exceptPid, nowNs, level))
+        if (pProcs[i].pid == exceptPid)
+            continue;
+        _veClassify(&pProcs[i], nowNs, &c);
+        if (!_veGives(&c, level))
             continue;
         pA  = _vidmemActivityFind(pProcs[i].pid, NV_TRUE);
         fg  = pA->lastFgNs;
         vis = pA->lastVisibleNs;
-        if (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_FG)
+        if (c.role == VE_ROLE_FOCUS)
             cls = 6;    // the compositor's last resort
-        else if ((level == VE_LEVEL_COMPOSITOR) && _vidmemEvictIsProtected(pProcs[i].pid, nowNs))
+        else if ((level == VE_LEVEL_COMPOSITOR) && c.bProtected)
             cls = 5;    // the game in the background, a process just started or just restored
-        else if (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_VISIBLE)
+        else if (c.role == VE_ROLE_VISIBLE)
             // Visible: only for the foreground, idle ones before drawing ones.
-            cls = (_vidmemActivityIdleSec(pProcs[i].pid) >= VIDMEM_EVICT_VISIBLE_IDLE_SEC) ? 3 : 4;
-        else if (VE_HINT_STATE(pProcs[i].hint) == VE_HINT_UNKNOWN)
+            cls = (c.idleSec >= VIDMEM_EVICT_VISIBLE_IDLE_SEC) ? 3 : 4;
+        else if (c.role == VE_ROLE_WINDOWLESS)
             cls = 2;
         else
-            cls = (_vidmemActivityIdleSec(pProcs[i].pid) < VIDMEM_EVICT_IDLE_SEC) ? 1 : 0;
+            cls = (c.idleSec < VIDMEM_EVICT_IDLE_SEC) ? 1 : 0;
         if ((pPick == NULL) || (cls < pickClass) ||
             ((cls == pickClass) &&
              ((fg < pickFg) ||
