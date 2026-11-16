@@ -6,6 +6,9 @@
 #   sudo ./evict.sh status [--raw|--pretty]     # per process: vram, ram, evictable, idle; laid out
 #                                               # by evict-status.py on a terminal, the driver's plain
 #                                               # lines into a pipe (--raw / --pretty: either anywhere)
+#   sudo ./evict.sh status --watch [SEC]        # the same, refreshed every SEC s (2, at least 1), with
+#                                               # what changed since it began; q: quit, r: changes from
+#                                               # now, another key: refresh now
 #   sudo ./evict.sh dry     <pid|chrome|name>   # list what could move, and why not
 #   sudo ./evict.sh move    <pid|chrome|name>   # move its vidmem to other vidmem pages (no sysmem; problem #16)
 #   sudo ./evict.sh compact MB                  # background compaction keeps a free run of MB (0: off; problem #16)
@@ -42,20 +45,29 @@
 set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "evict.sh: run with sudo" >&2; exit 1; }
-usage() { echo "usage: sudo $0 status [--raw|--pretty] | map | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows|moveshared|fgown|compactfg|compactbig|placesides|gamegives on|off | quiesce 0..4 | compact MB | trace-lock US" >&2; exit 2; }
+usage() { echo "usage: sudo $0 status [--raw|--pretty|--watch [SEC]] | map | dry|evict|restore|move|shared <pid|chrome|name> | auto|trace|windows|moveshared|fgown|compactfg|compactbig|placesides|gamegives on|off | quiesce 0..4 | compact MB | trace-lock US" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 
 mode=$1
 case $mode in
     status)
         view=auto
+        every=2
         case ${2-} in
             '') ;;
             --raw) view=raw ;;
             --pretty) view=pretty ;;
+            --watch)
+                view=watch
+                if [[ $# -eq 3 ]]; then
+                    # Each status takes the GPU lock and samples the GPU: not more often than once a second.
+                    [[ $3 =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v s="$3" 'BEGIN { exit !(s >= 1) }' || usage
+                    every=$3
+                fi
+                ;;
             *) usage ;;
         esac
-        [[ $# -le 2 ]] || usage
+        [[ $# -le 2 || $view == watch && $# -le 3 ]] || usage
         cmd="$mode"
         ;;
     map)
@@ -133,6 +145,42 @@ run() {
 view=${view:-raw}
 [[ $view == auto ]] && { [[ -t 1 ]] && view=pretty || view=raw; }
 pretty=$(dirname "$(readlink -f "$0")")/evict-status.py
+
+if [[ $view == watch ]]; then
+    [[ -t 1 && -t 0 ]] || { echo "evict.sh: status --watch needs a terminal" >&2; exit 1; }
+    command -v python3 >/dev/null && [[ -f $pretty ]] || { echo "evict.sh: status --watch needs python3 and $pretty" >&2; exit 1; }
+    tmp=$(mktemp -d)
+    # The alternate screen, no cursor, no line wrap; all of it back on the way out.
+    trap 'printf "\e[?7h\e[?25h\e[?1049l"; stty echo 2>/dev/null; rm -rf "$tmp"' EXIT
+    trap 'exit 0' INT TERM
+    printf '\e[?1049h\e[?25l\e[?7l'
+    stty -echo 2>/dev/null || true
+    since=
+    while :; do
+        status=0
+        run >"$tmp/now" 2>&1 || status=$?
+        flock -u 9      # free between refreshes: other evict.sh commands go on meanwhile
+        if [[ -z $since ]]; then
+            cp "$tmp/now" "$tmp/base"
+            since=$(date +%T)
+        fi
+        read -r rows cols < <(stty size 2>/dev/null || echo "40 100")
+        top="$(printf '\e[1mvidmem_evict\e[0m  %s  every %s s, changes since %s' "$(date +%T)" "$every" "$since")"
+        [[ $status -eq 0 ]] || top+="$(printf '  \e[31mthe driver answered %s\e[0m' "$status")"
+        top+="$(printf '  \e[2mq: quit  r: changes from now\e[0m')"
+        frame=$( { echo "$top"; echo; COLUMNS=$cols FORCE_COLOR=1 python3 "$pretty" --prev "$tmp/base" --rows $((rows - 2)) "$tmp/now"; } \
+                 | head -n "$rows")
+        # Home, each line cleared to its end, the rest of the screen cleared: no flicker.
+        printf '\e[H%s\e[K\e[J' "${frame//$'\n'/$'\e[K\n'}"
+        key=
+        IFS= read -rsn1 -t "$every" key || true
+        case $key in
+            q|Q) exit 0 ;;
+            r|R) since= ;;
+        esac
+        flock 9
+    done
+fi
 if [[ $view == pretty ]] && command -v python3 >/dev/null && [[ -f $pretty ]]; then
     # sudo does not pass COLUMNS on; a pipe (--pretty | less -R) has no width of its own.
     cols=$( { stty size </dev/tty; } 2>/dev/null | cut -d' ' -f2) || true

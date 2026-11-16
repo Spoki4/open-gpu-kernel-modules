@@ -123,6 +123,7 @@ sudo ./local/install.sh stock            # back to the stock modules; then reboo
 ```bash
 sudo ./local/evict.sh status             # the policy's state, fragmentation, bounces (moves undone within a minute), per process: vram, ram, window state
                                          # on a terminal laid out by evict-status.py; into a pipe the driver's plain lines (--raw / --pretty to choose)
+sudo ./local/evict.sh status --watch     # the same, refreshed every 2 s (--watch SEC) with what changed since it began; q: quit, r: changes from now
 sudo ./local/evict.sh dry chrome         # what of a process could move, and why the rest cannot
 sudo ./local/evict.sh evict|restore|move <pid|chrome|name>   # by hand: to sysmem, back, to other vidmem pages
 sudo ./local/evict.sh auto on|off|hints  # the automatic policy (hints, the default: only with window hints)
