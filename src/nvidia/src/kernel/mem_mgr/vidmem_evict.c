@@ -3929,14 +3929,54 @@ _vidmemEvictClientVidmem(void *ctx)
     return bytes;
 }
 
+//
+// Who asks, with its name: for a buffer made through nvidia-drm (its kernel
+// client's ProcID is the modprobe that loaded it) the calling process and its
+// leader's name, as _vidmemRequesterPid() (below) for the placement path.
+//
+void osGetCurrentProcessLeaderName(char *ProcName, NvU32 Length); // arch/nvalloc/unix/src/os.c
+
+static NvBool
+_vidmemRequester(RmClient *pRmClient, NvU32 *pPid, char *pName, NvU32 nameSize)
+{
+    if (staticCast(pRmClient, RsClient)->type != CLIENT_TYPE_KERNEL)
+    {
+        *pPid = pRmClient->ProcID;
+        portStringCopy(pName, nameSize, pRmClient->name, sizeof(pRmClient->name));
+        return NV_FALSE;
+    }
+    *pPid = osGetCurrentProcess();
+    portMemSet(pName, 0, nameSize);
+    osGetCurrentProcessLeaderName(pName, nameSize);
+    return NV_TRUE;
+}
+
+// The requester's vidmem from the last walk only (the kernel client holds every process's buffers).
+static NvU64
+_vidmemEvictNoMeasure(void *ctx)
+{
+    (void)ctx;
+    return 0;
+}
+
 NvBool
 vidmemEvictWantBorn(OBJGPU *pGpu, RmClient *pRmClient, NV_MEMORY_ALLOCATION_PARAMS *pAllocData)
 {
     Heap  *pHeap = GPU_GET_HEAP(pGpu);
     NvU64  blockBytes = 0, blockFree = 0, blockLargest = 0;
+    char   name[NV_PROC_NAME_MAX_LENGTH];
+    NvU32  pid;
+    NvBool bKernel;
 
-    if ((pRmClient == NULL) || (pAllocData == NULL) ||
-        !vepWantBorn(pRmClient->ProcID, pRmClient->name, _vidmemEvictClientVidmem, pRmClient))
+    if ((pRmClient == NULL) || (pAllocData == NULL))
+        return NV_FALSE;
+    //
+    // For nvidia-drm's buffers the policy is asked about the calling process:
+    // asked about modprobe (long idle, no window) it said yes, and a focused
+    // app's buffer could be made in sysmem instead of being given room.
+    //
+    bKernel = _vidmemRequester(pRmClient, &pid, name, sizeof(name));
+    if (!vepWantBorn(pid, name, bKernel ? _vidmemEvictNoMeasure : _vidmemEvictClientVidmem, pRmClient))
         return NV_FALSE;
     if ((pAllocData->size == 0) || (pAllocData->size > VIDMEM_EVICT_BORN_MAX_BYTES))
         return NV_FALSE;
@@ -3963,7 +4003,13 @@ vidmemEvictWantBorn(OBJGPU *pGpu, RmClient *pRmClient, NV_MEMORY_ALLOCATION_PARA
 NvBool
 vidmemEvictPlaceLow(RmClient *pRmClient)
 {
-    return (pRmClient != NULL) && vepPlaceLow(pRmClient->ProcID, pRmClient->name);
+    char  name[NV_PROC_NAME_MAX_LENGTH];
+    NvU32 pid;
+
+    if (pRmClient == NULL)
+        return NV_FALSE;
+    (void)_vidmemRequester(pRmClient, &pid, name, sizeof(name));
+    return vepPlaceLow(pid, name);
 }
 
 // See vepNoteContig(): vidmemConstruct() tells of every contiguous allocation it is asked for.
@@ -3977,7 +4023,13 @@ vidmemEvictNoteContig(NvU64 size)
 NvU64
 vidmemEvictBackgroundCushion(RmClient *pRmClient)
 {
-    return (pRmClient != NULL) ? vepBackgroundCushion(pRmClient->ProcID, pRmClient->name) : 0;
+    char  name[NV_PROC_NAME_MAX_LENGTH];
+    NvU32 pid;
+
+    if (pRmClient == NULL)
+        return 0;
+    (void)_vidmemRequester(pRmClient, &pid, name, sizeof(name));
+    return vepBackgroundCushion(pid, name);
 }
 
 //
