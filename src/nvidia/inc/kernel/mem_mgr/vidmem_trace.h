@@ -13,7 +13,7 @@
 
 #include "nvtypes.h"
 
-#define VMT_ARGS 14
+#define VMT_ARGS 16
 
 // Event types (os_vidmem_trace(), kernel-open/nvidia/nv-vidmem-trace.c)
 #define VMT_MOVE      1   // one evict/restore batch of a process

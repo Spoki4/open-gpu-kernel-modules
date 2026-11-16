@@ -2,7 +2,7 @@
 # Builds the patched kernel modules and the test tools (no root needed).
 #
 #   ./build.sh          # modules + tools
-#   ./build.sh tools    # only the test tools (vram-hog, gbm-hog, compr-test, nvt-game)
+#   ./build.sh tools    # only the test tools (vram-hog, gbm-hog, compr-test, vk-share, nvt-game)
 set -euo pipefail
 
 KVER=${KVER:-$(uname -r)}
@@ -30,6 +30,7 @@ gcc -O2 -Wall -pthread -I"$VK_HEADERS/include" -o "$T/vram-hog" "$T/vram-hog.c" 
     "$LIBDIR/libvulkan.so.1" -ldl
 gcc -O2 -Wall -o "$T/gbm-hog" "$T/gbm-hog.c" "$LIBDIR/libgbm.so.1" -ldl
 gcc -O2 -Wall -I"$VK_HEADERS/include" -o "$T/compr-test" "$T/compr-test.c" "$LIBDIR/libvulkan.so.1"
+gcc -O2 -Wall -I"$VK_HEADERS/include" -o "$T/vk-share" "$T/vk-share.c" "$LIBDIR/libvulkan.so.1"
 
 # nvt-game's compute shader: compiled to SPIR-V and embedded as a C array.
 if [[ ! -x $GLSLANG_DIR/bin/glslang ]]; then
