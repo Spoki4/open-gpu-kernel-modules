@@ -61,6 +61,14 @@ typedef struct
     NvU32  windows;               // windows cleared for it
     double compactMaxMs;          // longest pause a compaction step gave it
     double winMaxMs;              // longest pause a window cleared for somebody else gave it
+    // The player's view (local/gamerec/player.py on a recording), for a game in focus:
+    NvU32  plHitches;             // the driver held the RM locks PLAYER_HITCH_MS or more while it played
+    double plWorstMs;             // the longest of those
+    double plHoldMs;              // the RM locks held while it played, in all
+    NvU32  plPauses;              // its own channels stopped PLAYER_HITCH_MS or more
+    double plPauseMaxMs;
+    double plFocusS;              // focused as a game (VE_HINT_GAME_SIDE)
+    double plSysMBs;              // its memory in sysmem meanwhile
     NvU64  winKB;                 // its memory moved inside vidmem for others' windows
     NvU32  winPauses;             // how many such pauses
     NvU64  compactKB;             // moved by compaction
@@ -575,6 +583,7 @@ static void mapHint(Proc *p, NvU32 oldState, NvU32 newState)
 }
 
 static void accumulate(double toS);
+static void notePause(Proc *p, double ms);
 
 // --- the platform (vidmem_evict_policy.h) ---------------------------------
 
@@ -704,6 +713,7 @@ NV_STATUS vepPlatMovePid(OBJGPU *pGpu, NvU32 mode, NvU32 pid, NvU64 *pMovedBytes
 
     ms = moveMs(kb, n);
     gCtxMs += ms;
+    notePause(p, ms);
     // The clock runs on while memory moves, as in the driver (a step takes
     // nowNs once at its start; what it sets after a move is later).
     accumulate(gNowS + ms / 1000.0);
@@ -919,6 +929,7 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
 
                 ms += t;
                 *pMovedMB += inKB >> 10;
+                notePause(q, t);
                 if (q != p)
                 {
                     q->winMaxMs = NV_MAX(q->winMaxMs, t);
@@ -937,6 +948,7 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
                 double t = moveMs(outKB, nOut);
 
                 ms += t;
+                notePause(q, t);
                 *pMovedMB += outKB >> 10;
                 if (gNowS - q->lastRestoreS <= 4.0)
                     q->pingpong++;
@@ -1123,6 +1135,7 @@ NvU64 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64
         mapMove(3, 10, p->pid, p->name, kb, n, 0, ms);
         gMapSkewS = 0;
         p->compactMaxMs = NV_MAX(p->compactMaxMs, ms);
+        notePause(p, ms);
         p->compactKB += kb;
         if (gVerbose)
             printf("%s  COMPACT %s(%u) %llu MB in %u allocs, %.0f ms; window %llu MB\n", clockStr(gNowS), p->name,
@@ -1205,6 +1218,48 @@ static NvU64 measureVidmem(void *ctx)
     return sumKB((Proc *)ctx, W_VID) << 10;
 }
 
+//
+// The player's view. A game in focus (VE_HINT_GAME_SIDE) sees the driver as
+// the RM locks held while it plays (its calls wait: a policy step, somebody's
+// allocation that makes room, a headroom piece; each a context here) and as
+// pauses of its own channels while its memory moves. Either for this long is
+// a frame it misses at 60 Hz: what player.py counts as the driver's on a
+// recording.
+//
+#define PLAYER_HITCH_MS 8.0
+
+static Proc *focusedGame(void)
+{
+    int i;
+
+    for (i = 0; i < gNumProcs; i++)
+        if ((VE_HINT_STATE(gProcs[i].hint) == VE_HINT_FG) && (gProcs[i].hint & VE_HINT_GAME_SIDE))
+            return &gProcs[i];
+    return NULL;
+}
+
+static void notePause(Proc *p, double ms)
+{
+    if ((p == NULL) || (p != focusedGame()) || (ms < PLAYER_HITCH_MS))
+        return;
+    p->plPauses++;
+    p->plPauseMaxMs = NV_MAX(p->plPauseMaxMs, ms);
+}
+
+static void noteHold(double ms)
+{
+    Proc *g = focusedGame();
+
+    if (g == NULL)
+        return;
+    g->plHoldMs += ms;
+    if (ms >= PLAYER_HITCH_MS)
+    {
+        g->plHitches++;
+        g->plWorstMs = NV_MAX(g->plWorstMs, ms);
+    }
+}
+
 static void ctxBegin(Proc *p, const char *what)
 {
     gCtxProc = p;
@@ -1214,6 +1269,7 @@ static void ctxBegin(Proc *p, const char *what)
 
 static void ctxEnd(void)
 {
+    noteHold(gCtxMs);
     if (gCtxProc != NULL)
     {
         gCtxProc->stallMs += gCtxMs;
@@ -1452,6 +1508,11 @@ static void accumulate(double toS)
         {
             p->sysFgMBs += sys * dt;
             p->fgS += dt;
+            if (p->hint & VE_HINT_GAME_SIDE)
+            {
+                p->plFocusS += dt;
+                p->plSysMBs += sys * dt;
+            }
             if (sys > p->sysFgMaxMB)
                 p->sysFgMaxMB = sys;
         }
@@ -1586,6 +1647,9 @@ static double metric(const char *m, Proc *p)
     if (strcmp(m, "born") == 0)       return p->born;
     if (strcmp(m, "stallmax") == 0)   return p->maxStallMs;
     if (strcmp(m, "compact_pause") == 0) return p->compactMaxMs;
+    if (strcmp(m, "player_hitches") == 0) return p->plHitches;     // the driver's locks held >= 8 ms while it played
+    if (strcmp(m, "player_worst") == 0) return p->plWorstMs;
+    if (strcmp(m, "player_pauses") == 0) return p->plPauses;       // its own channels stopped >= 8 ms while focused
     if (strcmp(m, "window_pause") == 0) return p->winMaxMs;          // ms, longest pause for somebody else's window
     if (strcmp(m, "window_pauses") == 0) return p->winPauses;
     if (strcmp(m, "window_moved") == 0) return (double)(p->winKB >> 10);
@@ -1890,6 +1954,20 @@ static void summary(void)
             if (gProcs[i].compactKB != 0)
                 printf("  %-16.16s %llu MB moved by compaction, longest pause %.0f ms\n", gProcs[i].name,
                        (unsigned long long)(gProcs[i].compactKB >> 10), gProcs[i].compactMaxMs);
+    }
+    for (i = 0; i < gNumProcs; i++)
+    {
+        Proc *p = &gProcs[i];
+
+        if (p->plFocusS < 1)
+            continue;
+        printf("player %s(%u), focused %.0f s: %s; the driver's locks held %.0f ms or more while it played %u times "
+               "(worst %.0f ms, %.0f ms in all), its own channels stopped that long %u times (worst %.0f ms); "
+               "its memory in sysmem %.0f MB*s while focused, %.0f while only visible\n",
+               p->name, p->pid, p->plFocusS,
+               ((p->plHitches == 0) && (p->plPauses == 0) && (p->plSysMBs == 0)) ? "unnoticed" : "noticed",
+               PLAYER_HITCH_MS, p->plHitches, p->plWorstMs, p->plHoldMs, p->plPauses, p->plPauseMaxMs,
+               p->plSysMBs, p->sysVisMBs);
     }
     if (gChecks != 0)
         printf("\nexpect: %d of %d passed\n", gChecks - gFailures, gChecks);
