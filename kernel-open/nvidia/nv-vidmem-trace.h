@@ -174,6 +174,52 @@ TRACE_EVENT(vidmem_makeroom,
               __entry->ok, __entry->us, __entry->level)
 );
 
+// One vidmem allocation that took the lock-trace threshold or more (evict.sh
+// trace-lock), the allocating thread holding the API lock throughout; where
+// its time went. a: bytes, contiguous, total ns, before PMA ns (the reserve
+// and cushion checks, make-room for a denial, the headroom request), the
+// first PMA allocation ns (with any wait for pages still being scrubbed),
+// make-room after a PMA failure and the retry ns, waiting for the GPU lock
+// ns, the rest ns (memory descriptor, the RPC to GSP, mappings), status,
+// created in sysmem
+TRACE_EVENT(vidmem_alloc,
+    TP_PROTO(u32 pid, const char *comm, const u64 *a),
+    TP_ARGS(pid, comm, a),
+    TP_STRUCT__entry(
+        __field(u32, pid)
+        __array(char, comm, TASK_COMM_LEN)
+        __field(u64, kb)
+        __field(u32, contig)
+        __field(u64, total_us)
+        __field(u64, check_us)
+        __field(u64, pma_us)
+        __field(u64, room_us)
+        __field(u64, lockwait_us)
+        __field(u64, rest_us)
+        __field(u32, status)
+        __field(u32, born)
+    ),
+    TP_fast_assign(
+        __entry->pid = pid;
+        memcpy(__entry->comm, comm, TASK_COMM_LEN);
+        __entry->kb = a[0] >> 10;
+        __entry->contig = a[1];
+        __entry->total_us = a[2] / 1000;
+        __entry->check_us = a[3] / 1000;
+        __entry->pma_us = a[4] / 1000;
+        __entry->room_us = a[5] / 1000;
+        __entry->lockwait_us = a[6] / 1000;
+        __entry->rest_us = a[7] / 1000;
+        __entry->status = a[8];
+        __entry->born = a[9];
+    ),
+    TP_printk("pid=%u comm=%s kb=%llu contig=%u total_us=%llu check_us=%llu pma_us=%llu room_us=%llu "
+              "lockwait_us=%llu rest_us=%llu status=0x%x born=%u",
+              __entry->pid, __entry->comm, __entry->kb, __entry->contig, __entry->total_us, __entry->check_us,
+              __entry->pma_us, __entry->room_us, __entry->lockwait_us, __entry->rest_us, __entry->status,
+              __entry->born)
+);
+
 // One policy step. a: ns, queue ns (1 Hz timer to start: waiting for the API
 // lock), avail MB (free outside the block), block free MB, block largest
 // contiguous free MB, evicted MB, busiest pid, hints active, processes,

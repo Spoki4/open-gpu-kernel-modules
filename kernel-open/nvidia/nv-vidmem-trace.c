@@ -20,6 +20,7 @@
 #define NV_VMT_LOCK     7
 #define NV_VMT_BUDGET   8
 #define NV_VMT_FRAG     9
+#define NV_VMT_ALLOC    10
 
 NvBool NV_API_CALL os_vidmem_trace_on(NvU32 type)
 {
@@ -34,6 +35,7 @@ NvBool NV_API_CALL os_vidmem_trace_on(NvU32 type)
         case NV_VMT_LOCK:     return trace_rm_lock_enabled();
         case NV_VMT_BUDGET:   return trace_vidmem_budget_enabled();
         case NV_VMT_FRAG:     return trace_vidmem_frag_enabled();
+        case NV_VMT_ALLOC:    return trace_vidmem_alloc_enabled();
         default:              return NV_FALSE;
     }
 }
@@ -80,6 +82,7 @@ void NV_API_CALL os_vidmem_trace(NvU32 type, NvU32 pid, const NvU64 *a)
         case NV_VMT_LOCK:     trace_rm_lock(pid, comm, a);         break;
         case NV_VMT_BUDGET:   trace_vidmem_budget(pid, comm, a);   break;
         case NV_VMT_FRAG:     trace_vidmem_frag(pid, comm, a);     break;
+        case NV_VMT_ALLOC:    trace_vidmem_alloc(pid, comm, a);    break;
     }
 }
 
