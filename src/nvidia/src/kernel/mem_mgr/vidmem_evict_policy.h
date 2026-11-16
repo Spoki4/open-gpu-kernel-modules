@@ -63,16 +63,19 @@
 #define VIDMEM_EVICT_COMPACT_STALL_STEPS 16
 //
 // The run compaction gathers while a game is in focus: room for the biggest
-// contiguous buffer anybody asked for in the last NEED_SEC, NEED_TIMES over
-// (a page asks for several), NEED_MIN_MB when nobody did. Not the three
-// quarters of the free memory that are wanted next to any other window: every
-// step is a pause of the game, and what the run is for is those buffers (host,
-// 2026-11-11: Chrome's were 130-192 MB, the target 1.4 GB of the 1.9 GB free,
-// never reached between the game's blocks).
+// contiguous buffer anybody asked for in the last NEED_SEC, NEED_TIMES over,
+// NEED_MIN_MB when nobody did. Not the three quarters of the free memory that
+// are wanted next to any other window: every step is a pause of the game, and
+// what the run is for is those buffers (host, 2026-11-11: Chrome's were
+// 130-192 MB, the target 1.4 GB of the 1.9 GB free, never reached between the
+// game's blocks). Once over and nothing when nobody asked (2026-11-16, the
+// player's view of the 15 November session: compaction steps with WoW in
+// focus held the locks 23-27 ms, three of the 15 long frames of the
+// driver's); room for more buffers is gathered when the game is not in focus.
 //
 #define VIDMEM_EVICT_COMPACT_NEED_SEC    1800
-#define VIDMEM_EVICT_COMPACT_NEED_TIMES  3
-#define VIDMEM_EVICT_COMPACT_NEED_MIN_MB 256
+#define VIDMEM_EVICT_COMPACT_NEED_TIMES  1
+#define VIDMEM_EVICT_COMPACT_NEED_MIN_MB 0
 #define VIDMEM_EVICT_COMPACT_FREE_PCT    75
 extern NvU32 _vidmemCompactRunMB;
 extern NvU32 _vidmemCompactBig;

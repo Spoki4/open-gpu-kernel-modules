@@ -51,9 +51,9 @@ These patches do the same inside the driver.
   while a game is in focus). A game's memory moves only when no window
   without it lengthens the run (its blocks are then the only walls). The
   run it gathers: three quarters of the free memory, 1 GB at least; while a
-  game is in focus only three times the biggest contiguous buffer asked for
-  in the last half hour (256 MB at least), every step being a pause of the
-  game. And less is left to compact: while a game runs (started by a
+  game is in focus only room for the biggest contiguous buffer asked for in
+  the last half hour, and nothing when nobody asked, every step being a
+  pause of the game (the rest is gathered once the game is not in focus). And less is left to compact: while a game runs (started by a
   launcher, or with a fullscreen window), the others' new memory is placed
   from the bottom of vidmem and the game's from the top, so the small
   buffers a browser allocates and frees do not end up as holes between the
