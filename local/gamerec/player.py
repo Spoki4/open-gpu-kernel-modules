@@ -42,7 +42,10 @@ import sys
 LINE_RE = re.compile(r"^\s*(?P<task>.+?)-(?P<tid>\d+)\s+(?:\(\s*(?P<tgid>[\d-]+)\)\s+)?\[\d+\]\s+\S+\s+"
                      r"(?P<ts>\d+\.\d+): (?P<ev>\w+): (?P<body>.*)$")
 KV_RE = re.compile(r"(\w+)=(\S+)")
-EVENTS = (": vidmem_proc:", ": vidmem_pause:", ": rm_lock:", ": vidmem_move:", ": vidmem_makeroom:")
+EVENTS = (": vidmem_proc:", ": vidmem_pause:", ": rm_lock:", ": vidmem_move:", ": vidmem_makeroom:",
+          ": vidmem_alloc:")
+PHASES = (("check_us", "before PMA"), ("pma_us", "PMA"), ("room_us", "make-room and retry"),
+          ("lockwait_us", "waiting for the GPU lock"), ("rest_us", "the rest (descriptor, GSP, mappings)"))
 # Threads of a game under Wine/Proton that are not named after it.
 GAME_THREADS = ("dxvk-", "vkd3d", "wine_")
 LONG_RATIO, LONG_MS = 2.0, 8.0
@@ -98,6 +101,7 @@ class Trace:
         self.waits = []         # (end ts, task, tgid or None, wait s, lock, holder tid, where the holder took it)
         self.moves = []         # (ts, pid, op, why, mb, total s)
         self.makeroom = []      # (ts, pid, s)
+        self.allocs = []        # (end ts, pid, comm, kb, contig, total s, {phase: s}): allocations that took long
         self.names = {}         # tid -> task name
         self.has_tgid = False
         with open(path, errors="replace") as f:
@@ -126,6 +130,10 @@ class Trace:
                     elif ev == "vidmem_move":
                         self.moves.append((ts, int(kv["pid"]), kv.get("op"), kv.get("why"),
                                            int(kv.get("kb", 0)) >> 10, int(kv.get("total_us", 0)) / 1e6))
+                    elif ev == "vidmem_alloc":
+                        self.allocs.append((ts, int(kv["pid"]), kv["comm"], int(kv["kb"]), int(kv["contig"]),
+                                            int(kv["total_us"]) / 1e6,
+                                            {k: int(kv[k]) / 1e6 for k, _ in PHASES}))
                     elif ev == "vidmem_makeroom":
                         self.makeroom.append((ts, int(kv["pid"]), int(kv.get("us", 0)) / 1e6))
                 except (KeyError, ValueError):
@@ -344,6 +352,10 @@ def analyse(d):
                           f"its frames meanwhile {vis['ms_sys'] / max(vis['n_sys'], 1):.1f} ms, "
                           f"{vis['ms_no'] / max(vis['n_no'], 1):.1f} ms otherwise" if vsys_max else
                           "none of its memory in sysmem"))
+        sa = slow_allocs(tr, base - OFFSET_SPAN, t_end)
+        if sa:
+            out.append("  allocations that held the API lock long (vidmem_alloc), by phase in ms:")
+            out.extend(sa)
         if driver_frames:
             by = {}
             for e, ft, med, ov in driver_frames:
@@ -355,6 +367,7 @@ def analyse(d):
                 by[k] = by.get(k, 0) + 1
             out.append("  driver frames by cause: " + ", ".join(f"{k} {v}" for k, v in sorted(by.items(), key=lambda x: -x[1])))
             out.append("  worst frames caused by the driver:")
+            slow = [x for x in tr.allocs if base - OFFSET_SPAN <= x[0] <= t_end]
             for e, ft, med, ov in sorted(driver_frames, key=lambda x: -x[1])[:8]:
                 a = e - ft / 1000
                 why = []
@@ -370,8 +383,29 @@ def analyse(d):
                         wt[k] = wt.get(k, 0.0) + (min(wb, e) - max(wa, a))
                 for (lock, who), s in sorted(wt.items(), key=lambda x: -x[1])[:2]:
                     why.append(f"waited {s * 1000:.0f} ms for the {lock} lock (held by {who})")
+                for x in slow:
+                    if a - 0.1 <= x[0] - x[5] and x[0] - x[5] <= e and x[1] != game:
+                        ph = max(x[6], key=x[6].get)
+                        why.append(f"{x[2]} allocating {x[3] >> 10} MB{' contiguous' if x[4] else ''} took "
+                                   f"{x[5] * 1000:.0f} ms, most in {dict(PHASES)[ph]} ({x[6][ph] * 1000:.0f} ms)")
+                        break
                 out.append(f"    {clock(e)}  {ft:.0f} ms (median {med:.1f}): " + "; ".join(why))
     return out
+
+
+def slow_allocs(tr, t0, t1):
+    """Allocations that took the lock-trace threshold or more, per process and size: phases on average."""
+    groups = {}
+    for x in tr.allocs:
+        if t0 <= x[0] <= t1:
+            groups.setdefault((x[2], x[3] >> 10, x[4]), []).append(x)
+    lines = []
+    for (comm, mb, contig), xs in sorted(groups.items(), key=lambda g: -sum(x[5] for x in g[1]))[:6]:
+        avg = {k: sum(x[6][k] for x in xs) / len(xs) for k, _ in PHASES}
+        lines.append(f"    {comm} {mb} MB{' contiguous' if contig else ''}: {len(xs)} times, "
+                     f"{sum(x[5] for x in xs) / len(xs) * 1000:.1f} ms on average: "
+                     + ", ".join(f"{name} {avg[k] * 1000:.1f}" for k, name in PHASES))
+    return lines
 
 
 def main():

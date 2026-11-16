@@ -25,7 +25,8 @@
 #define VMT_LOCK      7   // a long RM lock wait or hold
 #define VMT_BUDGET    8   // free vidmem reported to a process (HEAP_FREE: its Vulkan/GL budget)
 #define VMT_FRAG      9   // how fragmented free vidmem is (periodic, and after each move batch)
-#define VMT_NUM_TYPES 10
+#define VMT_ALLOC     10  // one vidmem allocation that took long: where the time went
+#define VMT_NUM_TYPES 11
 
 // VMT_MOVE why (the caller of the evict engine)
 #define VMT_WHY_MANUAL    0   // procfs vidmem_evict (evict.sh)

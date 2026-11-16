@@ -149,6 +149,7 @@ The driver emits tracepoints (system `nvidia_vidmem`, free while off;
 | `vidmem_move` | one evict/restore batch: why, MB, phases (quiesce, sysmem alloc, copy, remap, pma) | the process moved, and whoever waits for the RM locks |
 | `vidmem_pause` | a process's channels were off: its GPU work stood still for `paused_us` | that process |
 | `vidmem_makeroom` | an allocation of a visible process moved others out first | the allocating thread (`us`) |
+| `vidmem_alloc` | an allocation that took the `trace-lock` threshold or more (1 ms), by phase: the checks before PMA, PMA itself (with any wait for pages still being scrubbed), make-room after a PMA failure and the retry, the GPU lock, the rest (descriptor, GSP, mappings) | every RM call: the allocating thread holds the API lock throughout |
 | `vidmem_reserve` | the reserve turned an allocation away: denied, room made, or created in sysmem | the allocating process |
 | `vidmem_tick` | one policy step (API + GPU lock held throughout), time queued for the lock | every RM call meanwhile |
 | `vidmem_proc` | per process at each step: vram, sysmem, eligible, window state, idle | - |
@@ -268,7 +269,8 @@ visible (another window focused). "unnoticed" is none of the three. The
 MangoHud log is put on the trace's clock by the driver's long pauses of the
 game (to a few ms; about 1 s without them). Threads are told apart by their
 process since 2026-11-16 (nvtrace records it); older recordings take the
-game's threads by name. The 15 November session (WoW, 158 min focused): 15
+game's threads by name. When the game waited behind another process's
+allocation, `vidmem_alloc` says in which phase that one spent its time. The 15 November session (WoW, 158 min focused): 15
 long frames of the driver's, 7 of them waiting for a policy step, 4 for
 Chrome's allocations; nothing in sysmem while focused, 768 MB for 12 s while
 Chrome was (its frames 36 ms instead of 17).

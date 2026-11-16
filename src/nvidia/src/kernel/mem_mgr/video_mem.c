@@ -1260,6 +1260,9 @@ vidmemConstruct_IMPL
     NvBool                       bLockAcquired         = NV_FALSE;
     NvBool                       bBornEvicted          = NV_FALSE; // local patch
     NvBool                       bReserveDenied        = NV_FALSE; // local patch: trace
+    // Local patch: where a long allocation's time went (VMT_ALLOC): start, before PMA, after the
+    // first PMA try, after make-room and the retry, before and after the GPU lock.
+    NvU64                        vmtT[6]               = { VMT_NOW(), 0, 0, 0, 0, 0 };
     NvU32                        attr                  = 0;
     NvU32                        attr2                 = 0;
     FB_ALLOC_INFO               *pFbAllocInfo          = NULL;
@@ -1456,8 +1459,10 @@ vidmemConstruct_IMPL
 
         pAllocRequest->pGpu = pGpu;
         _vidmemPmaLow = vidmemEvictPlaceLow(pRmClient);
+        vmtT[1] = VMT_NOW();
         rmStatus = _vidmemPmaAllocate(vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE), pAllocRequest,
                                       bReserveBound, bExempt, bBornEvicted);
+        vmtT[2] = VMT_NOW();
         //
         // Local patch: the compositor is never turned away. Without the
         // reserve, others move to sysmem until its allocation fits (a
@@ -1488,6 +1493,7 @@ vidmemConstruct_IMPL
                                           bReserveBound, bExempt, bBornEvicted);
         }
         _vidmemPmaLow = NV_FALSE;
+        vmtT[3] = VMT_NOW();
         if (NV_OK != rmStatus)
             goto done;
 
@@ -1504,8 +1510,10 @@ vidmemConstruct_IMPL
         //
         if (!rmDeviceGpuLockIsOwner(pGpu->gpuInstance) && !rmGpuLockIsOwner())
         {
+            vmtT[4] = VMT_NOW();
             rmStatus = rmDeviceGpuLocksAcquire(pGpu, GPUS_LOCK_FLAGS_NONE,
                                                RM_LOCK_MODULES_MEM);
+            vmtT[5] = VMT_NOW();
             NV_ASSERT_OR_GOTO(NV_OK == rmStatus, done);
 
             bLockAcquired = NV_TRUE;
@@ -1804,6 +1812,31 @@ done:
         if (pAllocRequest->pPmaAllocInfo)
             vidmemPmaFree(pGpu, vidmemGetHeap(pGpu, pDevice, NV_FALSE, NV_FALSE),
                           pAllocRequest->pPmaAllocInfo, 0);
+    }
+
+    //
+    // Local patch: an allocation that took long, by phase (VMT_ALLOC). On the
+    // host (2026-11-15 22:18) Chrome's 130 MB contiguous allocations held the
+    // API lock 6.3 ms each on average, the game waiting behind them, and
+    // nothing said where that went.
+    //
+    if (bIsPmaAlloc && (vmtT[1] != 0) && osVidmemTraceOn(VMT_ALLOC))
+    {
+        NvU64 now = VMT_NOW();
+
+        if (now - vmtT[0] >= vidmemTraceLockNs)
+        {
+            NvU64 tPma  = (vmtT[2] != 0) ? vmtT[2] : now;
+            NvU64 tRoom = (vmtT[3] != 0) ? vmtT[3] : tPma;
+            NvU64 lockw = (vmtT[5] != 0) ? (vmtT[5] - vmtT[4]) : 0;
+            NvU64 rest  = (vmtT[5] != 0) ? (now - vmtT[5]) : (now - tRoom);
+            NvU64 a[VMT_ARGS] = { pAllocData->size,
+                                  FLD_TEST_DRF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS, pAllocData->attr),
+                                  now - vmtT[0], vmtT[1] - vmtT[0], tPma - vmtT[1], tRoom - tPma, lockw, rest,
+                                  rmStatus, bBornEvicted };
+
+            osVidmemTrace(VMT_ALLOC, osGetCurrentProcess(), a);
+        }
     }
 
     return rmStatus;
