@@ -3462,7 +3462,10 @@ _vidmemActivitySample(OBJGPU *pGpu)
 //
 // Work submission per process: read GP_PUT (USERD offset 0x8C, the same in
 // every GPFIFO class since Volta) of each channel of each user client and
-// note a change of the per-process signature. API lock RW, GPU lock held.
+// note a change of the per-process signature. The channels come from FIFO's
+// own list: walking every object of every client to find them was a walk of
+// all allocations in every policy step, under the locks (a rented RTX 3060,
+// 2026-11-16: 3.0 ms of a step of 8.3, 14 processes). API lock RW, GPU lock held.
 //
 #define VIDMEM_EVICT_USERD_GP_PUT 0x8C
 
@@ -3470,48 +3473,36 @@ static void
 _vidmemActivitySampleSubmits(OBJGPU *pGpu)
 {
     MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    KernelFifo    *pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
     NvU32          subdev = gpumgrGetSubDeviceInstanceFromGpu(pGpu);
     NvU64          nowNs = osGetMonotonicTimeNs();
-    RmClient     **ppClient;
+    CHANNEL_ITERATOR it;
+    KernelChannel *pKC;
     typedef struct { NvU32 pid; NvU64 sig; } VE_SUBMIT_ACC;
     VE_SUBMIT_ACC *acc;
     NvU32          nAcc = 0, i;
 
+    if (pKernelFifo == NULL)
+        return;
     acc = portMemAllocNonPaged(sizeof(*acc) * VIDMEM_EVICT_MAX_PROCS);
     if (acc == NULL)
         return;
 
-    for (ppClient = serverutilGetFirstClientUnderLock();
-         ppClient != NULL;
-         ppClient = serverutilGetNextClientUnderLock(ppClient))
+    kfifoGetChannelIterator(pGpu, pKernelFifo, &it, INVALID_RUNLIST_ID);
+    while (kfifoGetNextKernelChannel(pGpu, pKernelFifo, &it, &pKC) == NV_OK)
     {
-        RmClient   *pRmClient = *ppClient;
-        RsClient   *pRsClient = staticCast(pRmClient, RsClient);
-        RS_ITERATOR iter;
-        NvU64       sig = 0;
-        NvBool      bAny = NV_FALSE;
+        RsClient        *pRsClient = RES_GET_CLIENT(pKC);
+        RmClient        *pRmClient = dynamicCast(pRsClient, RmClient);
+        TRANSFER_SURFACE surf = {0};
+        NvU32            put = 0;
 
-        if ((pRsClient->type == CLIENT_TYPE_KERNEL) || (pRmClient->ProcID == 0))
+        if ((pRmClient == NULL) || (pRsClient->type == CLIENT_TYPE_KERNEL) || (pRmClient->ProcID == 0) ||
+            (pKC->pUserdSubDeviceMemDesc[subdev] == NULL))
             continue;
-
-        iter = serverutilRefIter(pRsClient->hClient, NV01_NULL_OBJECT, 0, RS_ITERATE_DESCENDANTS, NV_TRUE);
-        while (clientRefIterNext(iter.pClient, &iter))
-        {
-            KernelChannel    *pKC = dynamicCast(iter.pResourceRef->pResource, KernelChannel);
-            TRANSFER_SURFACE  surf = {0};
-            NvU32             put = 0;
-
-            if ((pKC == NULL) || (pKC->pUserdSubDeviceMemDesc[subdev] == NULL))
-                continue;
-            surf.pMemDesc = pKC->pUserdSubDeviceMemDesc[subdev];
-            surf.offset   = VIDMEM_EVICT_USERD_GP_PUT;
-            if (memmgrMemRead(pMemoryManager, &surf, &put, sizeof(put),
-                              TRANSFER_FLAGS_PREFER_PROCESSOR | TRANSFER_FLAGS_MAP_PROTECT_READABLE) != NV_OK)
-                continue;
-            sig = sig * 1000003ULL + put + ((NvU64)RES_GET_HANDLE(pKC) << 32);
-            bAny = NV_TRUE;
-        }
-        if (!bAny)
+        surf.pMemDesc = pKC->pUserdSubDeviceMemDesc[subdev];
+        surf.offset   = VIDMEM_EVICT_USERD_GP_PUT;
+        if (memmgrMemRead(pMemoryManager, &surf, &put, sizeof(put),
+                          TRANSFER_FLAGS_PREFER_PROCESSOR | TRANSFER_FLAGS_MAP_PROTECT_READABLE) != NV_OK)
             continue;
 
         for (i = 0; i < nAcc; i++)
@@ -3527,7 +3518,7 @@ _vidmemActivitySampleSubmits(OBJGPU *pGpu)
             acc[nAcc].sig = 0;
             nAcc++;
         }
-        acc[i].sig = acc[i].sig * 31ULL + sig;
+        acc[i].sig = acc[i].sig * 1000003ULL + put + ((NvU64)RES_GET_HANDLE(pKC) << 32);
     }
 
     for (i = 0; i < nAcc; i++)
