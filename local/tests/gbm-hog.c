@@ -5,7 +5,7 @@
 //
 // Build: ./build.sh tools (no gbm.h needed; links libgbm.so.1 directly).
 // Usage: gbm-hog [--node PATH] [--size WxH] [--scanout] [--linear] [--dumb]
-//                [--max N] [--churn N] [--floor-mb N] [--hold S]
+//                [--max N] [--churn N] [--free-first] [--churn-us US] [--floor-mb N] [--hold S]
 //
 //   --node PATH   DRM node (default: the NVIDIA render node; --dumb defaults
 //                 to the NVIDIA primary node, dumb buffers need it)
@@ -17,6 +17,10 @@
 //   --churn N     then N times: one more buffer, the oldest one freed (a page
 //                 that remakes its big buffer, problem #15: Chrome asked for a
 //                 contiguous 130 MB up to 30 times a second); GBM only
+//   --free-first  churn by freeing the oldest buffer first, then making the new
+//                 one (Chrome's order on the host: the new buffer lands on the
+//                 pages just freed)
+//   --churn-us US the pause between two remakes (default 30000)
 //
 // It also stops when 5 buffers in a row did not take vidmem: nvidia-drm has
 // fallen back to sysmem (NO_SCANOUT only), and going on would fill system RAM.
@@ -110,7 +114,8 @@ int main(int argc, char **argv)
     unsigned w = 3840, h = 2160, max = 400, hold = 10, churn = 0, churned = 0;
     unsigned long floor_mb = 150;
     uint32_t flags = GBM_BO_USE_RENDERING;
-    int dumb = 0, force = 0;
+    int dumb = 0, force = 0, free_first = 0;
+    unsigned churn_us = 30000;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--node") && i + 1 < argc)
@@ -134,6 +139,10 @@ int main(int argc, char **argv)
             hold = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--force"))
             force = 1;
+        else if (!strcmp(argv[i], "--free-first"))
+            free_first = 1;
+        else if (!strcmp(argv[i], "--churn-us") && i + 1 < argc)
+            churn_us = (unsigned)strtoul(argv[++i], NULL, 0);
         else
             goto usage;
     }
@@ -226,15 +235,22 @@ int main(int argc, char **argv)
     // The page remaking its buffer: the new one first, then the old one goes.
     if (!dumb && count == max && count != 0) {
         for (; churned < churn; churned++) {
-            struct gbm_bo *bo = gbm_bo_create(gbm, w, h, GBM_FORMAT_ARGB8888, flags);
+            struct gbm_bo *bo;
+
+            if (free_first) {
+                gbm_bo_destroy(bos[churned % count]);
+                bos[churned % count] = NULL;
+            }
+            bo = gbm_bo_create(gbm, w, h, GBM_FORMAT_ARGB8888, flags);
             if (!bo) {
                 err = errno;
                 why = "churn-denied";
                 break;
             }
-            gbm_bo_destroy(bos[churned % count]);
+            if (!free_first)
+                gbm_bo_destroy(bos[churned % count]);
             bos[churned % count] = bo;
-            usleep(30000);
+            usleep(churn_us);
         }
     }
     long end_free = real_free_mb();
@@ -252,7 +268,8 @@ int main(int argc, char **argv)
 
     if (!dumb) {
         for (unsigned i = 0; i < count; i++)
-            gbm_bo_destroy(bos[i]);
+            if (bos[i])
+                gbm_bo_destroy(bos[i]);
         gbm_device_destroy(gbm);
     }
     close(fd); // also frees dumb buffers
