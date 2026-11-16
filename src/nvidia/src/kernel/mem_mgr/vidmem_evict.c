@@ -3590,12 +3590,23 @@ _vidmemEvictIsFirstPidHolder(MEMORY_DESCRIPTOR *pMemDesc, NvU32 pid, RsResourceR
 // per-process totals over every non-kernel client. API lock RW, GPU lock held.
 // Returns the number of entries filled.
 //
+//
+// Where a policy step's time goes (vidmem_tick): walks over the clients and
+// moves, summed while a step runs (they also run inside allocations; only
+// a step's are reported).
+//
+static NvU64 _vidmemStepWalkNs, _vidmemStepMoveNs;
+static NvU32 _vidmemStepMoveDepth;      // a move inside a window or compaction is counted once
+#define VE_MOVE_TIME_BEGIN() NvU64 vmtMove0 = VMT_NOW(); _vidmemStepMoveDepth++
+#define VE_MOVE_TIME_END()   do { if (--_vidmemStepMoveDepth == 0) _vidmemStepMoveNs += VMT_NOW() - vmtMove0; } while (0)
+
 NvU32
 vepPlatGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
 {
     VIDMEM_EVICT_MAPREF *pRefs;
     RmClient           **ppClient;
     NvU32                count = 0;
+    NvU64                t0 = VMT_NOW();
 
     pRefs = portMemAllocNonPaged(sizeof(*pRefs) * VIDMEM_EVICT_MAX_MAPPINGS);
     if (pRefs == NULL)
@@ -3690,6 +3701,7 @@ vepPlatGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
 
     _veHolderIndexEnd();
     portMemFree(pRefs);
+    _vidmemStepWalkNs += VMT_NOW() - t0;
     return count;
 }
 
@@ -3762,15 +3774,28 @@ vepPlatHotRestore(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count)
 NV_STATUS
 vepPlatMovePid(OBJGPU *pGpu, NvU32 mode, NvU32 pid, NvU64 *pMovedBytes)
 {
-    return _vidmemEvictPidLocked(pGpu, mode, pid, NULL, 0, NULL, pMovedBytes);
+    NV_STATUS status;
+    VE_MOVE_TIME_BEGIN();
+
+    status = _vidmemEvictPidLocked(pGpu, mode, pid, NULL, 0, NULL, pMovedBytes);
+    VE_MOVE_TIME_END();
+    return status;
 }
 
 // One policy step: sample the GPU activity, then the policy. API lock RW, GPU lock held.
+static NvU64 _vidmemStepSampleNs, _vidmemStepSubmitNs;
+
 static void
 _vidmemEvictPolicyStep(OBJGPU *pGpu)
 {
+    NvU64 t0 = VMT_NOW(), t1, t2;
+
     _vidmemActivitySample(pGpu);
+    t1 = VMT_NOW();
     _vidmemActivitySampleSubmits(pGpu);
+    t2 = VMT_NOW();
+    _vidmemStepSampleNs = t1 - t0;
+    _vidmemStepSubmitNs = t2 - t1;
     _vidmemHotPoll(pGpu);
     if (GPU_GET_HEAP(pGpu) != NULL)
         vidmemEvictNoteBlock(GPU_GET_HEAP(pGpu)->pPmaObject);
@@ -3792,8 +3817,12 @@ _vidmemEvictPolicyTick(OBJGPU *pGpu, NvU32 trigger)
     NvU64 blockBytes = 0, blockFree = 0, blockLargest = 0;
     NvU32 procs = 0;
     NvU64 stepNs = osGetMonotonicTimeNs();   // the clock the policy keeps (not VMT_NOW's)
+    NvU64 walkNs, moveNs;
 
+    _vidmemStepWalkNs = _vidmemStepMoveNs = 0;
     _vidmemEvictPolicyStep(pGpu);
+    walkNs = _vidmemStepWalkNs;
+    moveNs = _vidmemStepMoveNs;
 
     if (osVidmemTraceOn(VMT_PROC))
     {
@@ -3847,6 +3876,10 @@ _vidmemEvictPolicyTick(OBJGPU *pGpu, NvU32 trigger)
         a[7] = _vidmemHintsActive();
         a[8] = procs;
         a[9] = trigger;
+        a[10] = _vidmemStepSampleNs;
+        a[11] = _vidmemStepSubmitNs;
+        a[12] = walkNs;
+        a[13] = moveNs;
         osVidmemTrace(VMT_TICK, 0, a);
     }
     // Every 5th timer step (10 s): how fragmented free vidmem is (problem #16).
@@ -4680,9 +4713,24 @@ _vidmemCompactClass(OBJGPU *pGpu, VIDMEM_EVICT_PROC *p, NvBool bVictim, NvU64 li
     return _vidmemEvictHasCompositor(pRefs, numRefs) ? VC_SHARED : VC_MOVABLE;
 }
 
+static NvU64 _vidmemPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB,
+                                NvU64 fgStepMB, NvU64 *pWindowMB);
+
 NvU64
 vepPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB, NvU64 fgStepMB,
                NvU64 *pWindowMB)
+{
+    NvU64 moved;
+    VE_MOVE_TIME_BEGIN();
+
+    moved = _vidmemPlatCompact(pGpu, pProcs, count, stepMB, fgStepMB, pWindowMB);
+    VE_MOVE_TIME_END();
+    return moved;
+}
+
+static NvU64
+_vidmemPlatCompact(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 stepMB, NvU64 fgStepMB,
+                   NvU64 *pWindowMB)
 {
     NvU64   budgetMB = stepMB, wantMB = 0;
     Heap   *pHeap = GPU_GET_HEAP(pGpu);
@@ -5114,7 +5162,12 @@ NvBool
 vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 size, NvU64 align,
                   NvU32 forPid, NvU32 level, NvU64 *pMovedMB)
 {
-    return _vidmemEvictMakeContig(pGpu, pProcs, count, size, align, forPid, level, pMovedMB);
+    NvBool bOk;
+    VE_MOVE_TIME_BEGIN();
+
+    bOk = _vidmemEvictMakeContig(pGpu, pProcs, count, size, align, forPid, level, pMovedMB);
+    VE_MOVE_TIME_END();
+    return bOk;
 }
 
 //
