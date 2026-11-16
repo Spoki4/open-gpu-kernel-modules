@@ -441,11 +441,19 @@ failure, single moves of 1-36 ms. Compaction stood still next to the game
 
 Not verified yet: `vm/fulltest.sh` on the 3080 Ti (its `desktop` and `game`
 stages have never run), moving buffers shared with the compositor under a
-real Plasma session, the access-counter probe on Ampere. Sides change where
+real Plasma session. Sides change where
 the desktop's memory is placed while a game runs: the compositor's
 contiguous buffers then share the bottom of vidmem with it (`nvtest`
 comproom and scanout-churn are the checks, not run yet; `evict.sh
 placesides off` is the way back).
+
+Access counters (idea I5): the probe on a rented RTX 3060 (Ampere) got no
+notifications at all in 15 s, so accesses to vidmem are not reported and
+cold memory cannot be found that way. On the host `evict.sh hot on` gets
+none either: nvidia-uvm takes the GPU's only access-counter buffer as soon
+as a process opens `/dev/nvidia-uvm` (WoW and Spotify had it open), though
+on x86 without ATS it never turns counter migrations on
+(`is_migration_enabled()` in `kernel-open/nvidia-uvm/uvm_gpu_access_counters.c`).
 
 On a rented RTX 3060 (vast.ai, 2026-11-16; Ubuntu 22.04, so no `nvtest`,
 which wants KWin 6) every `fulltest.sh` stage that needs no desktop
