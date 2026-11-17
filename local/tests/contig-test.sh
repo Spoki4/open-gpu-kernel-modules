@@ -44,14 +44,14 @@ if [[ ! -s $H ]]; then printf '%s h\n' "${keep[@]}" >"$H"; ownhints=1; sleep 2; 
 # (the control run on the RTX 5000, 2026-11-11: a 2254 MB run took all eight).
 lrun=$(sudo -n ../evict.sh status | grep '^fragmentation' | grep -o 'longest [0-9]*' | cut -d' ' -f2)
 [[ -n $bufs ]] || bufs=$(( ${lrun:-1536} / 256 + 2 ))
-before=$(sudo -n ../evict.sh status | grep -o 'windows cleared.*: [0-9]* MB' | grep -o '[0-9]* MB$' | cut -d' ' -f1)
+before=$(sudo -n ../evict.sh status | sed -n 's/.*windows cleared for contiguous allocations: \([0-9]*\) MB.*/\1/p')
 cp ./gbm-hog "$T/kwin_wayland"
 "$T/kwin_wayland" --force --scanout --size 8192x8192 --max "$bufs" --floor-mb 64 --hold 6 >"$T/comp.log" 2>&1 &
 comp=$!
 for _ in $(seq 150); do grep -q '^RESULT' "$T/comp.log" && break; sleep 0.2; done
 echo "  compositor: $(grep '^RESULT' "$T/comp.log" || tail -2 "$T/comp.log")"
 echo "with them: $(frag)"
-after=$(sudo -n ../evict.sh status | grep -o 'windows cleared.*: [0-9]* MB' | grep -o '[0-9]* MB$' | cut -d' ' -f1)
+after=$(sudo -n ../evict.sh status | sed -n 's/.*windows cleared for contiguous allocations: \([0-9]*\) MB.*/\1/p')
 sudo journalctl -k --since "$T0" --no-pager | grep -o 'window .*cleared: .*' | sed 's/^/  /' | tail -12
 ram=0
 for p in "${keep[@]}"; do
