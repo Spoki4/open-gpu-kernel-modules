@@ -295,6 +295,10 @@ NvBool vepKeepFgHeadroomWanted(OBJGPU *pGpu, NvU32 pid, NvU64 size);
 NvBool vepHeadroomRequest(NvU32 pid);
 NvBool vepHeadroomRun(OBJGPU *pGpu);
 #define VEP_HAS_HEADROOM_RUN 1
+// The pause before the next run, ms, given how long the last one held the locks.
+NvU64  vepHeadroomGapMs(NvU64 pieceMs);
+void   vepHeadroomReset(void);
+#define VEP_HAS_HEADROOM_GAP 1
 NvBool vepMakeRoomCompositorRun(OBJGPU *pGpu, NvU64 size, NvBool bContig, NvU64 align,
                                 NvU64 *pWantMB, NvU64 *pAvail, NvU64 *pMovedMB);
 const char *vepMakeRoomDeniedWhy(NvU32 pid);

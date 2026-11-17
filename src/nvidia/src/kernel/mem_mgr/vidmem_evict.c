@@ -36,6 +36,7 @@
 #include "core/locks.h"
 #include "os/os.h"
 #include "gpu/gpu.h"
+#include "gpu/timer/objtmr.h"
 #include "gpu/mem_mgr/mem_mgr.h"
 #include "gpu/mem_mgr/mem_desc.h"
 #include "gpu/mem_mgr/heap.h"
@@ -4238,15 +4239,66 @@ vidmemEvictBackgroundCushion(RmClient *pRmClient)
 // The foreground's headroom refill (vepHeadroomRun()) runs here, a piece per
 // work item: the locks are free between pieces (problem #5).
 //
-static volatile NvU32 _vidmemHeadroomQueued;
+static volatile NvU32 _vidmemHeadroomQueued;   // a run queued, or its timer pending
+// The pause between pieces while a game is in focus (vepHeadroomGapMs()): an
+// OS timer, so the shared work queue does not sleep through it.
+static TMR_EVENT *_vidmemHeadroomTimer;
 
 static void _vidmemHeadroomQueue(OBJGPU *pGpu);
+
+static NV_STATUS
+_vidmemHeadroomTimerFired(OBJGPU *pGpu, OBJTMR *pTmr, TMR_EVENT *pEvent)
+{
+    _vidmemHeadroomQueued = 0;
+    _vidmemHeadroomQueue(pGpu);
+    return NV_OK;
+}
+
+// The next run in gapMs (GPU lock held). NV_FALSE: no timer, queue it at once.
+static NvBool
+_vidmemHeadroomAfter(OBJGPU *pGpu, NvU64 gapMs)
+{
+    OBJTMR *pTmr = GPU_GET_TIMER(pGpu);
+
+    if ((gapMs == 0) || (pTmr == NULL))
+        return NV_FALSE;
+    if ((_vidmemHeadroomTimer == NULL) &&
+        (tmrEventCreate(pTmr, &_vidmemHeadroomTimer, _vidmemHeadroomTimerFired, NULL,
+                        TMR_FLAG_USE_OS_TIMER) != NV_OK))
+    {
+        _vidmemHeadroomTimer = NULL;
+        return NV_FALSE;
+    }
+    _vidmemHeadroomQueued = 1;
+    if (tmrEventScheduleRel(pTmr, _vidmemHeadroomTimer, gapMs * 1000000ULL) != NV_OK)
+    {
+        _vidmemHeadroomQueued = 0;
+        return NV_FALSE;
+    }
+    return NV_TRUE;
+}
+
+// Module unload, suspend: no timer left behind. GPU lock held.
+void
+vidmemEvictHeadroomTeardown(OBJGPU *pGpu)
+{
+    OBJTMR *pTmr = GPU_GET_TIMER(pGpu);
+
+    if ((_vidmemHeadroomTimer != NULL) && (pTmr != NULL))
+    {
+        tmrEventCancel(pTmr, _vidmemHeadroomTimer);
+        tmrEventDestroy(pTmr, _vidmemHeadroomTimer);
+    }
+    _vidmemHeadroomTimer = NULL;
+    _vidmemHeadroomQueued = 0;
+    vepHeadroomReset();
+}
 
 static void
 _vidmemHeadroomWorkItem(NvU32 gpuInstance, void *pArgs)
 {
     OBJGPU *pGpu = gpumgrGetGpu(gpuInstance);
-    NvBool  bMore = NV_FALSE;
+    NvBool  bMore = NV_FALSE, bLater = NV_FALSE;
 
     _vidmemHeadroomQueued = 0;
     if ((pGpu != NULL) && gpuIsGpuFullPower(pGpu) &&
@@ -4254,12 +4306,16 @@ _vidmemHeadroomWorkItem(NvU32 gpuInstance, void *pArgs)
         rmapiLockIsWriteOwner() &&
         (rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_MEM) == NV_OK))
     {
+        NvU64 startNs = osGetMonotonicTimeNs();
+
         _veHolderIndexBegin();
         bMore = vepHeadroomRun(pGpu);
         _veHolderIndexEnd();
+        if (bMore)
+            bLater = _vidmemHeadroomAfter(pGpu, vepHeadroomGapMs((osGetMonotonicTimeNs() - startNs) / 1000000ULL));
         rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     }
-    if (bMore && (pGpu != NULL))
+    if (bMore && !bLater && (pGpu != NULL))
         _vidmemHeadroomQueue(pGpu);
 }
 
