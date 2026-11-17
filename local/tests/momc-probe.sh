@@ -5,8 +5,12 @@
 # An app reads 512 MB of its own vidmem every frame, nothing is evicted.
 # 15 s with the usual counters (`evict.sh hot on`), then 15 s with the vidmem
 # counters too (`hot momc`); the notifications of each phase are compared.
+# Then the app is moved to sysmem and 15 s more with the usual counters: do
+# they report accesses to evicted memory at all (what they are for; on an
+# RTX 3060 the first two phases got no notification, and with nothing
+# evicted none was to be had from the usual ones)?
 # The answer is the result, either way: ends with
-#   MOMCPROBE PASS vidmem-accesses-reported=yes|no ...
+#   MOMCPROBE PASS vidmem-accesses-reported=yes|no sysmem-accesses-reported=yes|no ...
 # and FAIL only when the counters cannot be had, the app broke or the kernel
 # log has errors. Run in the test VM guest.
 #   ./momc-probe.sh [SECONDS=15]
@@ -38,6 +42,11 @@ phase "usual counters" on
 n1=$(num notifications); e1=$(num 'outside evicted allocations')
 phase "vidmem counters too" momc
 n2=$(num notifications); e2=$(num 'outside evicted allocations'); c2=$(num 'type cpu'); v2=$(num 'aperture vidmem')
+sudo -n ../evict.sh evict "$app" >/dev/null
+echo "  app moved out: $(st | awk -v p="$app" '$1 == p {print $4 " MB in sysmem"; exit}')"
+phase "usual counters, the app in sysmem" on
+n3=$(num notifications); s3=$(num sysmem); m3=$(num 'on evicted allocations')
+sudo -n ../evict.sh restore "$app" >/dev/null
 ram=$(st | awk -v p="$app" '$1 == p {print $4; exit}')
 (( ${ram:-0} == 0 )) || echo "  note: $ram MB of the app in sysmem, its accesses count as the usual kind"
 sudo -n ../evict.sh hot off >/dev/null
@@ -50,5 +59,7 @@ klog | grep -qE 'Xid|BUG:|Oops|general protection|[Aa]ssert' && fail "kernel log
 # "Reported": the app's 256 two-megabyte regions read 30 times a second give
 # far more than a handful; without the vidmem counters next to nothing comes.
 if (( ${e2:-0} >= 32 && ${e2:-0} > 4 * ${e1:-0} )); then rep=yes; else rep=no; fi
-(( fails == 0 )) && echo "MOMCPROBE PASS vidmem-accesses-reported=$rep (in ${dur} s: usual $n1 notifications, $e1 in resident memory; with vidmem counters $n2, $e2 in resident memory, type cpu $c2, aperture vidmem $v2)" \
+# Evicted: the same 256 regions, now in sysmem, read 30 times a second.
+if (( ${s3:-0} >= 32 )); then srep=yes; else srep=no; fi
+(( fails == 0 )) && echo "MOMCPROBE PASS vidmem-accesses-reported=$rep sysmem-accesses-reported=$srep (in ${dur} s: usual $n1 notifications, $e1 in resident memory; with vidmem counters $n2, $e2 in resident memory, type cpu $c2, aperture vidmem $v2; the app in sysmem: usual $n3, of them sysmem $s3, on its evicted allocations $m3)" \
     || echo "MOMCPROBE FAIL $fails"
