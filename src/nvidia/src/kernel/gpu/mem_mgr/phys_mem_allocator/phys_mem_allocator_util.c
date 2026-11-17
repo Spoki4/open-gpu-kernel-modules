@@ -51,7 +51,7 @@ NV_STATUS scrubWaitPages(OBJMEMSCRUB *pScrubber, NvU64 chunkSize, NvU64* pages, 
 }
 
 NV_STATUS scrubCheckAndWaitForSize (OBJMEMSCRUB *pScrubber, NvU64 numPages,
-                                    NvU64 pageSize, PSCRUB_NODE *ppList, NvU64 *pSize)
+                                    NvU64 pageSize, NvU64 contigAlign, PSCRUB_NODE *ppList, NvU64 *pSize)
 {
     return NV_OK;
 }

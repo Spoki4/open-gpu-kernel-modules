@@ -5,7 +5,8 @@
 //
 // Build: ./build.sh tools (no gbm.h needed; links libgbm.so.1 directly).
 // Usage: gbm-hog [--node PATH] [--size WxH] [--scanout] [--linear] [--dumb]
-//                [--max N] [--churn N] [--free-first] [--churn-us US] [--floor-mb N] [--hold S]
+//                [--max N] [--churn N] [--free-first] [--churn-batch N] [--churn-us US] [--floor-mb N]
+//                [--hold S]
 //
 //   --node PATH   DRM node (default: the NVIDIA render node; --dumb defaults
 //                 to the NVIDIA primary node, dumb buffers need it)
@@ -20,7 +21,13 @@
 //   --free-first  churn by freeing the oldest buffer first, then making the new
 //                 one (Chrome's order on the host: the new buffer lands on the
 //                 pages just freed)
+//   --churn-batch N  with --free-first: free the N oldest, then make N (Chrome
+//                 freed two 130 MB buffers and asked for one at once, host
+//                 2026-11-16); a remake is then one batch
 //   --churn-us US the pause between two remakes (default 30000)
+//
+// With --churn it prints how long each buffer creation took (the RM call,
+// under the API lock): "CHURN creates=N p50_ms=.. p99_ms=.. max_ms=..".
 //
 // It also stops when 5 buffers in a row did not take vidmem: nvidia-drm has
 // fallen back to sysmem (NO_SCANOUT only), and going on would fill system RAM.
@@ -42,6 +49,22 @@
 #include <unistd.h>
 
 #include "nvml-lite.h"
+#include <time.h>
+
+static double now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+static int cmp_double(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+
+    return (x > y) - (x < y);
+}
 
 // The parts of gbm.h used here (stable ABI).
 struct gbm_device;
@@ -115,7 +138,7 @@ int main(int argc, char **argv)
     unsigned long floor_mb = 150;
     uint32_t flags = GBM_BO_USE_RENDERING;
     int dumb = 0, force = 0, free_first = 0;
-    unsigned churn_us = 30000;
+    unsigned churn_us = 30000, batch = 1;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--node") && i + 1 < argc)
@@ -143,6 +166,8 @@ int main(int argc, char **argv)
             free_first = 1;
         else if (!strcmp(argv[i], "--churn-us") && i + 1 < argc)
             churn_us = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--churn-batch") && i + 1 < argc)
+            batch = (unsigned)strtoul(argv[++i], NULL, 0);
         else
             goto usage;
     }
@@ -233,25 +258,51 @@ int main(int argc, char **argv)
         }
     }
     // The page remaking its buffer: the new one first, then the old one goes.
-    if (!dumb && count == max && count != 0) {
+    double *create_ms = NULL;
+    unsigned ncreate = 0, slot = 0;
+
+    if (batch < 1 || !free_first)
+        batch = 1;
+    if (batch > count)
+        batch = count;
+    if (!dumb && count == max && count != 0 && churn != 0)
+        create_ms = calloc((size_t)churn * batch, sizeof(*create_ms));
+    if (create_ms != NULL) {
         for (; churned < churn; churned++) {
-            struct gbm_bo *bo;
+            struct gbm_bo *bo = NULL;
+            unsigned b;
 
             if (free_first) {
-                gbm_bo_destroy(bos[churned % count]);
-                bos[churned % count] = NULL;
+                for (b = 0; b < batch; b++) {
+                    gbm_bo_destroy(bos[(slot + b) % count]);
+                    bos[(slot + b) % count] = NULL;
+                }
             }
-            bo = gbm_bo_create(gbm, w, h, GBM_FORMAT_ARGB8888, flags);
+            for (b = 0; b < batch; b++) {
+                double t0 = now_ms();
+
+                bo = gbm_bo_create(gbm, w, h, GBM_FORMAT_ARGB8888, flags);
+                create_ms[ncreate++] = now_ms() - t0;
+                if (!bo)
+                    break;
+                if (!free_first)
+                    gbm_bo_destroy(bos[(slot + b) % count]);
+                bos[(slot + b) % count] = bo;
+            }
             if (!bo) {
                 err = errno;
                 why = "churn-denied";
                 break;
             }
-            if (!free_first)
-                gbm_bo_destroy(bos[churned % count]);
-            bos[churned % count] = bo;
+            slot = (slot + batch) % count;
             usleep(churn_us);
         }
+        if (ncreate) {
+            qsort(create_ms, ncreate, sizeof(*create_ms), cmp_double);
+            printf("CHURN creates=%u batch=%u p50_ms=%.2f p99_ms=%.2f max_ms=%.2f\n", ncreate, batch,
+                   create_ms[ncreate / 2], create_ms[(unsigned)(0.99 * (ncreate - 1))], create_ms[ncreate - 1]);
+        }
+        free(create_ms);
     }
     long end_free = real_free_mb();
     if (end_free < min_free)

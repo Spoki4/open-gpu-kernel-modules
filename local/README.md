@@ -88,7 +88,10 @@ These patches do the same inside the driver.
   approach, `RmVidmemUserReserveMB`, still there and off by default).
 - Fixes found on the way in NVIDIA's own code: a channel group leaked on GSP
   after a failed creation (new GPU apps could not start until reboot), slow
-  copies of memory on 64 KB pages, new contexts failing in fragmented vidmem.
+  copies of memory on 64 KB pages, new contexts failing in fragmented vidmem,
+  a contiguous allocation waiting for the scrubbing of more freed memory than
+  it needed (a browser's 130 MB buffer waited for two, holding the RM API
+  lock; `mem_scrub.c`).
 
 Everything is switchable at run time, see `evict.sh` below.
 
@@ -338,6 +341,7 @@ cd local/tests
 ./bounce-test.sh               # an app covered by the window just focused gives its headroom and stays out (no out-back-out)
 ./headroom-test.sh             # a focused game's headroom comes in pieces with pauses between them
 ./born-test.sh                 # a hidden app's buffers created in sysmem: no regmap.c assertion
+./scrubwait-test.sh            # a contiguous buffer remade after two were freed waits for one scrub, not two
 ./fragchurn.sh                 # fragments vidmem like a long session
 ./momc-probe.sh                # a probe: do the GPU's access counters report accesses to vidmem?
 ../watchdog.sh --stall 300 -- CMD   # any long run: WATCHDOG STALL/TIMEOUT instead of waiting forever

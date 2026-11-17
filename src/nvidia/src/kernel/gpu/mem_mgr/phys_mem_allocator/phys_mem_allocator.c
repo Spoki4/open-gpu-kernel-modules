@@ -1180,8 +1180,13 @@ pmaAllocatePages_retry:
 
         NV_PRINTF(LEVEL_INFO, "Waiting for scrubber\n");
 
+        //
+        // Local patch: a contiguous request waits for the first freed run
+        // that holds it, not for as many pages in all and one item more
+        // (scrubCheckAndWaitForSize()).
+        //
         status = scrubCheckAndWaitForSize(pPma->pScrubObj, numPagesLeftToAllocate,
-                                          pageSize, &pPmaScrubList, &count);
+                                          pageSize, contigFlag ? alignment : 0, &pPmaScrubList, &count);
 
         if (status == NV_OK)
         {

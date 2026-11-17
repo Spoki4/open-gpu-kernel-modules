@@ -595,6 +595,7 @@ scrubCheckAndWaitForSize
     OBJMEMSCRUB *pScrubber,
     NvU64        numPages,
     NvU64        pageSize,
+    NvU64        contigAlign,
     PSCRUB_NODE  *ppList,
     NvU64        *pSize
 )
@@ -611,8 +612,37 @@ scrubCheckAndWaitForSize
     NvU64 totalScrubbedPages = 0;
     NvLength requiredItemsToSave = 0;
 
-    for (; requiredItemsToSave < totalItems && totalScrubbedPages <= numPages; requiredItemsToSave++) {
-        totalScrubbedPages += (pScrubber->pScrubList[(startIdx + requiredItemsToSave) % MAX_SCRUB_ITEMS].size / pageSize);
+    //
+    // Local patch: a contiguous request (contigAlign != 0) waits up to the
+    // first item that alone holds an aligned run of numPages * pageSize, a
+    // freed buffer of the size asked for, not for numPages in all and then
+    // one item more. A browser that frees two 130 MB buffers and asks for one
+    // at once waited for both to be scrubbed, 6-8 ms holding the RM API lock
+    // (host, recording 20261116_184241: 3308 times in two hours, 16 of the
+    // game's 22 long frames caused by the driver). With no such item, as
+    // before.
+    //
+    if (contigAlign != 0)
+    {
+        NvU64     bytes = numPages * pageSize;
+        NvLength  i;
+
+        for (i = 0; i < totalItems; i++)
+        {
+            SCRUB_NODE *pItem = &pScrubber->pScrubList[(startIdx + i) % MAX_SCRUB_ITEMS];
+            NvU64       start = NV_ALIGN_UP64(pItem->base, contigAlign);
+
+            if ((start >= pItem->base) && (start + bytes <= pItem->base + pItem->size))
+            {
+                requiredItemsToSave = i + 1;
+                break;
+            }
+        }
+    }
+    if (requiredItemsToSave == 0) {
+        for (; requiredItemsToSave < totalItems && totalScrubbedPages <= numPages; requiredItemsToSave++) {
+            totalScrubbedPages += (pScrubber->pScrubList[(startIdx + requiredItemsToSave) % MAX_SCRUB_ITEMS].size / pageSize);
+        }
     }
 
     if (requiredItemsToSave != 0) {
