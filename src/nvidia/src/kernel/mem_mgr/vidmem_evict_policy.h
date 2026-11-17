@@ -401,6 +401,28 @@ typedef struct
 //
 NvU64  vepContigWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, NvU64 chunks, NvU64 need,
                        NvU64 alignChunks, NvU64 startOff, NvU64 *pStart);
+//
+// The same among windows whose memory that may only move inside vidmem
+// (vepContigGive() VEP_GIVE_MOVE) finds room outside them: pStayIn[c] the
+// frames of such memory in chunk c, pStayWhole[n] all frames of owner n if
+// it is such memory (else 0); the room is the free chunks outside the window
+// (freeChunks in all, chunks of chunkFrames) plus giveFrames, what those who
+// may be moved out hold (room is made from it, vepContigMakeSpace()). NULL:
+// vepContigWindow().
+//
+typedef struct
+{
+    const NvU32 *pStayWhole;
+    const NvU32 *pStayIn;
+    NvU64        freeChunks;
+    NvU64        chunkFrames;
+    NvU64        giveFrames;
+} VEP_CONTIG_ROOM;
+NvU64  vepContigWindowRoom(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, const VEP_CONTIG_ROOM *pRoom,
+                           NvU64 chunks, NvU64 need, NvU64 alignChunks, NvU64 startOff, NvU64 *pStart);
+#define VEP_HAS_CONTIG_ROOM 1
+// The requester pays for a window with its own memory that is not contiguous (vepContigMakeSpace()).
+NvBool vepContigOwnPays(NvU32 forPid);
 NvBool vepCompactWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, NvU64 chunks, NvU64 chunkFrames,
                         NvU64 runStart, NvU64 runLen, NvU64 budgetFrames, NvU64 *pLo, NvU64 *pHi);
 // Total evicted bytes right now (the engine's count).

@@ -1,0 +1,52 @@
+# A focused browser's contiguous buffers next to a fullscreen game drawing on
+# the other monitor, with no room left for the game's blocks (host, recording
+# 20261116_184241, 19:32:47 and 20:19:47-20:20:14). The windows for Chrome's
+# 130 MB buffers were chosen by what they held to move, not by whether that
+# found room outside them: windows over a corner of a 256 MB block of WoW were
+# cleared as far as they went, 17 of 53 were given up after 424 MB of the game
+# had moved for them, and one was chosen again every second for 15 s.
+# Here: the game's 256 MB blocks fill vidmem with the browser's buffers and
+# holes of 20 MB between them: 200 MB free, more than the request, no run that
+# holds it and no room for a block of the game; nobody hidden to move out, and
+# nothing of the browser's own goes to sysmem (its buffers are contiguous).
+# Wanted: no window is cleared (none can be), so nothing of the game moves for
+# them; the browser is turned away. Before 2026-11-17 the game's blocks were
+# moved for windows that then were not cleared.
+cap 3120
+set layout 1
+set copy_gbs 10
+set fg_headroom 0            # the window is the subject, not the headroom
+set compact 0                # nor background compaction
+set fg_own 0                 # nothing of the browser's own goes to sysmem (its buffers are contiguous)
+proc 1614 kwin_wayland old
+proc 2672 chrome old
+proc 3686 spotify old
+proc 566609 Wow.exe old
+
+act 1614 0 4
+alloc 1614 250 n=1 fixed
+mark the game's 256 MB blocks with the browser's contiguous buffers between them
+mix n=10 566609 256 3686 20 2672 10
+free 3686 99999              # 200 MB free in holes of 20 MB: no run of 130 MB, no room for a 256 MB block
+hint 566609 v full
+hint 2672 f
+act 566609 0 30
+act 2672 0 6
+step
+expect free - >= 190
+expect longest - <= 40
+
+mark the browser asks for a 130 MB contiguous buffer, again and again
+alloc 2672 130 contig
+at 1
+alloc 2672 130 contig
+at 2
+alloc 2672 130 contig
+at 4
+expect windows 2672 == 0          # no window could be cleared...
+expect window_moved 566609 == 0   # ...and none of the game moved for one
+expect window_pauses 566609 == 0
+expect moved_out 566609 == 0
+expect sys 566609 == 0
+expect window_fails 2672 == 0     # nor was one chosen and given up (the host: every second)
+

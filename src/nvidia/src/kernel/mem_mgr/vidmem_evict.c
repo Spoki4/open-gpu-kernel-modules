@@ -2651,6 +2651,41 @@ _vidmemFragTrace(OBJGPU *pGpu, NvU32 at, NvU32 why, NvU32 pid, const VIDMEM_FRAG
 }
 
 //
+// Allocations whose move inside vidmem failed a moment ago (no room for them
+// outside a window): no window is chosen over them for VIDMEM_EVICT_STUCK_SEC
+// (host, recording 20261116_184241, 20:19:50-20:20:04: the same window over a
+// corner of a 256 MB block of WoW, chosen for Chrome's buffers every second
+// and given up each time). A pointer only compared, never followed: one freed
+// and reused meanwhile is spared a window for those seconds, no more.
+//
+#define VIDMEM_EVICT_STUCK_MAX 16
+#define VIDMEM_EVICT_STUCK_SEC 10
+static struct { const MEMORY_DESCRIPTOR *pMemDesc; NvU64 atNs; } _vidmemStuck[VIDMEM_EVICT_STUCK_MAX];
+static NvU32 _vidmemStuckNext;
+
+static void
+_vidmemStuckNote(const MEMORY_DESCRIPTOR *pMemDesc)
+{
+    _vidmemStuck[_vidmemStuckNext].pMemDesc = pMemDesc;
+    _vidmemStuck[_vidmemStuckNext].atNs     = osGetMonotonicTimeNs();
+    _vidmemStuckNext = (_vidmemStuckNext + 1) % VIDMEM_EVICT_STUCK_MAX;
+}
+
+static NvBool
+_vidmemStuckRecently(const MEMORY_DESCRIPTOR *pMemDesc, NvU64 nowNs)
+{
+    NvU32 i;
+
+    for (i = 0; i < VIDMEM_EVICT_STUCK_MAX; i++)
+    {
+        if ((_vidmemStuck[i].pMemDesc == pMemDesc) && (_vidmemStuck[i].atNs != 0) &&
+            (VE_AGO_NS(nowNs, _vidmemStuck[i].atNs) < VIDMEM_EVICT_STUCK_SEC * 1000000000ULL))
+            return NV_TRUE;
+    }
+    return NV_FALSE;
+}
+
+//
 // Evict / restore / dry-run every eligible allocation of process `pid`
 // (its own and those it shares only with the compositor).
 // API lock held for writing, GPU lock held.
@@ -2980,6 +3015,8 @@ _vidmemEvictPidLocked
                 if (mode == 3)
                 {
                     static NvU32 moveFailLogged;
+
+                    _vidmemStuckNote(pMemDesc);
 
                     // Why a move inside vidmem did not happen (problem #15: "failed 1" said nothing).
                     if ((moveFailLogged++ < 8) || ((moveFailLogged % 64) == 0))
@@ -4614,6 +4651,11 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     NvU32  *pCost = NULL, *pOwner = NULL, *pOwnerFrames = NULL, numOwners = 0;
     NvU8   *pOwnerW = NULL;
     NvU64   bestStart = NV_U64_MAX, bestCost = NV_U64_MAX, f, c;
+    // What may only move inside vidmem (all of each owner, per chunk the frames), what others may give.
+    NvU32  *pStay = NULL, *pStaySmall = NULL;
+    NvU64  *pStayBits = NULL, giveFrames = 0;
+    NvU32   stuck = 0;
+    NvBool  bOwnPays = vepContigOwnPays(forPid);
     VIDMEM_EVICT_MAPREF *pRefs = NULL;
     NvU64   nowNs = osGetMonotonicTimeNs();
     NvBool  bOk = NV_FALSE;
@@ -4643,13 +4685,20 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     pOwner       = portMemAllocNonPaged(NV_MAX(chunks, 1) * 3 * sizeof(NvU32));
     pOwnerFrames = portMemAllocNonPaged((VEP_COMPACT_MAX_OWNERS + 1) * 2 * sizeof(NvU32));
     pOwnerW      = portMemAllocNonPaged(VEP_COMPACT_MAX_OWNERS + 1);
+    pStay        = portMemAllocNonPaged((VEP_COMPACT_MAX_OWNERS + 1) * sizeof(NvU32));
+    pStaySmall   = portMemAllocNonPaged(NV_MAX(chunks, 1) * sizeof(NvU32));
+    pStayBits    = portMemAllocNonPaged(words * sizeof(NvU64));
     if ((pMovable == NULL) || (pHeavy == NULL) || (pCost == NULL) || (pRefs == NULL) || (pOwner == NULL) ||
-        (pOwnerFrames == NULL) || (pOwnerW == NULL) || (need == 0) || (need > chunks))
+        (pOwnerFrames == NULL) || (pOwnerW == NULL) || (pStay == NULL) || (pStaySmall == NULL) ||
+        (pStayBits == NULL) || (need == 0) || (need > chunks))
         goto done;
     portMemSet(pMovable, 0, words * sizeof(NvU64));
     portMemSet(pHeavy, 0, words * sizeof(NvU64));
     portMemSet(pOwner, 0, chunks * 3 * sizeof(NvU32));
     portMemSet(pOwnerFrames, 0, (VEP_COMPACT_MAX_OWNERS + 1) * 2 * sizeof(NvU32));
+    portMemSet(pStay, 0, (VEP_COMPACT_MAX_OWNERS + 1) * sizeof(NvU32));
+    portMemSet(pStaySmall, 0, chunks * sizeof(NvU32));
+    portMemSet(pStayBits, 0, words * sizeof(NvU64));
     // Already there: an aligned window with nothing in it.
     if (_vidmemEvictBestWindow(pUsed, pMovable, NULL, pCost, base, off, chunks, need, align, NULL) == 0)
     {
@@ -4669,6 +4718,9 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
 
         if (give == VEP_GIVE_NONE)
             continue;
+        // Room is made from what those who may be moved out hold (vepContigMakeSpace()).
+        if (give == VEP_GIVE_EVICT)
+            giveFrames += pProcs[i].eligibleBytes >> PMA_PAGE_SHIFT;
         for (ppClient = serverutilGetFirstClientUnderLock(); ppClient != NULL;
              ppClient = serverutilGetNextClientUnderLock(ppClient))
         {
@@ -4702,6 +4754,15 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
                 if (bMoveOnly && ((pMemory->pMemDesc->pPmaAllocInfo == NULL) ||
                                   pMemory->pMemDesc->pPmaAllocInfo->bContig))
                     continue;
+                // The requester's own memory that is not contiguous may go to sysmem for room (vepContigMakeSpace()).
+                if (bOwnPays && (pProcs[i].pid == forPid))
+                    giveFrames += memdescGetSize(pMemory->pMemDesc) >> PMA_PAGE_SHIFT;
+                // Its move found no room a moment ago: it stays where it is (_vidmemStuckRecently()).
+                if (_vidmemStuckRecently(pMemory->pMemDesc, nowNs))
+                {
+                    stuck++;
+                    continue;
+                }
                 (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pMovable, base, frames);
                 if (bHeavy)
                     (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pHeavy, base, frames);
@@ -4713,9 +4774,12 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
                     numOwners++;
                     pOwnerFrames[numOwners] = (NvU32)((memdescGetSize(pMemory->pMemDesc) >> PMA_PAGE_SHIFT) * w);
                     pOwnerW[numOwners]      = w;
+                    pStay[numOwners]        = bMoveOnly ? (NvU32)(memdescGetSize(pMemory->pMemDesc) >> PMA_PAGE_SHIFT) : 0;
                     _vidmemCompactOwn(pMemory->pMemDesc, numOwners, pOwner, pOwner + chunks, pOwner + 2 * chunks,
                                       base, off, chunks);
                 }
+                if (bMoveOnly)
+                    (void)_vidmemMemDescFrames(pMemory->pMemDesc, 0, 0, pStayBits, base, frames);
             }
         }
     }
@@ -4732,12 +4796,19 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
         if (pOwner[c] != 0)
             pOwner[chunks + c] *= pOwnerW[pOwner[c]];
     }
+    // Per chunk the frames of what may only move inside vidmem.
+    for (c = 0; c < chunks; c++)
+    {
+        for (f = off + c * VIDMEM_EVICT_CHUNK_FRAMES; f < off + (c + 1) * VIDMEM_EVICT_CHUNK_FRAMES; f++)
+            pStaySmall[c] += (pStayBits[f >> 6] >> (f & 63)) & 1;
+    }
     {
         VEP_COMPACT_OWNERS owners = { pOwner, pOwner + chunks, pOwnerFrames, pOwnerFrames + VEP_COMPACT_MAX_OWNERS + 1 };
+        VEP_CONTIG_ROOM    room   = { pStay, pStaySmall, freeChunks, VIDMEM_EVICT_CHUNK_FRAMES, giveFrames };
         NvU64 alignChunks = align >> 21;
         NvU64 startOff = ((base + (off << PMA_PAGE_SHIFT)) >> 21) % NV_MAX(alignChunks, 1ULL);
 
-        if (vepContigWindow(pCost, &owners, chunks, need, alignChunks, startOff, &bestStart) == NV_U64_MAX)
+        if (vepContigWindowRoom(pCost, &owners, &room, chunks, need, alignChunks, startOff, &bestStart) == NV_U64_MAX)
             bestStart = NV_U64_MAX;
     }
     if (bestStart == NV_U64_MAX)
@@ -4746,8 +4817,8 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
 
         // A page asking 30 times a second (problem #15): the first few, then one in 64.
         if ((noneLogged++ < 8) || ((noneLogged % 64) == 0))
-            NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: contiguous: no %llu MB window aligned to %llu KB can be cleared for pid %u (longest free %llu MB)\n",
-                      need * 2, align >> 10, forPid, longest * 2);
+            NV_PRINTF(LEVEL_ERROR, "NVRM: vidmem evict: contiguous: no %llu MB window aligned to %llu KB can be cleared for pid %u (longest free %llu MB, %llu MB free in chunks; %u allocations stuck a moment ago)\n",
+                      need * 2, align >> 10, forPid, longest * 2, freeChunks * 2, stuck);
         goto done;
     }
     // What is in it, in MB (the cost above counts some frames several times).
@@ -4770,15 +4841,26 @@ _vidmemEvictMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU
     for (pass = 0; pass < 2; pass++)
     {
         NvU64 shortBytes = 0, lo, hi;
+        NvU32 k;
 
-        for (i = 0; i < count; i++)
+        //
+        // What may only move inside vidmem first, to the free chunks outside
+        // the window; then those who may be moved out, to what is left or to
+        // sysmem. In the order of the processes a hidden app's buffers took
+        // the room the game's block then had none of (the room counted above,
+        // vepContigWindowRoom(), is for the first).
+        //
+        for (k = 0; k < 2 * count; k++)
         {
             NvU64  moved = 0;
             NvBool bHeavy;
-            NvU32  give = vepContigGive(&pProcs[i], forPid, level, _vidmemCompactVictim(&pProcs[i], NV_FALSE),
-                                        nowNs, &bHeavy);
+            NvU32  give;
 
-            if ((give == VEP_GIVE_NONE) || !_vidmemPidHasInRange(pProcs[i].pid))
+            i    = k % count;
+            give = vepContigGive(&pProcs[i], forPid, level, _vidmemCompactVictim(&pProcs[i], NV_FALSE),
+                                 nowNs, &bHeavy);
+            if ((give == VEP_GIVE_NONE) || ((give == VEP_GIVE_MOVE) != (k < count)) ||
+                !_vidmemPidHasInRange(pProcs[i].pid))
                 continue;
             //
             // To other vidmem pages first (problems #16, #15: Chrome's contiguous
@@ -4841,6 +4923,9 @@ done:
     portMemFree(pOwner);
     portMemFree(pOwnerFrames);
     portMemFree(pOwnerW);
+    portMemFree(pStay);
+    portMemFree(pStaySmall);
+    portMemFree(pStayBits);
     return bOk;
 }
 

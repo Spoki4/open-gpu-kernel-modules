@@ -71,6 +71,7 @@ typedef struct
     double plSysMBs;              // its memory in sysmem meanwhile
     NvU64  winKB;                 // its memory moved inside vidmem for others' windows
     NvU32  winPauses;             // how many such pauses
+    NvU32  winFails;              // windows cleared for it that were chosen and then not cleared
     NvU64  compactKB;             // moved by compaction
 } Proc;
 
@@ -865,8 +866,50 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
     }
     {
         VEP_COMPACT_OWNERS ow = { owner, own, frames, cnt };
+#ifdef VEP_HAS_CONTIG_ROOM
+        // As the driver: only a window whose memory that may only move finds room outside it.
+        NvU32 *stay = calloc(gNextId + 1, sizeof(*stay)), *staySmall = calloc(gChunks, sizeof(*staySmall));
+        NvU64  freeChunks = 0, giveFrames = 0;
 
+        for (c = 0; c < gChunks; c++)
+            freeChunks += (gChunk[c] == 0);
+        for (i = 0; i < gNumProcs; i++)
+        {
+            for (k = 0; k < (int)count; k++)
+                if ((pProcs[k].pid == gProcs[i].pid) && (give[i] == VEP_GIVE_EVICT))
+                    giveFrames += pProcs[k].eligibleBytes >> 16;
+            // The requester's own memory that is not contiguous, when it pays with it (vepContigMakeSpace()).
+            for (k = 0; (gProcs[i].pid == forPid) && vepContigOwnPays(forPid) && (k < gProcs[i].na); k++)
+            {
+                Alloc *a = &gProcs[i].a[k];
+
+                if ((a->where == W_VID) && (a->id != 0) && a->movable && !a->contig)
+                    giveFrames += (NvU64)a->kb >> 6;
+            }
+            if (give[i] != VEP_GIVE_MOVE)
+                continue;
+            for (k = 0; k < gProcs[i].na; k++)
+            {
+                Alloc *a = &gProcs[i].a[k];
+
+                if ((a->where != W_VID) || (a->id == 0) || !a->movable || a->contig)
+                    continue;
+                if (gCompactOwners && (a->kb > 2048))
+                    stay[a->id] = (NvU32)(((a->kb + 2047) >> 11) * SIM_CHUNK_FRAMES);
+                for (c = 0; c < gChunks; c++)
+                    staySmall[c] += (gChunk[c] == a->id) ? SIM_CHUNK_FRAMES : 0;
+            }
+        }
+        {
+            VEP_CONTIG_ROOM room = { stay, staySmall, freeChunks, SIM_CHUNK_FRAMES, giveFrames };
+
+            best = vepContigWindowRoom(cost, &ow, &room, gChunks, need, 1, 0, &lo);
+        }
+        free(stay);
+        free(staySmall);
+#else
         best = vepContigWindow(cost, &ow, gChunks, need, 1, 0, &lo);
+#endif
     }
     if (best == NV_U64_MAX)
     {
@@ -883,14 +926,18 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
     for (pass = 0; pass < 2; pass++)
     {
         NvU64 shortKB = 0;
+        int   j;
 
-        for (i = 0; i < gNumProcs; i++)
+        // What may only move inside vidmem first, then those who may be moved out (the driver's order).
+        for (j = 0; j < 2 * gNumProcs; j++)
         {
-            Proc  *q = &gProcs[i];
+            Proc  *q;
             NvU64  inKB = 0, outKB = 0;
             NvU32  nIn = 0, nOut = 0;
 
-            if (give[i] == VEP_GIVE_NONE)
+            i = j % gNumProcs;
+            q = &gProcs[i];
+            if ((give[i] == VEP_GIVE_NONE) || ((give[i] == VEP_GIVE_MOVE) != (j < gNumProcs)))
                 continue;
             for (k = 0; k < q->na; k++)
             {
@@ -988,6 +1035,8 @@ NvBool vepPlatMakeContig(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, N
         ok &= (gChunk[c] == 0);
     if (ok && (p != NULL))
         p->windows++;
+    if (!ok && (p != NULL))
+        p->winFails++;
     if (gVerbose)
         printf("%s  WINDOW %s, %llu MB moved\n", clockStr(gNowS), ok ? "cleared" : "not cleared",
                (unsigned long long)*pMovedMB);
@@ -1664,6 +1713,7 @@ static double metric(const char *m, Proc *p)
     if (strcmp(m, "player_pauses") == 0) return p->plPauses;       // its own channels stopped >= 8 ms while focused
     if (strcmp(m, "window_pause") == 0) return p->winMaxMs;          // ms, longest pause for somebody else's window
     if (strcmp(m, "window_pauses") == 0) return p->winPauses;
+    if (strcmp(m, "window_fails") == 0) return p->winFails;
     if (strcmp(m, "window_moved") == 0) return (double)(p->winKB >> 10);
     if (strcmp(m, "compact_moved") == 0) return (double)(p->compactKB >> 10);
     if (strcmp(m, "sysfg_mbs") == 0)  return p->sysFgMBs;
