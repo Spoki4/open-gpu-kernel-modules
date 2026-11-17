@@ -14,7 +14,7 @@
 // apart by name.
 //
 // Usage: nvt-game [--mb N] [--chunk-mb N] [--read-mb N] [--fps N] [--idle]
-//                 [--verify-s S] [--duration S] [--floor-mb N]
+//                 [--verify-s S] [--duration S] [--floor-mb N] [--wait-s S]
 //   --mb N        memory to hold (default 1024); allocation stops early, with
 //                 a note, when the driver refuses or free vidmem would fall
 //                 under --floor-mb (default 256; 0: no floor, until the driver
@@ -27,6 +27,10 @@
 //                 checked every --verify-s seconds and on SIGUSR1
 //   --verify-s S  full check every S seconds (default 0 = only at the end)
 //   --duration S  stop after S seconds (default 0 = until SIGINT/SIGTERM)
+//   --wait-s S    sit idle S seconds after the device is made, then allocate
+//                 (an app idle for a while that then asks for memory: the
+//                 driver creates a hidden idle one's buffers in sysmem when
+//                 vidmem says no)
 //   --gfx         frames are graphics work: a full-screen draw whose fragment
 //                 shader does the checking (and --write), into a 1024x1024
 //                 colour attachment; graphics is preempted more coarsely than
@@ -263,7 +267,7 @@ static int cmp_double(const void *a, const void *b)
 int main(int argc, char **argv)
 {
     unsigned long mb = 1024, chunk_mb = 128, read_mb = 0, floor_mb = 256;
-    double fps_cap = 0, verify_s = 0, duration = 0;
+    double fps_cap = 0, verify_s = 0, duration = 0, wait_s = 0;
     int idle = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -290,6 +294,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--fps")) fps_cap = atof(v);
         else if (!strcmp(a, "--verify-s")) verify_s = atof(v);
         else if (!strcmp(a, "--duration")) duration = atof(v);
+        else if (!strcmp(a, "--wait-s")) wait_s = atof(v);
         else if (!strcmp(a, "--floor-mb")) floor_mb = strtoul(v, NULL, 0);
         else goto usage;
         i++;
@@ -498,6 +503,9 @@ int main(int argc, char **argv)
     VkDescriptorPool dpool;
     check(vkCreateDescriptorPool(dev, &dpci, NULL, &dpool), "vkCreateDescriptorPool");
 
+    if (wait_s > 0)
+        usleep((useconds_t)(wait_s * 1e6));
+
     unsigned long allocated_mb = 0;
     const char *stop_reason = "complete";
     for (unsigned c = 0; c < want_chunks; c++) {
@@ -668,6 +676,6 @@ int main(int argc, char **argv)
 
 usage:
     fprintf(stderr, "usage: %s [--mb N] [--chunk-mb N] [--read-mb N] [--fps N] [--idle] [--gfx] [--write] [--verify-s S] "
-                    "[--duration S] [--floor-mb N]\n", argv[0]);
+                    "[--duration S] [--floor-mb N] [--wait-s S]\n", argv[0]);
     return 2;
 }

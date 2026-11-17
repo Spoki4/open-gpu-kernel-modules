@@ -23,6 +23,7 @@
 #   fgown        fgown-test.sh       the focused app gets memory nobody can make room for (#7)
 #   bounce       bounce-test.sh      an app covered by the focused window gives its headroom and stays out
 #   headroom     headroom-test.sh    a focused game's headroom comes in pieces with pauses between them
+#   born         born-test.sh        a hidden app's buffers created in sysmem: no regmap.c assertion
 #   nvtest       vmtest.sh all       the whole bench (15 scenarios; S, #5-#13, R)
 #   desktop      the guest's Plasma session under fragchurn with moves: compaction and
 #                windows now also move buffers the compositor maps (evict.sh
@@ -163,6 +164,7 @@ stage sides 180 600 'SIDESTEST PASS' "./sides-test.sh 90"
 stage fgown 180 600 'FGOWNTEST PASS' "./fgown-test.sh"
 stage bounce 180 600 'BOUNCETEST PASS' "./bounce-test.sh"
 stage headroom 120 300 'HEADROOMTEST PASS' "./headroom-test.sh"
+stage born 120 300 'BORNTEST PASS' "./born-test.sh"
 if (( here )); then
     # Scenario by scenario: one that fails does not take the rest with it.
     for sc in active "chrome 5 anim" "chrome 3 idle" "webgpu 5" occlusion "switch 5" "fgprio 3 idle" "fgprio 2 anim" \

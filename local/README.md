@@ -330,6 +330,7 @@ cd local/tests
 ./sides-test.sh [90]           # next to a game the others' memory is placed at the other end of vidmem: compaction does not move the game
 ./bounce-test.sh               # an app covered by the window just focused gives its headroom and stays out (no out-back-out)
 ./headroom-test.sh             # a focused game's headroom comes in pieces with pauses between them
+./born-test.sh                 # a hidden app's buffers created in sysmem: no regmap.c assertion
 ./fragchurn.sh                 # fragments vidmem like a long session
 ./momc-probe.sh                # a probe: do the GPU's access counters report accesses to vidmem?
 ../watchdog.sh --stall 300 -- CMD   # any long run: WATCHDOG STALL/TIMEOUT instead of waiting forever
