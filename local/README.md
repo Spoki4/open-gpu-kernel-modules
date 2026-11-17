@@ -481,6 +481,15 @@ memory last; it had failed 1-2 runs in 5 before), fgown, bounce. A focused
 app next to a visible game moved the game's blocks inside vidmem only (one
 move of 256 MB, 37 ms, the game's content verified).
 
+The final iteration on a rented RTX 3060 again (2026-11-17), with the
+recording 20261116_184241 as its data: every `fulltest.sh` stage that needs
+no desktop passes, the new ones included (headroom, born, scrubwait). Old
+against new driver: remaking two 130 MB buffers in Chrome's order took
+13.8 ms per creation (p50; p99 18.2) and takes 4.1 (4.4); a focused game's
+headroom came in 47 pieces 0.1 ms apart and comes 31 ms apart (median). The
+rule for a game hidden a moment ago ran in the simulator only (the
+recording replayed: the game no longer moved out).
+
 A screenshot next to the game (host, 2026-11-15 19:03): the picker covered
 both monitors for 2.5 s, Chrome gave 572 MB for its headroom and, shown
 again, drew from sysmem for 45 s with the game at 2-7 frames a second.
