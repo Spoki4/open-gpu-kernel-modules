@@ -171,6 +171,7 @@ static NvU32 _vidmemUserReserveMB = NV_U32_MAX; // NV_U32_MAX: registry not read
 // Local patch: for mem_mgr/vidmem_evict.c
 NvBool vidmemIsReserveExemptName(const char *name);
 NvBool vidmemUserReserveBoundRangeAny(PMA *pPma, NvU64 pageSize, NvU64 *pBegin, NvU64 *pEnd);
+NvBool vidmemWholeRange(PMA *pPma, NvU64 align, NvU64 *pBegin, NvU64 *pEnd);
 void vidmemEvictAutoInit(OBJGPU *pGpu, NvU32 reserveMB);
 void vidmemMapInit(OBJGPU *pGpu);
 void vidmemEvictNoteBlock(PMA *pPma);
@@ -268,6 +269,39 @@ NvBool
 vidmemUserReserveBoundRangeAny(PMA *pPma, NvU64 pageSize, NvU64 *pBegin, NvU64 *pEnd)
 {
     return (pPma != NULL) && _vidmemReserveBoundRange(pPma, pageSize, pBegin, pEnd);
+}
+
+//
+// All of vidmem as an explicit PMA range (the reserve block included), from
+// the lowest region's base rounded up to the alignment, not from 0: PMA makes
+// a range relative to each region, a start below the region becomes its
+// base, and the base is not 2 MB aligned (GA102: 0x5200000), so regmap.c
+// asserts on every 2 MB-page allocation (host, recording 20261116_184241,
+// 20:20:13: ghostty's buffers born in sysmem; the move path had the same,
+// 2026-11-10). NV_FALSE: no region (the caller's range stays as it was).
+//
+NvBool
+vidmemWholeRange(PMA *pPma, NvU64 align, NvU64 *pBegin, NvU64 *pEnd)
+{
+    NvU64 base = NV_U64_MAX, limit = 0;
+    NvU32 i;
+
+    if ((pPma == NULL) || (align == 0))
+        return NV_FALSE;
+    for (i = 0; i < pPma->regSize; i++)
+    {
+        PMA_REGION_DESCRIPTOR *pDesc = pPma->pRegDescriptors[i];
+
+        if ((pDesc == NULL) || pDesc->bProtected)
+            continue;
+        base  = NV_MIN(base, pDesc->base);
+        limit = NV_MAX(limit, pDesc->limit);
+    }
+    if ((base == NV_U64_MAX) || (NV_ALIGN_DOWN64(limit + 1, align) <= NV_ALIGN_UP64(base, align)))
+        return NV_FALSE;
+    *pBegin = NV_ALIGN_UP64(base, align);
+    *pEnd   = NV_ALIGN_DOWN64(limit + 1, align) - 1;
+    return NV_TRUE;
 }
 
 //
@@ -898,13 +932,10 @@ _vidmemPmaAllocate
     // reserve block included. An explicit whole range, so pmaAllocatePages()
     // does not add the above-the-block one.
     //
-    if (bAnywhere && !(allocOptions.flags & PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE))
+    if (bAnywhere && !(allocOptions.flags & PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE) &&
+        vidmemWholeRange(pPma, NV_MAX(sizeAlign, pageSize), &allocOptions.physBegin, &allocOptions.physEnd))
     {
-        NvU64 align = NV_MAX(sizeAlign, pageSize);
-
-        allocOptions.flags    |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
-        allocOptions.physBegin = 0;
-        allocOptions.physEnd   = NV_ALIGN_DOWN64(NV_U64_MAX, align) - 1;
+        allocOptions.flags |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
     }
 
     // Skip scrubber, used only by scrubber construction path

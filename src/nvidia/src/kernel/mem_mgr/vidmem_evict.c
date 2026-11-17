@@ -160,6 +160,7 @@ typedef struct
 #define VIDMEM_EVICT_COMPOSITOR "kwin_wayland"
 
 NvBool vidmemUserReserveBoundRangeAny(PMA *pPma, NvU64 pageSize, NvU64 *pBegin, NvU64 *pEnd); // video_mem.c
+NvBool vidmemWholeRange(PMA *pPma, NvU64 align, NvU64 *pBegin, NvU64 *pEnd);                  // video_mem.c
 
 // Totals for the log and the procfs summary.
 NvU64 _vidmemEvictBytes;               // also read by the policy
@@ -1928,12 +1929,13 @@ _vidmemRestoreBegin(OBJGPU *pGpu, MEMORY_DESCRIPTOR *pMemDesc, VIDMEM_EVICT_MAPR
         // RM itself needs the vidmem pages now (scanout, CPU mapping): a
         // failure would fail the client's call. Use the reserve block too
         // (an explicit whole range, so pmaAllocatePages() does not add the
-        // above-the-block one).
+        // above-the-block one; from the region's base, vidmemWholeRange()).
         //
-        allocOptions.flags    |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
-        allocOptions.physBegin = 0;
-        allocOptions.physEnd   = NV_ALIGN_DOWN64(NV_U64_MAX, allocOptions.alignment) - 1;
-        status = pmaAllocatePages(pPma, pPmaInfo->pageCount, pPmaInfo->pageSize, &allocOptions, pPages);
+        if (vidmemWholeRange(pPma, allocOptions.alignment, &allocOptions.physBegin, &allocOptions.physEnd))
+        {
+            allocOptions.flags |= PMA_ALLOCATE_SPECIFY_ADDRESS_RANGE;
+            status = pmaAllocatePages(pPma, pPmaInfo->pageCount, pPmaInfo->pageSize, &allocOptions, pPages);
+        }
     }
     if (status != NV_OK)
     {
