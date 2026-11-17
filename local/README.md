@@ -45,7 +45,8 @@ These patches do the same inside the driver.
 - **Keeps out of the way of a game in focus.** The driver's work for others
   holds the RM locks the game's own calls wait for, so while a game is in
   focus it goes in pieces of about 4 ms of copying or waits: the headroom is
-  refilled in small pieces, others' memory comes back after the game (except
+  refilled in small pieces with a pause of twice a piece (16-50 ms) between
+  them, so the game's calls get in, others' memory comes back after the game (except
   a shown window drawing from sysmem in earnest), compaction gathers only
   room for a buffer that was asked for, a fruitless make-room for a window
   not in focus is not retried for 5 s. A fullscreen window is a game when its
@@ -328,6 +329,7 @@ cd local/tests
 ./fgown-test.sh                # the focused app gets an allocation nobody can make room for
 ./sides-test.sh [90]           # next to a game the others' memory is placed at the other end of vidmem: compaction does not move the game
 ./bounce-test.sh               # an app covered by the window just focused gives its headroom and stays out (no out-back-out)
+./headroom-test.sh             # a focused game's headroom comes in pieces with pauses between them
 ./fragchurn.sh                 # fragments vidmem like a long session
 ./momc-probe.sh                # a probe: do the GPU's access counters report accesses to vidmem?
 ../watchdog.sh --stall 300 -- CMD   # any long run: WATCHDOG STALL/TIMEOUT instead of waiting forever

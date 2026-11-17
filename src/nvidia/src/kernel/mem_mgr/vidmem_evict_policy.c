@@ -2177,6 +2177,13 @@ vepHeadroomRequest(NvU32 pid)
     return bQueue;
 }
 
+// The refill dropped (its timer cancelled at unload or suspend): the next request queues one again.
+void
+vepHeadroomReset(void)
+{
+    _vidmemHeadroomPid = 0;
+}
+
 // One piece of the refill. API lock RW, GPU lock held. NV_TRUE: run again.
 NvBool
 vepHeadroomRun(OBJGPU *pGpu)
@@ -2222,6 +2229,28 @@ vepHeadroomRun(OBJGPU *pGpu)
     if (!bMore)
         _vidmemHeadroomPid = 0;
     return bMore;
+}
+
+//
+// The pause before the next piece of the refill, ms (0: at once). Back to
+// back, the pieces left a game in focus no way in: the work item took the API
+// lock again before the threads waiting for it ran, and the game's RM calls
+// waited for two or three pieces at once (host, recording 20261116_184241,
+// 19:20:23: eleven pieces of Chrome, 6-12 ms each, in 100 ms; WoW waited
+// 21-38 ms, 4 of the session's 22 long frames caused by the driver). A pause
+// of twice the piece leaves the game two thirds of the time, at least one
+// frame at 60 Hz, at most 50 ms (the 750 MB of that refill in about 0.5 s).
+// Another window in focus has no frames to keep: at once, as before.
+//
+#define VIDMEM_EVICT_HEADROOM_GAP_MIN_MS 16
+#define VIDMEM_EVICT_HEADROOM_GAP_MAX_MS 50
+
+NvU64
+vepHeadroomGapMs(NvU64 pieceMs)
+{
+    if (!_vidmemFgIsGame)
+        return 0;
+    return NV_MIN(NV_MAX(2 * pieceMs, (NvU64)VIDMEM_EVICT_HEADROOM_GAP_MIN_MS), (NvU64)VIDMEM_EVICT_HEADROOM_GAP_MAX_MS);
 }
 
 //

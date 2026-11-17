@@ -1588,7 +1588,11 @@ static void advance(double toS)
 #ifdef VEP_HAS_HEADROOM_RUN
             ctxBegin(NULL, "headroom");
             if (vepHeadroomRun(NULL))
+#ifdef VEP_HAS_HEADROOM_GAP
+                gHeadroomAtS = gNowS + 0.005 + vepHeadroomGapMs(0) / 1000.0;
+#else
                 gHeadroomAtS = gNowS + 0.005;
+#endif
             ctxEnd();
 #endif
             continue;
