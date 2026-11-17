@@ -61,7 +61,12 @@ These patches do the same inside the driver.
   while a game is in focus). Both choose their window by what it costs to
   move, an allocation with a corner in it counted with all of it, and a
   game's memory moves for compaction only when no window without it
-  lengthens the run (its blocks are then the only walls). The run it
+  lengthens the run (its blocks are then the only walls). A window for a
+  contiguous request is chosen only if what in it may only move (a visible
+  game's blocks, the requester's own memory) finds room outside it, that
+  memory is moved first, and an allocation whose move found no room is left
+  alone for 10 s (windows were given up halfway, and one was chosen again
+  every second). The run it
   gathers: three quarters of the free memory, 1 GB at least; while a game is
   in focus only room for the biggest contiguous buffer asked for in the last
   half hour, and nothing when nobody asked (the rest is gathered once the

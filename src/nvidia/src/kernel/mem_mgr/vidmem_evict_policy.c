@@ -1101,6 +1101,14 @@ vepContigGive(VIDMEM_EVICT_PROC *p, NvU32 forPid, NvU32 level, NvBool bMayMove, 
     return bMayMove ? VEP_GIVE_MOVE : VEP_GIVE_NONE;
 }
 
+// Does the requester pay for its window with its own memory that is not contiguous (vepContigMakeSpace())?
+NvBool
+vepContigOwnPays(NvU32 forPid)
+{
+    return (forPid != 0) && _vidmemFgOwnEnabled && !_vidmemFgIsGame &&
+           (VE_HINT_STATE(_vidmemHint(forPid, NULL)) == VE_HINT_FG);
+}
+
 NvU64
 vepContigMakeSpace(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 wantMB, NvU32 forPid, NvU32 level)
 {
@@ -1124,8 +1132,7 @@ vepContigMakeSpace(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 count, NvU64 w
     // the game's (2026-11-16). Its contiguous buffers stay: each would want a
     // window of its own to come back (problem #15).
     //
-    if ((avail < wantMB) && (forPid != 0) && _vidmemFgOwnEnabled && !_vidmemFgIsGame &&
-        (VE_HINT_STATE(_vidmemHint(forPid, NULL)) == VE_HINT_FG))
+    if ((avail < wantMB) && vepContigOwnPays(forPid))
     {
         for (k = 0; k < count; k++)
         {
@@ -1605,9 +1612,50 @@ vepCompactWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, NvU64 ch
 // 130 MB on the host (2026-11-15 22:18) windows over the edge of WoW's 256 MB
 // blocks moved all 256 MB of each. Charged like a compaction window now.
 //
+// And only a window whose memory that may not leave vidmem finds room outside
+// it (pRoom): the cheapest one was chosen whether or not, and cleared as far
+// as it went (host, recording 20261116_184241: 17 of 53 windows for Chrome's
+// buffers next to WoW were not cleared, after 424 MB of the game had been
+// moved for them; one window, a corner of a 256 MB block of WoW with no room
+// for it, was chosen again every second for 15 s).
+//
+//
+// Room outside the window [lo, lo + need) for what in it may only move inside
+// vidmem. Each such allocation moves whole, and its frames outside the window
+// come free once it has moved: what is used up is its part inside the window,
+// while the copy wants room for all of it at once. So the parts inside, and
+// the biggest of those allocations, must each fit in the free chunks outside
+// plus what others may give.
+//
+static NvBool
+_vepContigRoomOk(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, const VEP_CONTIG_ROOM *pRoom,
+                 NvU64 lo, NvU64 need)
+{
+    NvU64 in = 0, freeIn = 0, biggest = 0, room, c;
+
+    if (pRoom == NULL)
+        return NV_TRUE;
+    for (c = lo; c < lo + need; c++)
+    {
+        in     += pRoom->pStayIn[c];
+        freeIn += (pCost[c] == 0);
+        if ((pOwners != NULL) && (pOwners->pOwner[c] != 0))
+            biggest = NV_MAX(biggest, (NvU64)pRoom->pStayWhole[pOwners->pOwner[c]]);
+    }
+    room = (pRoom->freeChunks - NV_MIN(pRoom->freeChunks, freeIn)) * pRoom->chunkFrames + pRoom->giveFrames;
+    return (in <= room) && (biggest <= room);
+}
+
 NvU64
 vepContigWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, NvU64 chunks, NvU64 need,
                 NvU64 alignChunks, NvU64 startOff, NvU64 *pStart)
+{
+    return vepContigWindowRoom(pCost, pOwners, NULL, chunks, need, alignChunks, startOff, pStart);
+}
+
+NvU64
+vepContigWindowRoom(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, const VEP_CONTIG_ROOM *pRoom,
+                    NvU64 chunks, NvU64 need, NvU64 alignChunks, NvU64 startOff, NvU64 *pStart)
 {
     NvU64 best = NV_U64_MAX, sum = 0, drag = 0, fixed = 0, c;
 
@@ -1648,7 +1696,7 @@ vepContigWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, NvU64 chu
             }
         }
         if ((c + 1 >= need) && (fixed == 0) && (((c + 1 - need) + startOff) % alignChunks == 0) &&
-            (sum + drag < best))
+            (sum + drag < best) && _vepContigRoomOk(pCost, pOwners, pRoom, c + 1 - need, need))
         {
             best    = sum + drag;
             *pStart = c + 1 - need;
