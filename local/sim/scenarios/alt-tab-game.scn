@@ -1,0 +1,63 @@
+# Alt-tab from a game through a second window (host, recording
+# 20261116_184241, 19:20:04-19:20:14): WoW in focus, Spotify visible on the
+# other monitor with part of its memory in sysmem; the player switches to a
+# terminal and on to Chrome. WoW, hidden, was no longer the previous focus,
+# and 702 MB of it went to sysmem (70 ms) to bring back 146 MB of Spotify,
+# "visible again"; 9 s later the player was back and the game came back
+# (43 ms). Wanted: a game focused less than 30 s ago gives nothing for
+# others' restores or the headroom; it gives when the focused window itself
+# allocates.
+cap 6000
+set fg_headroom 1500         # the focused window's headroom: hidden apps give for it
+set compact 0
+proc 1614 kwin_wayland old
+proc 3403 spotify old
+proc 2210 ghostty old
+proc 2837 chrome old
+proc 11571 Wow.exe old
+
+act 1614 0 4
+alloc 1614 250 n=5 fixed
+alloc 2210 100
+alloc 2837 100
+alloc 3403 700
+hint 1614 v
+hint 2210 h
+hint 2837 h
+hint 3403 h
+hint 11571 f full
+act 11571 0 30
+act 3403 60 0
+act 2210 60 0
+act 2837 60 0
+alloc 11571 4000 n=16
+at 10
+mark the game took what it needed: Spotify, hidden then, partly in sysmem
+alloc 11571 600 n=4
+at 12
+expect sys 3403 > 0
+expect sys 11571 == 0
+
+mark alt-tab: a terminal, then Chrome; Spotify visible again
+hint 11571 h
+act 11571 60 0               # a game hidden stops drawing
+hint 2210 f
+step
+at 15
+hint 2210 h
+hint 2837 f
+hint 3403 v
+act 3403 0 10
+step
+at 20
+alloc 2837 40                # Chrome, focused 5 s, allocates: its headroom is refilled
+at 24
+expect moved_out 11571 == 0      # the game left 12 s ago gave nothing for others
+
+mark the player is back
+hint 2837 h
+hint 11571 f full
+act 11571 0 30
+step
+at 27
+expect sys 11571 == 0

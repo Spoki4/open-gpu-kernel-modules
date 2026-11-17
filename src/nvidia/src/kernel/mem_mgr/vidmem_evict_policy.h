@@ -127,6 +127,7 @@ typedef struct
     NvU64 submitSig;      // signature of its channels' GP_PUT at the last check
     NvU64 lastSubmitNs;   // monotonic ns when that signature last changed (work submitted)
     NvU64 lastFgNs;       // monotonic ns when a hint last said foreground
+    NvU64 lastGameShownNs; // monotonic ns when it was last a game in focus or visible (R4; VIDMEM_EVICT_GAME_DWELL_SEC)
     NvU64 drawingSinceNs; // monotonic ns since when it has drawn at every policy step (0: not drawing)
     NvU64 lastStuckLogNs; // monotonic ns of the last "foreground, only N MB free" line
     NvU64 fgSinceNs;      // monotonic ns since when a hint says foreground without a break (0: not)
