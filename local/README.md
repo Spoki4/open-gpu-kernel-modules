@@ -25,7 +25,9 @@ These patches do the same inside the driver.
   KWin script (`kwin-vram-hints/`) tells the driver which processes have the
   window in focus, a visible window, or only hidden ones. The order is: focus
   > the window focused before it > visible > hidden; a fullscreen window that
-  keeps the GPU busy is a game. Without the script's hints the policy stays
+  keeps the GPU busy is a game, and a game hidden less than 30 s ago is kept
+  like the window focused before (an alt-tab through two windows no longer
+  sends it to sysmem for others). Without the script's hints the policy stays
   off (`evict.sh auto on` runs it on GPU activity alone).
 - **Makes room inside an allocation**: when a visible process (or the
   compositor, or a new GPU context) finds no memory, hidden processes are

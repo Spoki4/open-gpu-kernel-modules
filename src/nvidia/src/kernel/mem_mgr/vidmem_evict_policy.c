@@ -344,6 +344,8 @@ _vidmemEvictIsNeverName(const char *name)
 // activity records follow them. API lock RW, GPU lock held. Returns the
 // number of entries filled.
 //
+static NvBool _vidmemEvictIsGame(VIDMEM_EVICT_PROC *p);
+
 NvU32
 _vidmemEvictGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
 {
@@ -357,7 +359,11 @@ _vidmemEvictGatherProcs(OBJGPU *pGpu, VIDMEM_EVICT_PROC *pProcs, NvU32 maxProcs)
         pAct->vidmemAtNs  = osGetMonotonicTimeNs();
         pProcs[k].hint    = _vidmemHint(pProcs[k].pid, NULL);
         if (VE_HINT_STATE(pProcs[k].hint) >= VE_HINT_VISIBLE)
+        {
             pAct->lastVisibleNs = pAct->vidmemAtNs;
+            if (_vidmemEvictIsGame(&pProcs[k]))
+                pAct->lastGameShownNs = pAct->vidmemAtNs;
+        }
         if (VE_HINT_STATE(pProcs[k].hint) == VE_HINT_FG)
         {
             pAct->lastFgNs = pAct->vidmemAtNs;
@@ -571,7 +577,21 @@ typedef struct
     NvBool bProtected;      // _vidmemEvictIsProtected(): the game of the samples, >= 1 GB, new, just restored
     NvBool bDrawsHidden;    // hidden and drawing since it was hidden (not only right before)
     NvBool bInheritGrace;   // hidden by an ancestor of another name, in its first minutes (a game loading)
+    NvBool bGameDwell;      // a game the user saw a moment ago, hidden now (VIDMEM_EVICT_GAME_DWELL_SEC)
 } VE_CLASS;
+
+//
+// A game hidden a moment ago is kept like the previous focus: WoW, on the
+// screen while the player worked in other windows, was covered by Chrome,
+// and one second later 702 MB of it went to sysmem (70 ms) to bring back
+// 146 MB of a visible Spotify, which Chrome's headroom took again half a
+// second later; 9 s on the player was back and so was the game (43 ms; host,
+// recording 20261116_184241, 19:20:04-19:20:14). A hidden window says no
+// more "fullscreen", so the time is kept from when it was last a game in
+// focus or visible. What the focused window allocates or brings back of its
+// own may still take its memory.
+//
+#define VIDMEM_EVICT_GAME_DWELL_SEC 30
 
 static void
 _veClassify(VIDMEM_EVICT_PROC *p, NvU64 nowNs, VE_CLASS *c)
@@ -596,6 +616,8 @@ _veClassify(VIDMEM_EVICT_PROC *p, NvU64 nowNs, VE_CLASS *c)
                        ((VE_AGO_NS(nowNs, pAct->hiddenSinceNs)) / 1000000000ULL > (NvU64)c->idleSec + 1);
     c->bInheritGrace = (p->hint & VE_HINT_OTHER_APP) &&
                        (VE_AGO_NS(nowNs, pAct->firstSeenNs) < VIDMEM_EVICT_INHERIT_GRACE_SEC * 1000000000ULL);
+    c->bGameDwell    = (st == VE_HINT_HIDDEN) && (pAct->lastGameShownNs != 0) &&
+                       (VE_AGO_NS(nowNs, pAct->lastGameShownNs) < VIDMEM_EVICT_GAME_DWELL_SEC * 1000000000ULL);
 }
 
 //
@@ -608,6 +630,7 @@ _veClassify(VIDMEM_EVICT_PROC *p, NvU64 nowNs, VE_CLASS *c)
 //   desktop          -           -            -            -            -
 //   focus            -           -            -            -            yes (last)
 //   previous focus   -           -            as its window             yes
+//     hidden, a game the user saw < 30 s ago: as the previous focus
 //   just restored    -           -            -            -            yes
 //   visible          -           idle 10 s    yes          yes          yes
 //     a game, for a focus that is not one: - at FG_RESTORE/FG_ALLOC (R5 over R2)
@@ -629,7 +652,7 @@ _veGives(const VE_CLASS *c, NvU32 level)
     // The previous foreground stays for the background and for the
     // foreground's headroom and pressure; it gives what the foreground needs
     // right now or to come back (FG_ALLOC, FG_RESTORE), and to the compositor.
-    if (((level == VE_LEVEL_HIDDEN) || (level == VE_LEVEL_FG_IDLE)) && c->bPrevFocus)
+    if (((level == VE_LEVEL_HIDDEN) || (level == VE_LEVEL_FG_IDLE)) && (c->bPrevFocus || c->bGameDwell))
         return NV_FALSE;
     if (c->bJustRestored)
         return NV_FALSE;
