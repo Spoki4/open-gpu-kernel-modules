@@ -1775,6 +1775,19 @@ _vidmemEvictBegin
     memdescSetPageSize(pSys, AT_GPU, chunk);
     memdescSetPteKind(pSys, _vidmemEvictUncompressedKind(pGpu, pMemoryManager, kind));
     memdescSetCpuCacheSnoop(pSys, MEMDESC_CACHE_SNOOP_ENABLE);
+    //
+    // The copy keeps the original's protection. The mappings move to
+    // sub-descriptors of pSys, and since 620.73.04 RM refuses to write for the
+    // device (notifiers, semaphores, context DMAs) into memory whose
+    // descriptor chain says read-only (memdescIsReadOnlyForDevice()); without
+    // the flags an evicted read-only buffer would have been writable there.
+    // The GMMU also maps a device-read-only descriptor read-only only, as the
+    // original mappings are.
+    //
+    if (memdescGetFlag(pMemDesc, MEMDESC_FLAGS_DEVICE_READ_ONLY))
+        memdescSetFlag(pSys, MEMDESC_FLAGS_DEVICE_READ_ONLY, NV_TRUE);
+    if (memdescGetFlag(pMemDesc, MEMDESC_FLAGS_USER_READ_ONLY))
+        memdescSetFlag(pSys, MEMDESC_FLAGS_USER_READ_ONLY, NV_TRUE);
 
     VE_PHASE_SKIP();
     memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_141, pSys);
