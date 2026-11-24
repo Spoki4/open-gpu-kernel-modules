@@ -9,6 +9,8 @@ sudo apt-get install -y -q build-essential linux-headers-$(uname -r) pkg-config 
 cd ~/open-gpu-kernel-modules
 make modules -j4 >~/build.log 2>&1 || { tail -30 ~/build.log; echo SETUP FAIL build; exit 1; }
 ls -la kernel-open/*.ko
-cd ~ && curl -fsSLO https://us.download.nvidia.com/XFree86/Linux-x86_64/620.70.06/NVIDIA-Linux-x86_64-620.70.06.run || { echo SETUP FAIL download; exit 1; }
-ls -la NVIDIA-Linux-x86_64-620.70.06.run
+# The userspace of the release the tree is (version.mk).
+v=$(sed -n 's/^NVIDIA_VERSION = //p' version.mk)
+cd ~ && curl -fsSLO "https://us.download.nvidia.com/XFree86/Linux-x86_64/$v/NVIDIA-Linux-x86_64-$v.run" || { echo SETUP FAIL download; exit 1; }
+ls -la "NVIDIA-Linux-x86_64-$v.run"
 echo SETUP DONE
