@@ -25,6 +25,8 @@
 #   headroom     headroom-test.sh    a focused game's headroom comes in pieces with pauses between them
 #   born         born-test.sh        a hidden app's buffers created in sysmem: no regmap.c assertion
 #   scrubwait    scrubwait-test.sh   a contiguous buffer remade after two were freed waits for one scrub, not two
+#   hintsoff     hintsoff-test.sh    with the window hints gone, what the policy moved out comes back
+#   suspend      suspend-test.sh     memory in sysmem survives a suspend and resume of the driver
 #   nvtest       vmtest.sh all       the whole bench (15 scenarios; S, #5-#13, R)
 #   desktop      the guest's Plasma session under fragchurn with moves: compaction and
 #                windows now also move buffers the compositor maps (evict.sh
@@ -167,6 +169,8 @@ stage bounce 180 600 'BOUNCETEST PASS' "./bounce-test.sh"
 stage headroom 120 300 'HEADROOMTEST PASS' "./headroom-test.sh"
 stage born 120 300 'BORNTEST PASS' "./born-test.sh"
 stage scrubwait 120 300 'SCRUBWAITTEST PASS' "./scrubwait-test.sh"
+stage hintsoff 120 300 'HINTSOFFTEST PASS' "./hintsoff-test.sh"
+stage suspend 120 300 'SUSPENDTEST PASS' "./suspend-test.sh"
 if (( here )); then
     # Scenario by scenario: one that fails does not take the rest with it.
     for sc in active "chrome 5 anim" "chrome 3 idle" "webgpu 5" occlusion "switch 5" "fgprio 3 idle" "fgprio 2 anim" \

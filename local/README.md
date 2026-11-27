@@ -28,7 +28,10 @@ These patches do the same inside the driver.
   keeps the GPU busy is a game, and a game hidden less than 30 s ago is kept
   like the window focused before (an alt-tab through two windows no longer
   sends it to sysmem for others). Without the script's hints the policy stays
-  off (`evict.sh auto on` runs it on GPU activity alone).
+  off (`evict.sh auto on` runs it on GPU activity alone), and what it had
+  moved out comes back as room allows. `HINTS.md`: the protocol for a hint
+  writer on another desktop, and which compositors and shells the driver
+  already knows by name.
 - **Makes room inside an allocation**: when a visible process (or the
   compositor, or a new GPU context) finds no memory, hidden processes are
   moved out first and the allocation is retried instead of failing. A
@@ -39,8 +42,8 @@ These patches do the same inside the driver.
   what it needed from the game).
 - **Brings memory back** when its window is shown again and there is room,
   the focused window first; nothing returns to others while the focus still
-  has memory in sysmem. The focus keeps a headroom free (2 GB) and the others
-  wait for it, except a shown window that takes a good share of the GPU from
+  has memory in sysmem. The focus keeps a headroom free (2 GB on a 12 GB
+  card, the same share of any other) and the others wait for it, except a shown window that takes a good share of the GPU from
   sysmem: that one slows the focus more than a short headroom does and comes
   back after one policy step. An app's headroom waits until it has been in
   focus for 3 s (a screenshot's region picker got none); a game's does not.
@@ -342,6 +345,8 @@ cd local/tests
 ./headroom-test.sh             # a focused game's headroom comes in pieces with pauses between them
 ./born-test.sh                 # a hidden app's buffers created in sysmem: no regmap.c assertion
 ./scrubwait-test.sh            # a contiguous buffer remade after two were freed waits for one scrub, not two
+./hintsoff-test.sh             # with the window hints gone, what the policy moved out comes back
+./suspend-test.sh [hibernate]  # memory in sysmem survives a suspend and resume of the driver (idea I11)
 ./fragchurn.sh                 # fragments vidmem like a long session
 ./momc-probe.sh                # a probe: do the GPU's access counters report accesses to vidmem?
 ../watchdog.sh --stall 300 -- CMD   # any long run: WATCHDOG STALL/TIMEOUT instead of waiting forever

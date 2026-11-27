@@ -155,10 +155,6 @@ typedef struct
     NvBool                bCompositor;  // the holder belongs to the compositor
 } VIDMEM_EVICT_MAPREF;
 
-// The only other process an evicted buffer may be shared with: it reads
-// window buffers and never writes them.
-#define VIDMEM_EVICT_COMPOSITOR "kwin_wayland"
-
 NvBool vidmemUserReserveBoundRangeAny(PMA *pPma, NvU64 pageSize, NvU64 *pBegin, NvU64 *pEnd); // video_mem.c
 NvBool vidmemWholeRange(PMA *pPma, NvU64 align, NvU64 *pBegin, NvU64 *pEnd);                  // video_mem.c
 
@@ -607,7 +603,11 @@ _vidmemEvictUncompressedKind(OBJGPU *pGpu, MemoryManager *pMemoryManager, NvU32 
 static NvBool
 _vidmemEvictIsCompositor(RmClient *pRmClient)
 {
-    return portStringCompare(pRmClient->name, VIDMEM_EVICT_COMPOSITOR, NV_PROC_NAME_MAX_LENGTH) == 0;
+    NvBool bReader = NV_FALSE;
+
+    // The only other process an evicted buffer may be shared with: the
+    // compositor, which reads window buffers and never writes them.
+    return vepIsCompositorName(pRmClient->name, &bReader) && bReader;
 }
 
 //
@@ -3471,11 +3471,12 @@ _vidmemHotPoll(OBJGPU *pGpu)
 //     process and never the desktop itself (_vidmemEvictNeverNames); repeated
 //     every tick, so what a background app allocates later goes too;
 //   - otherwise restore: a recently active process as soon as it fits above
-//     lowMB + VIDMEM_EVICT_HYST_MB, the others once there was no pressure for
+//     lowMB + the hysteresis (_vidmemHystMB), the others once there was no pressure for
 //     VIDMEM_EVICT_QUIET_SEC and highMB stays free after the restore; one
 //     process per tick.
 // Registry (NVreg_RegistryDwords): RmVidmemAutoEvict (default 1 when the user
-// reserve is on), RmVidmemEvictLowMB (1024), RmVidmemEvictHighMB (2560).
+// reserve is on), RmVidmemEvictLowMB (1024), RmVidmemEvictHighMB (2560): the
+// values for a 12 GB card, other sizes in proportion (vepScaleToCard()).
 // Runtime: "auto 0|1" to the vidmem_evict procfs file.
 // ---------------------------------------------------------------------------
 
@@ -4977,8 +4978,7 @@ _vidmemCompactVictim(VIDMEM_EVICT_PROC *p, NvBool bFgToo)
         return NV_FALSE;
     if ((VE_HINT_STATE(p->hint) == VE_HINT_FG) && !(bFgToo && _vidmemCompactFg))
         return NV_FALSE;
-    return (portStringCompare(p->name, VIDMEM_EVICT_COMPOSITOR, NV_PROC_NAME_MAX_LENGTH) != 0) &&
-           (portStringCompare(p->name, "Xwayland", NV_PROC_NAME_MAX_LENGTH) != 0);
+    return !vepIsCompositorName(p->name, NULL);
 }
 
 //
@@ -5789,6 +5789,7 @@ vidmemEvictAutoInit(OBJGPU *pGpu, NvU32 reserveMB)
     // 0 off, 1 also without hints, 2 hints only.
     //
     _vidmemAutoEnabled = VIDMEM_AUTO_HINTS;
+    vepScaleToCard(GPU_GET_MEMORY_MANAGER(pGpu)->Ram.fbTotalMemSizeMb);
     if ((osReadRegistryDword(pGpu, "RmVidmemAutoEvict", &data32) == NV_OK) && (data32 <= 2))
         _vidmemAutoEnabled = data32;
     if ((osReadRegistryDword(pGpu, "RmVidmemEvictLowMB", &data32) == NV_OK) && (data32 != 0))
@@ -5799,15 +5800,17 @@ vidmemEvictAutoInit(OBJGPU *pGpu, NvU32 reserveMB)
         _vidmemFgHeadroomMB = data32;
     if (osReadRegistryDword(pGpu, "RmVidmemBgCushionMB", &data32) == NV_OK)
         _vidmemBgCushionMB = data32;
-    if (_vidmemHighMB <= _vidmemLowMB + VIDMEM_EVICT_HYST_MB)
-        _vidmemHighMB = _vidmemLowMB + 2 * VIDMEM_EVICT_HYST_MB;
+    if (_vidmemHighMB <= _vidmemLowMB + _vidmemHystMB)
+        _vidmemHighMB = _vidmemLowMB + 2 * _vidmemHystMB;
 
     // Sampling also feeds "status", so the timer runs even with auto off.
     if (osSchedule1HzCallback(pGpu, _vidmemEvict1HzCallback, NULL, NV_OS_1HZ_REPEAT) != NV_OK)
         NV_PRINTF(LEVEL_ERROR, "vidmem evict: cannot schedule the 1 Hz callback\n");
 
-    NV_PRINTF(LEVEL_ERROR, "vidmem evict: auto %s, evict below %u MB free outside the reserve, restore above %u MB\n",
-              _vidmemAutoName(), _vidmemLowMB, _vidmemHighMB);
+    NV_PRINTF(LEVEL_ERROR, "vidmem evict: auto %s, evict below %u MB free outside the reserve, restore above %u MB; "
+              "focused window's headroom %u MB, background cushion %u MB, compaction run %u MB (card %llu MB)\n",
+              _vidmemAutoName(), _vidmemLowMB, _vidmemHighMB, _vidmemFgHeadroomMB, _vidmemBgCushionMB,
+              _vidmemCompactRunMB, GPU_GET_MEMORY_MANAGER(pGpu)->Ram.fbTotalMemSizeMb);
 }
 
 //

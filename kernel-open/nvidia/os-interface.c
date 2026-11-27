@@ -944,7 +944,8 @@ static NvU32 nv_vidmem_hint_lookup(NvU32 pid)
 // process has a fullscreen window ("g"); bit 11: `pid` was started by
 // Steam's game launcher (an ancestor named "reaper": every Steam game, native
 // or Proton, runs under it); rule R4.
-// *pGen: snapshot generation (0: no snapshot was ever written, hints are off).
+// *pGen: snapshot generation (0: hints are off: no snapshot was ever written,
+// or the last one was empty, as a hint writer leaves it when it stops).
 //
 #define NV_VIDMEM_HINT_LAUNCHER_DEPTH 16
 NvU32 NV_API_CALL os_get_vidmem_hint(NvU32 pid, NvU32 *pGen)
@@ -954,7 +955,7 @@ NvU32 NV_API_CALL os_get_vidmem_hint(NvU32 pid, NvU32 *pGen)
     NvU32 state = 0, depth;
 
     spin_lock_irqsave(&nv_vidmem_hint_lock, flags);
-    *pGen = nv_vidmem_hint_gen;
+    *pGen = (nv_vidmem_hint_count != 0) ? nv_vidmem_hint_gen : 0;
     spin_unlock_irqrestore(&nv_vidmem_hint_lock, flags);
     if (*pGen == 0)
         return 0;

@@ -1,0 +1,34 @@
+# The hint writer stops (session ended, compositor restarted without its
+# script, a desktop without one) and leaves an empty snapshot: hints are off.
+# By default the policy runs with hints only, so it stopped altogether, and
+# what it had moved out stayed in sysmem for as long as the process lived,
+# drawing over PCIe. Wanted: it comes back as room allows (the policy
+# without hints: an active process as soon as it fits), nothing more goes out.
+cap 6000
+set auto 2
+set compact 0
+proc 1614 kwin_wayland old
+proc 2837 chrome old
+proc 2210 ghostty old
+act 1614 0 4
+alloc 1614 250 n=5 fixed
+alloc 2837 1200
+alloc 2210 300
+hint 1614 v
+hint 2837 h
+hint 2210 f
+act 2837 60 0
+act 2210 0 10
+at 5
+mark the terminal grows: hidden Chrome makes room
+alloc 2210 3800 n=8
+at 10
+expect sys 2837 > 0
+
+mark the terminal frees its memory, the writer stops
+free 2210 3800
+set hints 0
+act 2837 0 10                # Chrome is used again (no window state known)
+at 20
+expect sys 2837 == 0
+expect evicts 2210 == 0

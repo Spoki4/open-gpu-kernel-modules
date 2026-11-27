@@ -20,7 +20,8 @@
 // was skipped as "not managed", the game counted as hidden and its launcher
 // behind it as the foreground, so the driver never made room for the game).
 // The whole table is written on every change; a write to the stock driver
-// (no such file) simply fails; older drivers ignore the second word.
+// (no such file) simply fails; older drivers ignore the second word. The
+// protocol, for scripts on other desktops: local/HINTS.md.
 //
 // Needs QML_XHR_ALLOW_FILE_WRITE=1 in KWin's environment
 // (~/.config/plasma-workspace/env/nvidia-vram-hints.sh, see install.sh).
@@ -219,4 +220,13 @@ Item {
     }
 
     Component.onCompleted: publish()
+
+    // Unloaded (logout, the script turned off): a snapshot without lines
+    // turns the hints off, so the driver stops acting on windows nobody
+    // reports any more and brings back what it moved out (local/HINTS.md).
+    Component.onDestruction: {
+        var x = new XMLHttpRequest();
+        x.open("PUT", hintsUrl);
+        x.send("\n");
+    }
 }

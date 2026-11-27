@@ -193,10 +193,12 @@ NvU32 osGetVidmemHint(NvU32 pid, NvU32 *pGeneration)
     return (p != NULL) ? p->hint : 0;
 }
 
+#ifndef VEP_HAS_COMPOSITOR_LIST
 NvBool vidmemIsReserveExemptName(const char *name)
 {
     return (strcmp(name, "kwin_wayland") == 0) || (strcmp(name, "Xwayland") == 0);
 }
+#endif
 
 // The engine's globals (vidmem_evict.c in the driver).
 NvU64 _vidmemEvictBytes;
@@ -1248,7 +1250,11 @@ static Proc *getProc(NvU32 pid, const char *name)
     p->idle = -1;
     p->chunkMB = 32;
     p->lastEvictS = p->lastRestoreS = -1e9;
+#ifdef VEP_HAS_COMPOSITOR_LIST
+    p->exempt = vepIsCompositorName(p->name, NULL);
+#else
     p->exempt = vidmemIsReserveExemptName(p->name);
+#endif
     return p;
 }
 
@@ -1763,6 +1769,9 @@ static int setKnob(const char *k, const char *v)
     else if (strcmp(k, "place_top") == 0)    gPlaceTop = (int)d;
     else if (strcmp(k, "place_sides") == 0)  _vidmemPlaceSides = (NvU32)d;
     else if (strcmp(k, "compact_whole") == 0) gCompactOwners = (int)d;
+#ifdef VEP_HAS_CARD_SCALE
+    else if (strcmp(k, "card_gb") == 0)      vepScaleToCard((NvU64)(d * 1024));
+#endif
     else return 0;
     return 1;
 }

@@ -8,14 +8,84 @@
 
 #include "vidmem_evict_policy.h"
 
-// Never evicted automatically: the desktop itself.
+//
+// The compositors (process names as the kernel keeps them, at most 15
+// characters). Tested with KDE Plasma (kwin_wayland, Xwayland); the others
+// are the same role on other desktops (local/HINTS.md): they draw every
+// window, own the scanout buffers and must never wait for a move. A
+// compositor not listed here is an app to the driver: add its name here.
+// bReader: it only reads the window buffers apps share with it, so an
+// evicted buffer may stay shared with it (vidmem_evict.c).
+// An X server is not one: X11 clients draw into its pixmaps.
+//
+static const struct { const char *name; NvBool bReader; } _vepCompositors[] =
+{
+    { "kwin_wayland", NV_TRUE  },  // KDE Plasma
+    { "gnome-shell",  NV_TRUE  },  // GNOME (mutter inside), also GDM's login screen
+    { "mutter",       NV_TRUE  },
+    { "Hyprland",     NV_TRUE  },
+    { "sway",         NV_TRUE  },
+    { "wayfire",      NV_TRUE  },
+    { "labwc",        NV_TRUE  },
+    { "niri",         NV_TRUE  },
+    { "cosmic-comp",  NV_TRUE  },  // COSMIC
+    { "river",        NV_TRUE  },
+    { "weston",       NV_TRUE  },
+    { "gamescope",    NV_TRUE  },  // Steam's session compositor, or nested around a game
+    { "Xwayland",     NV_FALSE },
+    { "Xorg",         NV_FALSE },  // X11 sessions
+    { "kwin_x11",     NV_FALSE },  // X11 compositing window managers: they read the X
+    { "xfwm4",        NV_FALSE },  // server's pixmaps, not the apps' buffers
+    { "picom",        NV_FALSE },
+    { "compiz",       NV_FALSE },
+    { "marco",        NV_FALSE },  // MATE
+    { "cinnamon",     NV_FALSE },  // Cinnamon (muffin inside)
+    { "budgie-wm",    NV_FALSE },
+};
+
+NvBool
+vepIsCompositorName(const char *name, NvBool *pbReader)
+{
+    NvU32 i;
+
+    for (i = 0; i < NV_ARRAY_ELEMENTS(_vepCompositors); i++)
+    {
+        if (portStringCompare(name, _vepCompositors[i].name, NV_PROC_NAME_MAX_LENGTH) == 0)
+        {
+            if (pbReader != NULL)
+                *pbReader = _vepCompositors[i].bReader;
+            return NV_TRUE;
+        }
+    }
+    return NV_FALSE;
+}
+
+//
+// Never evicted automatically: the desktop itself, besides the compositors
+// above: the shells and panels that draw
+// with the GPU, and the login screens. Names as the kernel keeps them (15
+// characters at most). Tested with KDE Plasma; the others are the same role
+// on other desktops (local/HINTS.md).
+//
 static const char * const _vidmemEvictNeverNames[] =
 {
     "plasmashell",
-    // The login screen: its windows belong to the greeter's own compositor,
-    // which reports no hints, so it would look like a windowless process.
+    "quickshell",       // Quickshell bars (Hyprland, niri)
+    "ags",              // Aylur's GTK shell
+    "cosmic-panel",
+    "budgie-panel",
+    "lxqt-panel",
+    "xfce4-panel",
+    "mate-panel",
+    // The login screens: their windows belong to the greeter's own
+    // compositor, which reports no hints, so they would look like windowless
+    // processes. GDM's is a gnome-shell, a compositor already.
     "sddm-greeter-qt",
     "sddm-greeter",
+    "lightdm-gtk-gre",  // lightdm-gtk-greeter
+    "slick-greeter",
+    "regreet",
+    "gtkgreet",
 };
 
 //
@@ -183,6 +253,7 @@ NvBool _vidmemAutoActive(void)
 }
 NvU32  _vidmemLowMB = 1024;
 NvU32  _vidmemHighMB = 2560;
+NvU32  _vidmemHystMB = VIDMEM_EVICT_HYST_MB;
 NvU64  _vidmemLastPressureNs;
 NvU32  _vidmemCompactRunMB = VIDMEM_EVICT_COMPACT_RUN_MB;
 NvU32  _vidmemCompactBig = 1;          // the step follows who pays for it (0: 32 MB for everyone)
@@ -329,7 +400,7 @@ _vidmemEvictIsNeverName(const char *name)
 {
     NvU32 i;
 
-    if (vidmemIsReserveExemptName(name))
+    if (vepIsCompositorName(name, NULL))
         return NV_TRUE;
     for (i = 0; i < NV_ARRAY_ELEMENTS(_vidmemEvictNeverNames); i++)
     {
@@ -1745,6 +1816,7 @@ vepPolicyStep(OBJGPU *pGpu)
     NvU64 nowNs = osGetMonotonicTimeNs();
     NvU64 avail;
     NvU32 count, busiest, done = 0, i;
+    NvBool bRestoreOnly;
 
     // Drawing streaks ("drawing again" wants a steady one, not a frame now and then).
     for (i = 0; i < VIDMEM_EVICT_MAX_PROCS; i++)
@@ -1767,7 +1839,17 @@ vepPolicyStep(OBJGPU *pGpu)
     }
     if (_vidmemBusiestPid != 0)
         _vidmemActivityFind(_vidmemBusiestPid, NV_TRUE)->lastBusiestNs = osGetMonotonicTimeNs();
-    if (!_vidmemAutoActive())
+    //
+    // Hints only, and there are none any more (the writer stopped and left
+    // an empty snapshot, local/HINTS.md, or its desktop session ended):
+    // nobody says what the user sees, so what was moved out comes back by the
+    // rules of the policy without hints (as room allows, active processes
+    // first) and nothing more goes out. Before, it stayed in sysmem for as
+    // long as the process lived.
+    //
+    bRestoreOnly = (_vidmemAutoEnabled == VIDMEM_AUTO_HINTS) && !_vidmemHintsActive() &&
+                   (_vidmemEvictBytes != 0);
+    if (!_vidmemAutoActive() && !bRestoreOnly)
         return;
 
     // Common case without hints: no pressure, nothing to restore; skip the
@@ -1873,12 +1955,12 @@ vepPolicyStep(OBJGPU *pGpu)
     }
     busiest = _vidmemEvictBusiestPid(pProcs, count);
 
-    if (avail < _vidmemLowMB)
+    if ((avail < _vidmemLowMB) && !bRestoreOnly)
     {
         _vidmemLastPressureNs = nowNs;
 
         // Least recently active first; "never active" counts as oldest.
-        while ((done < VIDMEM_EVICT_MAX_PER_TICK) && (avail < _vidmemLowMB + VIDMEM_EVICT_HYST_MB))
+        while ((done < VIDMEM_EVICT_MAX_PER_TICK) && (avail < _vidmemLowMB + _vidmemHystMB))
         {
             VIDMEM_EVICT_PROC *pPick = NULL;
             NvU32 pickIdle = 0;
@@ -1930,7 +2012,7 @@ vepPolicyStep(OBJGPU *pGpu)
             // Active: as soon as it fits with headroom. Idle: only when the
             // pressure is long gone and highMB stays free afterwards (a game
             // loading a level frees memory for a moment; no ping-pong).
-            if (avail < needMB + _vidmemLowMB + VIDMEM_EVICT_HYST_MB)
+            if (avail < needMB + _vidmemLowMB + _vidmemHystMB)
                 continue;
             if (!bActive && !(bQuiet && (avail >= needMB + _vidmemHighMB)))
                 continue;
@@ -2084,6 +2166,44 @@ vepBackgroundCushion(NvU32 pid, const char *name)
 // windowless processes move out first.
 //
 NvU32 _vidmemFgHeadroomMB = 2048;
+
+//
+// `tunedMB` (the value for VIDMEM_EVICT_TUNED_MB) for a card of `cardMB`,
+// in 64 MB steps, at least `minMB`.
+//
+static NvU32
+_vepScaleMB(NvU64 tunedMB, NvU64 cardMB, NvU64 minMB)
+{
+    NvU64 mb = (tunedMB * cardMB + VIDMEM_EVICT_TUNED_MB / 2) / VIDMEM_EVICT_TUNED_MB;
+
+    mb = (mb + 32) & ~63ULL;
+    return (NvU32)NV_MAX(mb, minMB);
+}
+
+//
+// The defaults were tuned on 12 GB cards (the host's RTX 3080 Ti, the
+// rented RTX 3060). What a game allocates at once follows the budget it is
+// told, which is the card's memory (DXVK and vkd3d size their pools by it),
+// so the headroom kept for the focused window is the same share of any card:
+// 2 GB is a third of a 6 GB card, which the hidden and visible apps would
+// have to give up for headroom the game there never asks for in one go, and
+// a 24 GB card's game loads in steps twice as big. The same holds for the
+// pressure marks of the policy without hints. The background cushion stays:
+// it is for desktop apps' buffers, whose size is the monitors'.
+//
+void
+vepScaleToCard(NvU64 cardMB)
+{
+    cardMB = (cardMB + 1023) & ~1023ULL;        // whole GB, as the card is sold
+    if ((cardMB == 0) || (cardMB == VIDMEM_EVICT_TUNED_MB))
+        return;
+    _vidmemLowMB        = _vepScaleMB(1024, cardMB, 128);
+    _vidmemHighMB       = _vepScaleMB(2560, cardMB, 320);
+    _vidmemHystMB       = _vepScaleMB(VIDMEM_EVICT_HYST_MB, cardMB, 64);
+    _vidmemFgHeadroomMB = _vepScaleMB(2048, cardMB, VIDMEM_EVICT_HINT_LOW_MB);
+    _vidmemCompactRunMB = NV_MIN(_vepScaleMB(VIDMEM_EVICT_COMPACT_RUN_MB, cardMB, 128),
+                                 VIDMEM_EVICT_COMPACT_RUN_MB);
+}
 
 // Nothing to move a moment ago: do not walk every client per allocation.
 static NvU64 _vidmemMakeRoomFruitlessNs;

@@ -237,7 +237,7 @@ NvU32 osGetVidmemHint(NvU32 pid, NvU32 *pGeneration);   // arch/nvalloc/unix/src
 extern VIDMEM_EVICT_ACTIVITY _vidmemActivity[VIDMEM_EVICT_MAX_PROCS];
 extern NvU64  _vidmemActivityNewestTs;
 extern NvU32  _vidmemAutoEnabled;
-extern NvU32  _vidmemLowMB, _vidmemHighMB;
+extern NvU32  _vidmemLowMB, _vidmemHighMB, _vidmemHystMB;
 extern NvU64  _vidmemLastPressureNs;
 extern NvU32  _vidmemBusiestPid;
 extern NvU64  _vidmemBusiestSinceNs;
@@ -428,7 +428,20 @@ NvBool vepCompactWindow(const NvU32 *pCost, const VEP_COMPACT_OWNERS *pOwners, N
                         NvU64 runStart, NvU64 runLen, NvU64 budgetFrames, NvU64 *pLo, NvU64 *pHi);
 // Total evicted bytes right now (the engine's count).
 extern NvU64 _vidmemEvictBytes;
-// kwin_wayland / Xwayland (video_mem.c).
-NvBool vidmemIsReserveExemptName(const char *name);
+// A compositor (the list in vidmem_evict_policy.c); *pbReader: it only reads
+// the buffers apps share with it (pbReader may be NULL).
+NvBool vepIsCompositorName(const char *name, NvBool *pbReader);
+#define VEP_HAS_COMPOSITOR_LIST 1
+
+//
+// The knobs that are a share of vidmem follow the card's size (MB, as the
+// card states it): lowMB, highMB and their hysteresis, the focused window's
+// headroom, and the compaction run, which only shrinks (it holds scanout
+// buffers, whose size is the monitors', not the card's). The defaults are the
+// values for VIDMEM_EVICT_TUNED_MB. Registry values set after this win.
+//
+#define VIDMEM_EVICT_TUNED_MB 12288
+void   vepScaleToCard(NvU64 cardMB);
+#define VEP_HAS_CARD_SCALE 1
 
 #endif // VIDMEM_EVICT_POLICY_H

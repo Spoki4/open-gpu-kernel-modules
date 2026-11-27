@@ -124,7 +124,7 @@ _vidmemQueryAlignment
 // free memory outside the block as HEAP_FREE, which their Vulkan/DXGI memory
 // budget is built from.
 //
-// Exempt: the compositor processes listed below, matched by the RM client's
+// Exempt: the compositors (vepIsCompositorName()), matched by the RM client's
 // name (process name recorded when the client was created) or by the current
 // thread's name, and kernel clients when they allocate from a kernel thread.
 // nvkms also allocates with kernel privilege inside the ioctl of whichever
@@ -147,29 +147,18 @@ _vidmemQueryAlignment
 //
 #define NV_REG_STR_RM_VIDMEM_USER_RESERVE_MB "RmVidmemUserReserveMB"
 
-static const char * const _vidmemReserveExemptProcs[] =
-{
-    "kwin_wayland",
-    "Xwayland",
-};
+// The compositors: the list is in vidmem_evict_policy.c (vepIsCompositorName()).
+NvBool vepIsCompositorName(const char *name, NvBool *pbReader);
 
 static NvBool
 _vidmemIsReserveExempt(const char *name)
 {
-    NvU32 i;
-
-    for (i = 0; i < NV_ARRAY_ELEMENTS(_vidmemReserveExemptProcs); i++)
-    {
-        if (portStringCompare(name, _vidmemReserveExemptProcs[i], NV_PROC_NAME_MAX_LENGTH) == 0)
-            return NV_TRUE;
-    }
-    return NV_FALSE;
+    return vepIsCompositorName(name, NULL);
 }
 
 static NvU32 _vidmemUserReserveMB = NV_U32_MAX; // NV_U32_MAX: registry not read yet
 
 // Local patch: for mem_mgr/vidmem_evict.c
-NvBool vidmemIsReserveExemptName(const char *name);
 NvBool vidmemUserReserveBoundRangeAny(PMA *pPma, NvU64 pageSize, NvU64 *pBegin, NvU64 *pEnd);
 NvBool vidmemWholeRange(PMA *pPma, NvU64 align, NvU64 *pBegin, NvU64 *pEnd);
 void vidmemEvictAutoInit(OBJGPU *pGpu, NvU32 reserveMB);
@@ -201,12 +190,6 @@ static NvBool _vidmemPmaLow;
 void vidmemEvictKeepFgHeadroom(OBJGPU *pGpu, RmClient *pRmClient, NvU64 size);
 NvU64 vidmemEvictReclaimableFor(RmClient *pRmClient);
 NV_STATUS vidmemEvictBornAllocation(OBJGPU *pGpu, Memory *pMemory);
-
-NvBool
-vidmemIsReserveExemptName(const char *name)
-{
-    return _vidmemIsReserveExempt(name);
-}
 
 void osGetCurrentProcessLeaderName(char *ProcName, NvU32 Length); // arch/nvalloc/unix/src/os.c
 
