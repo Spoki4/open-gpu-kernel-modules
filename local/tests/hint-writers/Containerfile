@@ -1,0 +1,8 @@
+# Compositors that run headless (no GPU), for hint-writers-test.sh. sway's
+# file capability (cap_sys_nice) makes exec fail in a rootless container: a
+# copy without it.
+FROM docker.io/library/archlinux:latest
+RUN pacman -Syu --noconfirm --needed sway niri gnome-shell xorg-server-xvfb xorg-xwayland \
+        openbox xfwm4 i3-wm python python-xlib foot xterm ttf-dejavu mesa dbus xdotool wmctrl \
+        procps-ng gcc make pkgconf && pacman -Scc --noconfirm && \
+    cp /usr/bin/sway /usr/local/bin/sway && useradd -m t

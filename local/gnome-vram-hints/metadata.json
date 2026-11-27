@@ -1,0 +1,7 @@
+{
+    "uuid": "nvidia-vram-hints@open-gpu-kernel-modules",
+    "name": "NVIDIA VRAM window hints",
+    "description": "Tells the patched NVIDIA driver which processes have visible windows, so it keeps their video memory and moves hidden ones to system memory",
+    "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+    "session-modes": ["user", "unlock-dialog"]
+}

@@ -22,16 +22,19 @@ These patches do the same inside the driver.
   process keeps working from sysmem, slower; contents are verified by the
   tests on every move.
 - **Decides who moves by what the user sees** (`vidmem_evict_policy.c`). A
-  KWin script (`kwin-vram-hints/`) tells the driver which processes have the
-  window in focus, a visible window, or only hidden ones. The order is: focus
+  hint writer tells the driver which processes have the window in focus, a
+  visible window, or only hidden ones: a KWin script on KDE
+  (`kwin-vram-hints/`), a Shell extension on GNOME (`gnome-vram-hints/`), a
+  daemon for Hyprland, sway, niri and X11 window managers (`vram-hintd/`). The order is: focus
   > the window focused before it > visible > hidden; a fullscreen window that
   keeps the GPU busy is a game, and a game hidden less than 30 s ago is kept
   like the window focused before (an alt-tab through two windows no longer
-  sends it to sysmem for others). Without the script's hints the policy stays
+  sends it to sysmem for others). Without hints the policy stays
   off (`evict.sh auto on` runs it on GPU activity alone), and what it had
-  moved out comes back as room allows. `HINTS.md`: the protocol for a hint
-  writer on another desktop, and which compositors and shells the driver
-  already knows by name.
+  moved out comes back as room allows. `HINTS.md`: which writer for which
+  desktop, what each one can and cannot see, the protocol for a writer on
+  another desktop, and which compositors and shells the driver already knows
+  by name.
 - **Makes room inside an allocation**: when a visible process (or the
   compositor, or a new GPU context) finds no memory, hidden processes are
   moved out first and the allocation is retried instead of failing. A
@@ -107,7 +110,7 @@ Everything is switchable at run time, see `evict.sh` below.
 | `src/nvidia/src/kernel/mem_mgr/video_mem.c` | hooks in the allocation path, the optional reserve |
 | `kernel-open/nvidia/nv-procfs.c`, `nv-vidmem-trace.[ch]` | `/proc/driver/nvidia/...` files, tracepoints |
 | `local/evict.sh`, `census.sh`, `evict-status.py` | control and inspection from a shell (`evict-status.py`: `status` laid out for a terminal) |
-| `local/kwin-vram-hints/` | the KWin script that reports window state |
+| `local/kwin-vram-hints/`, `gnome-vram-hints/`, `vram-hintd/` | the hint writers that report window state (KDE; GNOME; Hyprland, sway, niri, X11); `local/HINTS.md`: which one where, the protocol |
 | `local/sim/` | policy simulator, no GPU needed |
 | `local/tests/` | test programs and scenarios for a real GPU |
 | `local/vm/` | a QEMU guest that owns the GPU, to test builds without rebooting the host |
@@ -125,7 +128,9 @@ The modules must be the same release as the installed `nvidia-utils`.
 ```bash
 ./local/build.sh                         # modules for the running kernel + the test tools
 sudo ./local/install.sh                  # they load from the next boot; then reboot
-./local/kwin-vram-hints/install.sh       # the KWin script, per user; then log in again
+./local/kwin-vram-hints/install.sh       # the hint writer, per user: KDE; then log in again
+./local/gnome-vram-hints/install.sh      #   or GNOME; then log in again
+./local/vram-hintd/install.sh            #   or Hyprland, sway, niri, X11 (it prints the line for the compositor's config)
 sudo ./local/install.sh stock            # back to the stock modules; then reboot
 ./local/install.sh status                # which build runs, which one boots
 ```
@@ -347,6 +352,10 @@ cd local/tests
 ./scrubwait-test.sh            # a contiguous buffer remade after two were freed waits for one scrub, not two
 ./hintsoff-test.sh             # with the window hints gone, what the policy moved out comes back
 ./suspend-test.sh [hibernate]  # memory in sysmem survives a suspend and resume of the driver (idea I11)
+./hint-writers-test.sh         # on the host, no GPU: the hint writers on headless sway, niri, GNOME, Openbox,
+                               # xfwm4, i3 and a Hyprland IPC stand-in, in a podman container
+./hint-writers-test.sh --gpu   # as root where the driver runs with no desktop: the same against the driver's
+                               # file, the real Hyprland, and a hidden window's memory out and back on each
 ./fragchurn.sh                 # fragments vidmem like a long session
 ./momc-probe.sh                # a probe: do the GPU's access counters report accesses to vidmem?
 ../watchdog.sh --stall 300 -- CMD   # any long run: WATCHDOG STALL/TIMEOUT instead of waiting forever

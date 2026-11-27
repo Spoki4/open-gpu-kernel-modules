@@ -1,0 +1,9 @@
+# hint-writers-test.sh --gpu: the image of the container test with the real
+# Hyprland, the Vulkan loader for nvt-game and NVIDIA's userspace of the
+# release the loaded modules are (the .run, without its kernel modules).
+ARG BASE
+FROM $BASE
+COPY NVIDIA.run /tmp/NVIDIA.run
+RUN pacman -Syu --noconfirm --needed hyprland vulkan-icd-loader vulkan-headers && pacman -Scc --noconfirm && \
+    sh /tmp/NVIDIA.run --silent --no-kernel-modules --no-questions --ui=none --no-x-check --no-systemd && \
+    rm /tmp/NVIDIA.run

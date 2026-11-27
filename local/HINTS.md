@@ -11,9 +11,18 @@ that do not depend on the policy.
 | desktop | writer | install |
 |---|---|---|
 | KDE Plasma 6 | KWin script `kwin-vram-hints/` | `./kwin-vram-hints/install.sh`, log in again |
+| GNOME 45 and later | Shell extension `gnome-vram-hints/` | `./gnome-vram-hints/install.sh`, log in again |
+| Hyprland, sway, niri | `vram-hintd/vram-hintd.c` (C, libc only) | `./vram-hintd/install.sh`, plus one line in the compositor's configuration (the script prints it) |
+| X11: Xfce, Cinnamon, MATE, LXQt, i3, Openbox, any EWMH window manager | `vram-hintd` (with libxcb, xcb-res, xcb-randr: a build without them leaves X11 out) | `./vram-hintd/install.sh` (XDG autostart) |
 
-Only KDE has one so far. The rest of this page is the protocol, for a writer
-on another desktop.
+All of them apply the same rules (below). The KWin script runs on the
+author's desktop; the others pass the scenarios of
+`tests/hint-writers-test.sh` on the real compositors run headless, with the
+patched driver on a rented RTX 3060 (`--gpu`: the driver's own file, the
+real Hyprland 0.57, and on each desktop a hidden window's process giving its
+video memory to the focused one and getting it back when shown), but none
+has yet run anyone's everyday session. The rest of this page is the protocol, for a writer on yet
+another desktop.
 
 ## The file
 
@@ -117,10 +126,65 @@ hints (the kernel's process name, at most 15 characters):
 A compositor or shell not in these lists is an ordinary app to the driver:
 add its name there and rebuild. Check the name with `ps -o comm= -p <pid>`.
 
-## The writer
+## The writers
 
 **KWin** (`kwin-vram-hints/main.qml`): the reference; window state straight
 from KWin's scripting API, the table written through `XMLHttpRequest`.
+
+**GNOME** (`gnome-vram-hints/extension.js`): runs inside gnome-shell, which
+is the compositor. Windows from `global.get_window_actors()` (stacking
+order), shown = not minimized, `showing_on_its_workspace()` and
+`located_on_workspace()` of the active workspace; the covering test as
+above, override-redirect Xwayland windows over a monitor as games. Writes
+with a plain open and write (`Gio.File.append_to()`): `replace_contents()`
+writes a temporary file and renames it, which `/proc` refuses. Writes an
+empty table when disabled and on the shell's `shutdown` signal; stays enabled
+on the lock screen, so locking does not bring everything back. The overview
+shows no focused window: while it is open nobody is `f`.
+
+**vram-hintd** (`vram-hintd/vram-hintd.c`, `make`): a daemon in C that
+asks the compositor over its IPC on every event and every 250 ms (X11: 1 s, events cover more
+there and each query costs more round trips), and writes the table when it
+changed; picks the compositor from the environment
+(`HYPRLAND_INSTANCE_SIGNATURE`, `SWAYSOCK`, `NIRI_SOCKET`, else `DISPLAY`).
+On SIGTERM and when the compositor goes away it writes an empty table and
+exits. `vram-hintd --once` prints the table it would write; `--debug` logs
+each window's visible share.
+
+- *Hyprland*: `j/monitors`, `j/clients`, `j/activewindow` and the event
+  socket `.socket2.sock`; formats from 0.4x to 0.57 (workspaces by address,
+  else id, else name; fullscreen as the old bool or the new mode, 2 =
+  fullscreen, 1 = maximized). Shown = mapped, not `hidden` (a group's other
+  tabs), on a monitor's active or shown special workspace. Stacking: tiled,
+  floating, fullscreen, special workspace above. `decoration:active_opacity`,
+  `inactive_opacity` and `fullscreen_opacity` below 1 make those windows
+  translucent (they cover nothing; read every 5 s); per-window opacity rules
+  are not in the IPC. From 0.57 the configuration is Lua: the autostart line
+  is `hl.on("hyprland.start", function() hl.exec_cmd("~/.local/bin/vram-hintd") end)`
+  in `hyprland.lua` (before 0.57: `exec-once = ...` in `hyprland.conf`;
+  `install.sh` prints both with the full path).
+- *sway*: `GET_TREE` and a subscription to window, workspace and output
+  events. sway's own `visible` is already false on other workspaces, in the
+  scratchpad, for unseen tabs and behind a fullscreen view; floating views
+  get the covering test.
+- *niri*: `Outputs`, `Workspaces`, `Windows` and `EventStream`. niri gives
+  no position for tiled windows, so a tiled window on an active workspace
+  counts as shown even when its column is scrolled out of view: a hidden
+  window kept costs only memory not freed, a shown one moved out would make
+  the user wait. A tiled window the size of its output that is its
+  workspace's active window is fullscreen and covers the other tiled ones;
+  floating windows have positions and get the covering test. X11 apps under
+  xwayland-satellite are reported by niri with the satellite's pid, not
+  their own: they get no hint and count as background processes.
+- *X11*: EWMH (`_NET_CLIENT_LIST`, `_NET_ACTIVE_WINDOW`,
+  `_NET_CURRENT_DESKTOP`, per window `_NET_WM_PID`, `_NET_WM_DESKTOP`,
+  `_NET_WM_STATE`, `_NET_WM_WINDOW_TYPE`, `_NET_WM_WINDOW_OPACITY`), the
+  stacking from the X server (the root's children), pids from the
+  X-Resource extension when `_NET_WM_PID` is missing. Shown = viewable
+  (window managers unmap minimized windows and those of other desktops; the
+  unseen tabs of i3 are covered by the shown one). Override-redirect windows over a monitor
+  are games, unless they belong to the window manager or compositor (its
+  overlay window). Translucency through an ARGB visual alone is not seen.
 
 **Another compositor** needs a window list with the owners' pids. The
 Wayland protocols that list toplevels to clients (wlr foreign toplevel,
@@ -140,7 +204,10 @@ journalctl -k -f | grep 'vidmem evict'             # what the policy does, and f
 `status` should show `auto with window hints only` and, for the window in
 focus, `f`. Then switch windows and watch hidden apps go out under pressure
 and come back when shown. `tests/nvtest.sh` (see the README) runs the policy's
-scenarios with hints written by hand, no desktop needed.
+scenarios with hints written by hand, no desktop needed;
+`tests/hint-writers-test.sh` runs the writers on headless compositors, no
+GPU needed; with `--gpu`, as root on a machine with the driver loaded and no
+desktop of its own (the test VM, a rented one), against the driver itself.
 
 ## The numbers that follow the card
 
